@@ -1936,6 +1936,26 @@ class AstroSuiteProMainWindow(
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dlg.show()
 
+    def _show_help_chat(self):
+        """Open (or raise) the AI Help Chat dialog."""
+        try:
+            import pathlib
+            # Resolve the repository root from the installed package location.
+            # main_window.py lives at  src/setiastro/saspro/gui/main_window.py,
+            # so we walk up four levels to get the repo root.
+            repo_root = str(
+                pathlib.Path(__file__).resolve().parents[4]
+            )
+            from setiastro.saspro.ai_assistant import open_help_chat
+            open_help_chat(repo_root=repo_root, parent=self)
+        except Exception as exc:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "AI Help Chat",
+                f"Could not open AI Help Chat:\n{exc}"
+            )
+
     def _doc_by_ptr(self, ptr: int):
         dm = getattr(self, "doc_manager", None) or getattr(self, "docman", None)
         if dm and hasattr(dm, "all_documents"):

@@ -92,6 +92,10 @@ psutil = "*"
 opencv-python-headless = "*"
 scikit-image = "*"
 
+# ai assistant (optional — used for retrieval grounding in the Help Chat)
+sentence-transformers = {version = "*", optional = true}
+faiss-cpu = {version = "*", optional = true}
+
 [tool.poetry.group.dev.dependencies]
 pytest = "*"
 
@@ -100,7 +104,9 @@ requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.extras]
-# Optional extras can be added here if needed in the future
+# Optional extras for the AI Help Chat feature.
+# Install with:  pip install setiastrosuitepro[ai]
+ai = ["sentence-transformers", "faiss-cpu"]
 
 [tool.poetry.scripts]
 setiastrosuitepro = "setiastro.saspro.__main__:main"
