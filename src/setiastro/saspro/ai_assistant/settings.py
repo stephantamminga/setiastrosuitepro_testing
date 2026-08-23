@@ -20,6 +20,18 @@ from .providers.base import ProviderType
 _GROUP = "ai_assistant"
 
 
+class RetrievalMode:
+    LOCAL = "local"
+    GITHUB = "github"
+    DISABLED = "disabled"
+
+    DISPLAY_NAMES = {
+        LOCAL: "Local index",
+        GITHUB: "GitHub repository",
+        DISABLED: "Disabled",
+    }
+
+
 class AISettings:
     """
     Thin wrapper around QSettings for AI assistant configuration.
@@ -131,6 +143,15 @@ class AISettings:
     @use_retrieval.setter
     def use_retrieval(self, value: bool) -> None:
         self._set("use_retrieval", value)
+
+    @property
+    def retrieval_mode(self) -> str:
+        mode = str(self._get("retrieval_mode", RetrievalMode.LOCAL)).lower()
+        return mode if mode in RetrievalMode.DISPLAY_NAMES else RetrievalMode.LOCAL
+
+    @retrieval_mode.setter
+    def retrieval_mode(self, value: str) -> None:
+        self._set("retrieval_mode", value)
 
     @property
     def show_sources(self) -> bool:

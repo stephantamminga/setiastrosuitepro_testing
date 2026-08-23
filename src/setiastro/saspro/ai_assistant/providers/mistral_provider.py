@@ -138,7 +138,7 @@ class MistralProvider(IAIProvider):
 
     def _headers(self) -> Dict[str, str]:
         return {
-            "Authorization": f"******",
+            "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }

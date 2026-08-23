@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import List, Optional
 
 from .prompting import RetrievedChunk
@@ -90,7 +91,9 @@ class KnowledgeRetriever:
             q_np = np.array(q_vec, dtype="float32")
             faiss.normalize_L2(q_np)
 
-            fetch_k = min(top_k * 3, len(self._chunks))
+            # Fetch a wider candidate pool so filename-aware re-ranking can
+            # promote an implementation whose natural-language content is terse.
+            fetch_k = min(top_k * 10, len(self._chunks))
             scores, indices = self._index.search(q_np, fetch_k)
 
             candidates: List[RetrievedChunk] = []
@@ -108,9 +111,11 @@ class KnowledgeRetriever:
 
             # Lightweight re-ranking: boost if source file stem appears in query
             query_lower = query.lower()
+            query_compact = re.sub(r"[^a-z0-9]", "", query_lower)
             for c in candidates:
                 stem = os.path.splitext(os.path.basename(c.source_file))[0].lower()
-                if stem in query_lower:
+                stem_compact = re.sub(r"[^a-z0-9]", "", stem)
+                if stem in query_lower or (stem_compact and stem_compact in query_compact):
                     c.score += 0.2
 
             candidates.sort(key=lambda c: c.score, reverse=True)

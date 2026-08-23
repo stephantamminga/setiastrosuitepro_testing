@@ -19,7 +19,7 @@ from typing import Callable, List, Optional
 
 from .prompting import RetrievedChunk, build_prompt, format_sources
 from .providers.base import AIResponse, ConversationTurn
-from .settings import AISettings
+from .settings import AISettings, RetrievalMode
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,7 @@ class ChatService:
         self._provider = None
         self._retriever = None
         self._history: List[ConversationTurn] = []
+        self._last_chunks: List[RetrievedChunk] = []
         self._rate_limiter = _RateLimiter()
         self._loaded = False
 
@@ -122,17 +123,23 @@ class ChatService:
         """Re-initialise from current settings (e.g. after settings change)."""
         self._provider = None
         self._retriever = None
+        self._last_chunks = []
         self._loaded = False
         return self.load()
 
     def _load_retriever(self) -> None:
-        from .retriever import KnowledgeRetriever
-
-        retriever = KnowledgeRetriever(self._settings.index_path)
+        if self._settings.retrieval_mode == RetrievalMode.DISABLED:
+            return
+        if self._settings.retrieval_mode == RetrievalMode.GITHUB:
+            from .github_retriever import GitHubRepositoryRetriever
+            retriever = GitHubRepositoryRetriever()
+        else:
+            from .retriever import KnowledgeRetriever
+            retriever = KnowledgeRetriever(self._settings.index_path)
         if retriever.load():
             self._retriever = retriever
         else:
-            logger.info("ChatService: retriever not available (index not built yet?)")
+            logger.info("ChatService: selected retriever is not available")
 
     # ── conversation ──────────────────────────────────────────────────────
 
@@ -172,6 +179,10 @@ class ChatService:
         chunks: List[RetrievedChunk] = []
         if self._settings.use_retrieval and self._retriever and self._retriever.is_ready():
             chunks = self._retriever.retrieve(question, top_k=5)
+            if chunks:
+                self._last_chunks = list(chunks)
+            elif self._history and self._last_chunks:
+                chunks = list(self._last_chunks)
             if on_retrieval:
                 on_retrieval(chunks)
 
@@ -209,6 +220,7 @@ class ChatService:
 
     def clear_history(self) -> None:
         self._history.clear()
+        self._last_chunks.clear()
 
     # ── internal ──────────────────────────────────────────────────────────
 

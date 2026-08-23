@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QGroupBox, QFormLayout,
 )
 
-from .settings import AISettings
+from .settings import AISettings, RetrievalMode
 from .providers.base import ProviderType
 
 logger = logging.getLogger(__name__)
@@ -151,9 +151,11 @@ class _MessageBubble(QWidget):
             )
             label.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
-        layout.addWidget(label, alignment=(
-            Qt.AlignmentFlag.AlignRight if is_user else Qt.AlignmentFlag.AlignLeft
-        ))
+        label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        layout.addWidget(label)
 
         # Sources (assistant only)
         if not is_user and sources:
@@ -249,8 +251,14 @@ class _SettingsPanel(QDialog):
         beh_group = QGroupBox("Behaviour")
         beh_layout = QVBoxLayout(beh_group)
         self._use_retrieval_cb = QCheckBox("Use retrieval grounding (recommended)")
+        self._retrieval_mode_combo = QComboBox()
+        for mode, label in RetrievalMode.DISPLAY_NAMES.items():
+            self._retrieval_mode_combo.addItem(label, mode)
+        self._retrieval_mode_combo.currentIndexChanged.connect(self._on_retrieval_mode_changed)
         self._show_sources_cb = QCheckBox("Show source file references below answers")
         beh_layout.addWidget(self._use_retrieval_cb)
+        beh_layout.addWidget(QLabel("Retrieval source:"))
+        beh_layout.addWidget(self._retrieval_mode_combo)
         beh_layout.addWidget(self._show_sources_cb)
         layout.addWidget(beh_group)
 
@@ -301,11 +309,22 @@ class _SettingsPanel(QDialog):
         self._tokens_edit.setText(str(s.max_tokens))
         self._ctx_edit.setText(str(s.max_context_tokens))
         self._use_retrieval_cb.setChecked(s.use_retrieval)
+        for i in range(self._retrieval_mode_combo.count()):
+            if self._retrieval_mode_combo.itemData(i) == s.retrieval_mode:
+                self._retrieval_mode_combo.setCurrentIndex(i)
+                break
         self._show_sources_cb.setChecked(s.show_sources)
         self._update_index_status_label()
 
     def _on_provider_changed(self, _idx: int):
         self._model_combo.clear()
+
+    def _on_retrieval_mode_changed(self, _idx: int):
+        is_local = self._retrieval_mode_combo.currentData() == RetrievalMode.LOCAL
+        self._reindex_btn.setEnabled(is_local)
+        if not is_local:
+            mode = self._retrieval_mode_combo.currentText()
+            self._index_status_label.setText(f"{mode} retrieval selected")
 
     def _fetch_models(self):
         ptype = self._provider_combo.currentData()
@@ -417,6 +436,7 @@ class _SettingsPanel(QDialog):
         except ValueError:
             pass
         s.use_retrieval = self._use_retrieval_cb.isChecked()
+        s.retrieval_mode = self._retrieval_mode_combo.currentData()
         s.show_sources = self._show_sources_cb.isChecked()
         self.settings_saved.emit()
         self.accept()
@@ -656,6 +676,7 @@ class HelpChatDialog(QDialog):
                 f"⚠ Error: {response.error}",
                 is_user=False,
             )
+        QTimer.singleShot(0, self._input_edit.setFocus)
 
     # ── Conversation helpers ──────────────────────────────────────────────
 

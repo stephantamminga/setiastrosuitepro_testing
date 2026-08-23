@@ -53,12 +53,13 @@ class IndexedChunk:
 # Helper: extract meaningful text from Python source
 # ---------------------------------------------------------------------------
 
-def _extract_python_symbols(source: str, max_body_lines: int = 5) -> str:
+def _extract_python_symbols(source: str, max_body_lines: int = 30) -> str:
     """
     Extract module docstring + all function/class signatures with their
     docstrings.  Body lines are truncated to keep chunk sizes small.
     """
     lines: List[str] = []
+    source_lines = source.splitlines()
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -73,7 +74,7 @@ def _extract_python_symbols(source: str, max_body_lines: int = 5) -> str:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             # Signature line
             try:
-                sig_line = source.splitlines()[node.lineno - 1].strip()
+                sig_line = source_lines[node.lineno - 1].strip()
             except IndexError:
                 sig_line = f"def/class {node.name}"
 
@@ -81,6 +82,13 @@ def _extract_python_symbols(source: str, max_body_lines: int = 5) -> str:
             entry = sig_line
             if doc:
                 entry += "\n    " + doc.replace("\n", "\n    ")
+            end_line = min(
+                getattr(node, "end_lineno", node.lineno),
+                node.lineno + max_body_lines - 1,
+            )
+            excerpt = "\n".join(source_lines[node.lineno - 1:end_line]).strip()
+            if excerpt and excerpt != sig_line:
+                entry += "\n" + excerpt
             lines.append(entry)
 
     return "\n\n".join(lines)
@@ -162,6 +170,7 @@ def _collect_files(repo_root: str) -> List[Tuple[str, str]]:
 
 def _hash_files(files: List[Tuple[str, str]]) -> str:
     h = hashlib.sha256()
+    h.update(b"ai-index-format-v2")
     for path, _ in sorted(files):
         try:
             stat = os.stat(path)
