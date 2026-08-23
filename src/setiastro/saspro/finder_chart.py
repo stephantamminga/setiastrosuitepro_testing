@@ -24,6 +24,7 @@ from matplotlib import patheffects as pe
 from pathlib import Path
 from setiastro.saspro.resources import get_data_path
 from setiastro.saspro.bright_stars import BRIGHT_STARS
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 if TYPE_CHECKING:
     from astropy.wcs import WCS as AstropyWCS
@@ -1152,7 +1153,7 @@ def _rgb_u8_to_qimage(rgb_u8: np.ndarray) -> QImage:
     h, w, _ = rgb_u8.shape
     bpl = rgb_u8.strides[0]
     # QImage uses the buffer; to be safe, copy via .copy() when making pixmap
-    return QImage(rgb_u8.data, w, h, bpl, QImage.Format.Format_RGB888)
+    return tag_qimage_with_working_color_space(QImage(rgb_u8.data, w, h, bpl, QImage.Format.Format_RGB888))
 
 def _draw_star_names(ax, bg_wcs: "WCS", center: "SkyCoord", fov_deg: float, *,
                      mag_limit: float = 2.0, max_labels: int = 30, renderer=None):

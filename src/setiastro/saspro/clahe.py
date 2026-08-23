@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 from setiastro.saspro.widgets.graphics_views import ZoomableGraphicsView
 from setiastro.saspro.widgets.image_utils import extract_mask_resized as _get_active_mask_resized
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 # ----------------------- Core -----------------------
@@ -269,7 +270,7 @@ class CLAHEDialogPro(QDialog):
         arr = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
         h, w, _ = arr.shape
         q = QImage(arr.data, w, h, 3*w, QImage.Format.Format_RGB888)
-        self.pix.setPixmap(QPixmap.fromImage(q))
+        self.pix.setPixmap(QPixmap.fromImage(tag_qimage_with_working_color_space(q)))
         self.scene.setSceneRect(self.pix.boundingRect())
 
     def _update_preview(self):

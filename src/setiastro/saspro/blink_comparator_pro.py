@@ -49,6 +49,7 @@ from setiastro.saspro.cosmicclarity_engines.satellite_engine import (
 )
 from setiastro.saspro.legacy.numba_utils import debayer_raw_fast, debayer_fits_fast
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 from setiastro.saspro.star_metrics import measure_stars_sep
@@ -3747,7 +3748,7 @@ class BlinkTab(QWidget):
         # ✅ single source of truth (handles aggressive + mono + color)
         disp8 = self._make_display_frame(entry)
 
-        qimage = self.convert_to_qimage(disp8)
+        qimage = tag_qimage_with_working_color_space(self.convert_to_qimage(disp8))
         self.current_pixmap = QPixmap.fromImage(qimage)
         self.apply_zoom()
 
@@ -4858,10 +4859,10 @@ class BlinkTab(QWidget):
 
         if arr8.ndim == 3:
             # RGB
-            return QImage(buffer, w, h, 3*w, QImage.Format.Format_RGB888)
+            return tag_qimage_with_working_color_space(QImage(buffer, w, h, 3*w, QImage.Format.Format_RGB888))
         else:
             # grayscale
-            return QImage(buffer, w, h, w, QImage.Format.Format_Grayscale8)
+            return tag_qimage_with_working_color_space(QImage(buffer, w, h, w, QImage.Format.Format_Grayscale8))
 
     def _main_window(self):
         w = self

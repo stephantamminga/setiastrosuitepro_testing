@@ -138,6 +138,7 @@ import math
 from setiastro.saspro.autostretch import autostretch
 from setiastro.saspro.autostretch import autostretch as _autostretch
 from setiastro.saspro.rgb_extract import extract_rgb_channels
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 
@@ -326,7 +327,7 @@ def float01_to_qimage(img: np.ndarray) -> QImage:
     bytes_per_line = 3 * w
     qimg = QImage(rgb8.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
     # Important: detach from numpy buffer (copy) so clipboard stays valid
-    return qimg.copy()
+    return tag_qimage_with_working_color_space(qimg.copy())
 
 
 class UiStallDetector(QObject):

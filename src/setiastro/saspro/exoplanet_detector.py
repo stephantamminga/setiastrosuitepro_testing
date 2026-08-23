@@ -52,6 +52,7 @@ from setiastro.saspro.star_alignment import (
 )
 from setiastro.saspro.legacy.image_manager import load_image, save_image, get_valid_header  # adjust if different
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 # ------------------------------------------------------------------------
 from setiastro.saspro.xisf import XISF
@@ -676,7 +677,7 @@ class ReferenceOverlayDialog(QDialog):
         arr8 = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
         h, w = arr8.shape
         qimg = QImage(arr8.data, w, h, w, QImage.Format.Format_Grayscale8).copy()
-        pix = QPixmap.fromImage(qimg)
+        pix = QPixmap.fromImage(tag_qimage_with_working_color_space(qimg))
 
         self.scene.clear()
         self.ellipse_items.clear()

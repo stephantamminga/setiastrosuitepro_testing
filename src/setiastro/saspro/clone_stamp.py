@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 
 from setiastro.saspro.imageops.stretch import stretch_color_image, stretch_mono_image
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 def _circle_mask(radius: int, feather: float) -> np.ndarray:
@@ -487,7 +488,7 @@ class CloneStampDialogPro(QDialog):
 
         arr8 = np.ascontiguousarray(np.clip(canvas * 255.0, 0, 255).astype(np.uint8))
         qimg = QImage(arr8.data, w, h, w, QImage.Format.Format_Grayscale8)
-        self.brush_preview.setPixmap(QPixmap.fromImage(qimg))
+        self.brush_preview.setPixmap(QPixmap.fromImage(tag_qimage_with_working_color_space(qimg)))
 
     def _adjust_brush_radius(self, delta: int):
         """Increase/decrease clone stamp radius from keyboard shortcuts."""
@@ -839,7 +840,7 @@ class CloneStampDialogPro(QDialog):
         else:
             h, w, _ = arr.shape
             qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(qimg)
+        return QPixmap.fromImage(tag_qimage_with_working_color_space(qimg))
 
     def _refresh_pix(self):
         self.pix.setPixmap(self._np_to_qpix(self._display))

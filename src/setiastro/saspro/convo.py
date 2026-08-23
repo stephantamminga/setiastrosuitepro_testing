@@ -38,6 +38,7 @@ import sep  # PSF estimator
 
 # Import centralized widgets
 from setiastro.saspro.widgets.spinboxes import CustomSpinBox
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
 from setiastro.saspro.imageops.stretch import stretch_color_image, stretch_mono_image
 
@@ -1099,7 +1100,7 @@ class ConvoDeconvoDialog(QDialog):
         h, w = psf.shape
         img8 = ((psf / psf.max()) * 255.0).astype(np.uint8) if psf.max() > 0 else psf.astype(np.uint8)
         qimg = QImage(img8.data, w, h, w, QImage.Format.Format_Grayscale8)
-        scaled = QPixmap.fromImage(qimg).scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        scaled = QPixmap.fromImage(tag_qimage_with_working_color_space(qimg)).scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         final = QPixmap(64, 64); final.fill(Qt.GlobalColor.transparent)
         p = QPainter(final); p.drawPixmap((64 - scaled.width()) // 2, (64 - scaled.height()) // 2, scaled); p.end()
         return final
@@ -1108,7 +1109,7 @@ class ConvoDeconvoDialog(QDialog):
         h, w = psf_kernel.shape
         img8 = ((psf_kernel / max(psf_kernel.max(), 1e-12)) * 255.0).astype(np.uint8)
         qimg = QImage(img8.data, w, h, w, QImage.Format.Format_Grayscale8)
-        scaled = QPixmap.fromImage(qimg).scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        scaled = QPixmap.fromImage(tag_qimage_with_working_color_space(qimg)).scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         final = QPixmap(64, 64); final.fill(Qt.GlobalColor.transparent)
         p = QPainter(final); p.drawPixmap((64 - scaled.width()) // 2, (64 - scaled.height()) // 2, scaled); p.end()
         return final
@@ -1877,7 +1878,7 @@ class ConvoDeconvoDialog(QDialog):
             fmt = QImage.Format.Format_RGB888; bytespp = 3 * w
 
         qimg = QImage(arr8.data, w, h, bytespp, fmt)
-        self.pixmap_item.setPixmap(QPixmap.fromImage(qimg))
+        self.pixmap_item.setPixmap(QPixmap.fromImage(tag_qimage_with_working_color_space(qimg)))
         self.scene.setSceneRect(0, 0, w, h)
 
         if self._auto_fit:
@@ -1931,7 +1932,7 @@ class ConvoDeconvoDialog(QDialog):
         h, w = psf_kernel.shape
         img8 = ((psf_kernel / max(psf_kernel.max(), 1e-12)) * 255.0).astype(np.uint8)
         qimg = QImage(img8.data, w, h, w, QImage.Format.Format_Grayscale8)
-        scaled = QPixmap.fromImage(qimg).scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        scaled = QPixmap.fromImage(tag_qimage_with_working_color_space(qimg)).scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         final = QPixmap(64, 64); final.fill(Qt.GlobalColor.transparent)
         p = QPainter(final); p.drawPixmap((64 - scaled.width()) // 2, (64 - scaled.height()) // 2, scaled); p.end()
         self.sep_psf_preview.setPixmap(final)

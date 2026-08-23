@@ -32,6 +32,7 @@ from scipy.ndimage import zoom as _ndzoom
 import sep
 sep.set_extract_pixstack(20000000)
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 # bring in your existing helpers/classes from the snippet you posted
 # (we assume they live next to this file or already in pro/)
@@ -222,11 +223,11 @@ class PreviewPane(QWidget):
         h, w = arr.shape[:2]
         if arr.ndim == 2:
             img = QImage(arr.data, w, h, w, QImage.Format.Format_Grayscale8)
-            return img.copy()
+            return tag_qimage_with_working_color_space(img.copy())
         elif arr.ndim == 3 and arr.shape[2] == 3:
             bytes_per_line = 3 * w
             img = QImage(arr.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            return img.copy()
+            return tag_qimage_with_working_color_space(img.copy())
         else:
             raise ValueError(f"Cannot convert array of shape {arr.shape} to QImage")
 
@@ -1308,7 +1309,7 @@ class SurfaceDialog(QDialog):
         H,W,_ = bar.shape
         img = QImage(bar.data, 1, 256, 3*1, QImage.Format.Format_RGB888)
         # rotate to vertical
-        return QPixmap.fromImage(img.mirrored(False, True).scaled(20,256))
+        return QPixmap.fromImage(tag_qimage_with_working_color_space(img).mirrored(False, True).scaled(20,256))
 
 def distortion_vectors_sip(x_pix, y_pix, sip, pixel_size_um):
     """
@@ -2356,7 +2357,7 @@ class ImagePeekerDialogPro(QDialog):
                 dx = col * (panel_sz + sep); dy = row * (panel_sz + sep)
                 p.drawImage(dx, dy, patch)
         p.end()
-        return mosaic
+        return tag_qimage_with_working_color_space(mosaic)
 
     def _to_qimage(self, arr: np.ndarray):
         # same as your _to_qimage in the snippet
@@ -2370,7 +2371,7 @@ class ImagePeekerDialogPro(QDialog):
         buf = arr8.tobytes(); self._last_qimage_buffer = buf
         from PyQt6.QtGui import QImage
         if arr8.ndim == 2:
-            return QImage(buf, w, h, w, QImage.Format.Format_Grayscale8)
+            return tag_qimage_with_working_color_space(QImage(buf, w, h, w, QImage.Format.Format_Grayscale8))
         elif arr8.ndim == 3 and arr8.shape[2] == 3:
-            return QImage(buf, w, h, 3*w, QImage.Format.Format_RGB888)
+            return tag_qimage_with_working_color_space(QImage(buf, w, h, 3*w, QImage.Format.Format_RGB888))
         raise ValueError(f"Unsupported array shape {arr.shape}")

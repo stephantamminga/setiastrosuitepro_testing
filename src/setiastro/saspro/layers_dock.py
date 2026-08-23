@@ -24,6 +24,7 @@ from PyQt6.QtGui import (
 from setiastro.saspro.layers import LayerTransform
 from setiastro.saspro.dnd_mime import MIME_VIEWSTATE, MIME_MASK
 from setiastro.saspro.layers import composite_stack, ImageLayer, BLEND_MODES, _apply_levels, _ensure_3c, _float01
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 # ─────────────────────────────────────────────────────────────
@@ -35,7 +36,7 @@ def _arr_to_pixmap(arr: np.ndarray) -> QPixmap:
     rgb8 = np.clip(arr[:, :, :3] * 255.0, 0, 255).astype(np.uint8)
     h, w = rgb8.shape[:2]
     img = QImage(rgb8.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(img)
+    return QPixmap.fromImage(tag_qimage_with_working_color_space(img))
 
 
 # ─────────────────────────────────────────────────────────────

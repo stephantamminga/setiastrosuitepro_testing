@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QWidget, QSizePolicy, QCheckBox,
 )
 from PyQt6.QtGui import QImage, QPixmap
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 try:
     import cv2
@@ -1191,7 +1192,7 @@ class _centerPickerLabel(QLabel):
         rgb  = _ensure_rgb(arr)
         buf8 = np.ascontiguousarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8))
         h, w, _ = buf8.shape
-        self._qimg = QImage(buf8.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
+        self._qimg = tag_qimage_with_working_color_space(QImage(buf8.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888))
         self._repaint_scaled()
 
     def set_markers(self, markers: list):
@@ -2155,7 +2156,7 @@ class FlythroughDialog(QDialog):
             )
             buf8 = np.ascontiguousarray((frame * 255.0).clip(0, 255).astype(np.uint8))
             h, w, _ = buf8.shape
-            qimg = QImage(buf8.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
+            qimg = tag_qimage_with_working_color_space(QImage(buf8.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888))
             pm = QPixmap.fromImage(qimg).scaled(
                 self.preview_lbl.width(), self.preview_lbl.height(),
                 Qt.AspectRatioMode.KeepAspectRatio,

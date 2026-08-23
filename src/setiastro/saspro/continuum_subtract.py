@@ -279,7 +279,7 @@ class QPreviewDialog(QDialog):
         u8 = (result * 255.0 + 0.5).astype(np.uint8, copy=False)
         h, w = u8.shape[:2]
         qimg = QImage(u8.data, w, h, w, QImage.Format.Format_Grayscale8).copy()
-        pm   = QPixmap.fromImage(qimg)
+        pm   = QPixmap.fromImage(tag_qimage_with_working_color_space(qimg))
 
         self._pix_item.setPixmap(pm)
         self._scene.setSceneRect(self._pix_item.boundingRect())
@@ -1201,7 +1201,7 @@ class ContinuumSubtractTab(QWidget):
             for i, ch in enumerate("NB Flux"):
                 cv2.putText(scatter_img, ch, (2, 15+i*15), font, 0.5, (0,0,0), 1, cv2.LINE_AA)
             qscatter = QImage(scatter_img.data, w, h, 3*w, QImage.Format.Format_RGB888).copy()
-            scatter_pix = QPixmap.fromImage(qscatter)
+            scatter_pix = QPixmap.fromImage(tag_qimage_with_working_color_space(qscatter))
 
         overlay_pix = QPixmap.fromImage(overlay_qimg)
 
@@ -1408,7 +1408,7 @@ class ContinuumSubtractTab(QWidget):
                 u8 = (a * 255.0 + 0.5).astype(np.uint8, copy=False)
                 h, w = u8.shape
                 q = QImage(u8.data, w, h, w, QImage.Format.Format_Grayscale8)
-                return q.copy()
+                return tag_qimage_with_working_color_space(q.copy())
 
             if a.ndim == 3 and a.shape[2] == 1:
                 return _qimage_from_float01(a[..., 0])
@@ -1417,7 +1417,7 @@ class ContinuumSubtractTab(QWidget):
                 u8 = (a * 255.0 + 0.5).astype(np.uint8, copy=False)
                 h, w, _ = u8.shape
                 q = QImage(u8.data, w, h, 3 * w, QImage.Format.Format_RGB888)
-                return q.copy()
+                return tag_qimage_with_working_color_space(q.copy())
 
             # fallback
             raise ValueError(f"Unexpected image shape: {a.shape}")
@@ -1730,7 +1730,7 @@ class ContinuumProcessingThread(QThread):
     @staticmethod
     def _qimage_from_uint8(rgb_uint8: np.ndarray) -> QImage:
         h, w = rgb_uint8.shape[:2]
-        return QImage(rgb_uint8.data, w, h, 3*w, QImage.Format.Format_RGB888).copy()
+        return tag_qimage_with_working_color_space(QImage(rgb_uint8.data, w, h, 3*w, QImage.Format.Format_RGB888).copy())
 
     def _nonlinear_finalize_with_opts(self, lin_img: np.ndarray) -> np.ndarray:
         if not self.do_stretch:

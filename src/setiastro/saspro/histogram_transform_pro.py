@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 )
 
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 # ---------------- math ----------------
@@ -218,7 +219,7 @@ def _to_qimage_rgb(img01: np.ndarray) -> QImage:
     u8 = (a * 255.0 + 0.5).astype(np.uint8)
     h, w, _ = u8.shape
     q = QImage(u8.data, w, h, u8.strides[0], QImage.Format.Format_RGB888)
-    return q.copy()
+    return tag_qimage_with_working_color_space(q.copy())
 
 def _to_pixmap(img01: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(_to_qimage_rgb(img01))

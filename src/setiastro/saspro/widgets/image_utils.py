@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 from PyQt6.QtGui import QImage, QPixmap
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 def ensure_contiguous(arr: np.ndarray) -> np.ndarray:
@@ -68,7 +69,7 @@ def numpy_to_qimage(arr: np.ndarray, normalize: bool = True) -> QImage:
         h, w = arr.shape
         img = QImage(arr.data, w, h, w, QImage.Format.Format_Grayscale8)
         img._buf = arr # Keep alive
-        return img
+        return tag_qimage_with_working_color_space(img)
     
     elif arr.ndim == 3:
         h, w, c = arr.shape
@@ -78,21 +79,21 @@ def numpy_to_qimage(arr: np.ndarray, normalize: bool = True) -> QImage:
             arr = arr.squeeze()
             img = QImage(arr.data, w, h, w, QImage.Format.Format_Grayscale8)
             img._buf = arr
-            return img
+            return tag_qimage_with_working_color_space(img)
         
         elif c == 3:
             # RGB
             bytes_per_line = 3 * w
             img = QImage(arr.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             img._buf = arr
-            return img
+            return tag_qimage_with_working_color_space(img)
         
         elif c == 4:
             # RGBA
             bytes_per_line = 4 * w
             img = QImage(arr.data, w, h, bytes_per_line, QImage.Format.Format_RGBA8888)
             img._buf = arr
-            return img
+            return tag_qimage_with_working_color_space(img)
         
         else:
             raise ValueError(f"Unsupported number of channels: {c}")
@@ -144,7 +145,7 @@ def float_to_qimage_rgb8(arr: np.ndarray) -> QImage:
     img = QImage(buf8.data, w, h, 3 * w, QImage.Format.Format_RGB888)
     # Keep reference so bytes stay alive
     img._buf = buf8
-    return img
+    return tag_qimage_with_working_color_space(img)
 
 
 def qimage_to_numpy(qimg: QImage) -> np.ndarray:

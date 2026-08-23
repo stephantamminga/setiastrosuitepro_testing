@@ -32,6 +32,7 @@ from setiastro.saspro.legacy.numba_utils import apply_flat_division_numba, debay
 from setiastro.saspro.legacy.image_manager import load_image
 from setiastro.saspro.star_alignment import StarRegistrationWorker, StarRegistrationThread, IDENTITY_2x3
 from setiastro.saspro.widgets.spinboxes import CustomSpinBox, CustomDoubleSpinBox
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 class LiveStackSettingsDialog(QDialog):
@@ -2005,7 +2006,7 @@ class LiveStackWindow(QDialog):
         qimg = QImage(self._last_frame_bytes.data, w, h, bytespp, fmt)
 
         # 4) update scene
-        self.pixmap_item.setPixmap(QPixmap.fromImage(qimg))
+        self.pixmap_item.setPixmap(QPixmap.fromImage(tag_qimage_with_working_color_space(qimg)))
         self.scene.setSceneRect(0, 0, w, h)
 
         if not self._did_initial_fit:

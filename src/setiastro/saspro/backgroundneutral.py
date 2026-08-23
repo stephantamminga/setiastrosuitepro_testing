@@ -14,6 +14,7 @@ from setiastro.saspro.imageops.stretch import stretch_color_image
 # Shared utilities
 from setiastro.saspro.widgets.image_utils import extract_mask_from_document as _active_mask_array_from_doc
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 
@@ -490,7 +491,7 @@ class BackgroundNeutralizationDialog(QDialog):
             h, w, _ = disp.shape
             qimg = QImage((disp * 255).astype(np.uint8).tobytes(), w, h, 3 * w, QImage.Format.Format_RGB888)
 
-        pix = QPixmap.fromImage(qimg)
+        pix = QPixmap.fromImage(tag_qimage_with_working_color_space(qimg))
 
         # Add to scene; force scene rect to native image pixels and place at (0,0)
         self.scene.clear()

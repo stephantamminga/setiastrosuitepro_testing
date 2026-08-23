@@ -22,6 +22,7 @@ from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
 from setiastro.saspro.legacy.image_manager import (load_image, save_image)
 from setiastro.saspro.imageops.stretch import stretch_color_image, stretch_mono_image
 from setiastro.saspro.starless_engines.syqon_nafnet_engine import syqonnafnetSession
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 def _get_setting_any(settings, keys, default=None):
     """
@@ -1516,7 +1517,7 @@ class CometCentroidPreview(QDialog):
         if img is None: return
         disp = self._render_preview(img)
         qimg = QImage(disp.data, disp.shape[1], disp.shape[0], disp.strides[0], QImage.Format.Format_Grayscale8)
-        self.pix_item.setPixmap(QPixmap.fromImage(qimg.copy()))
+        self.pix_item.setPixmap(QPixmap.fromImage(tag_qimage_with_working_color_space(qimg.copy())))
         self.scene.setSceneRect(0, 0, disp.shape[1], disp.shape[0])
         if fp not in self.xy:
             self._auto_pick(one_file=fp, silent=True)
@@ -1597,6 +1598,6 @@ class CometCentroidPreview(QDialog):
         disp = self._render_preview(img)
         qimg = QImage(disp.data, disp.shape[1], disp.shape[0], disp.strides[0],
                       QImage.Format.Format_Grayscale8)
-        self.pix_item.setPixmap(QPixmap.fromImage(qimg.copy()))
+        self.pix_item.setPixmap(QPixmap.fromImage(tag_qimage_with_working_color_space(qimg.copy())))
         self.scene.setSceneRect(0, 0, disp.shape[1], disp.shape[0])
         self._place_cross()

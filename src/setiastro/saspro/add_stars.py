@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 # I/O (use your legacy functions)
 from setiastro.saspro.legacy.image_manager import load_image
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 try:
@@ -556,7 +557,7 @@ class AddStarsDialog(QDialog):
         else:
             # RGB888
             q = QImage(u8.data, u8.shape[1], u8.shape[0], u8.strides[0], QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(q)
+        return QPixmap.fromImage(tag_qimage_with_working_color_space(q))
 
     # Zoom/fit -----------------------------------------------------------------
     def wheelEvent(self, ev: QWheelEvent):

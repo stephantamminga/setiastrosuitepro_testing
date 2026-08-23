@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QLabel, QSlider, QPushButton, QCheckBox, QDoubleSpinBox, QSizePolicy, QSplitter,
     QToolButton, QMenu, QMessageBox, QStyle, QProgressDialog, QGraphicsItem, QFileDialog
 )
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 from setiastro.saspro.imageops.stretch import stretch_mono_image, stretch_color_image
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
@@ -788,14 +789,14 @@ class IsophoteModelerDialog(QDialog):
         u8 = (np.clip(vals, 0.0, 1.0) * 255.0).astype(np.uint8)
         h, w = u8.shape
         qimg = QImage(u8.data, w, h, w, QImage.Format.Format_Grayscale8)
-        return QPixmap.fromImage(qimg.copy())
+        return QPixmap.fromImage(tag_qimage_with_working_color_space(qimg.copy()))
 
     def _np_to_qpix_linear01(self, img: np.ndarray) -> QPixmap:
         img = np.nan_to_num(img, 0.0, 0.0, 0.0)
         u8 = np.clip(img * 255.0, 0, 255).astype(np.uint8)
         h, w = u8.shape
         qimg = QImage(u8.data, w, h, w, QImage.Format.Format_Grayscale8)
-        return QPixmap.fromImage(qimg.copy())
+        return QPixmap.fromImage(tag_qimage_with_working_color_space(qimg.copy()))
 
     def _enforce_sma_order(self):
         changed = False

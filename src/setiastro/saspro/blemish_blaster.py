@@ -13,6 +13,7 @@ from setiastro.saspro.imageops.stretch import stretch_color_image, stretch_mono_
 
 from dataclasses import dataclass
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 @dataclass
@@ -1253,7 +1254,7 @@ class BlemishBlasterDialogPro(QDialog):
         else:
             h, w, _ = arr.shape
             qimg = QImage(arr.data, w, h, 3*w, QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(qimg)
+        return QPixmap.fromImage(tag_qimage_with_working_color_space(qimg))
 
     def _refresh_pix(self):
         self.pix.setPixmap(self._np_to_qpix(self._display))

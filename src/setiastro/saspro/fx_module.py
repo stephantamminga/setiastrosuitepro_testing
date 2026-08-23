@@ -22,6 +22,7 @@ from setiastro.saspro.widgets.image_utils import (
     to_float01 as _to_float01,
     extract_mask_from_document as _active_mask_array_from_doc
 )
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 # ─── image helpers ────────────────────────────────────────────────────────────
@@ -34,7 +35,7 @@ def _as_qimage_rgb8(float01: np.ndarray) -> QImage:
         f = np.repeat(f, 3, axis=2)
     buf8 = np.ascontiguousarray(np.clip(f, 0.0, 1.0) * 255.0, dtype=np.uint8)
     h, w, _ = buf8.shape
-    return QImage(buf8.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888).copy()
+    return tag_qimage_with_working_color_space(QImage(buf8.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888).copy())
 
 
 def _luminance(image: np.ndarray) -> np.ndarray:

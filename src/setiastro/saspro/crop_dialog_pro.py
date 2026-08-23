@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 
 from setiastro.saspro.wcs_update import update_wcs_after_crop
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 _ROTATION_CURSOR = None
 
@@ -1104,11 +1105,11 @@ class CropDialogPro(QDialog):
         if img01.ndim == 2:
             buf = np.ascontiguousarray((img01 * 255).astype(np.uint8))
             h, w = buf.shape
-            return QImage(buf.tobytes(), w, h, buf.strides[0], QImage.Format.Format_Grayscale8)
+            return tag_qimage_with_working_color_space(QImage(buf.tobytes(), w, h, buf.strides[0], QImage.Format.Format_Grayscale8))
         if img01.ndim == 3 and img01.shape[2] == 3:
             buf = np.ascontiguousarray((img01 * 255).astype(np.uint8))
             h, w, _ = buf.shape
-            return QImage(buf.tobytes(), w, h, buf.strides[0], QImage.Format.Format_RGB888)
+            return tag_qimage_with_working_color_space(QImage(buf.tobytes(), w, h, buf.strides[0], QImage.Format.Format_RGB888))
         raise ValueError(f"Unsupported image shape for preview: {img01.shape}")
 
     # =========================================================================

@@ -87,6 +87,7 @@ from PyQt6.QtGui import (
 from .doc_manager import ImageDocument  # add this import
 from setiastro.saspro.legacy.image_manager import load_image as legacy_load_image
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 # ---------------------------- Threads ----------------------------
 
@@ -1759,7 +1760,7 @@ class FrequencySeperationTab(QWidget):
 
         h, w = u8.shape[:2]
         qimg = QImage(u8.data, w, h, w * 3, QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(qimg.copy())
+        return QPixmap.fromImage(tag_qimage_with_working_color_space(qimg.copy()))
 
     def _get_base_pixmap(self, which: str) -> QPixmap | None:
         """Get or create cached base pixmap for LF, HF, or Combined."""

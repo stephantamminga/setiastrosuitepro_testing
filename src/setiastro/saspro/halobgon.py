@@ -21,6 +21,7 @@ except Exception:
     _lut_color_inplace = None
 
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.color_space_manager import tag_qimage_with_working_color_space
 
 
 # =============================================================================
@@ -41,7 +42,7 @@ def _qimage_from_rgb01(a: np.ndarray) -> QImage:
     a = np.clip(a, 0, 1).astype(np.float32)
     a8 = (a * 255.0).astype(np.uint8)
     h, w = a8.shape[:2]
-    return QImage(a8.data, w, h, w*3, QImage.Format.Format_RGB888).copy()
+    return tag_qimage_with_working_color_space(QImage(a8.data, w, h, w*3, QImage.Format.Format_RGB888).copy())
 
 def _maybe_get_mask(parent, ref_img: np.ndarray) -> Optional[np.ndarray]:
     """Fetch an applied mask as float [0..1], broadcastable to ref_img."""
