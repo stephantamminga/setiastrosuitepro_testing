@@ -1,4 +1,4 @@
-# pro/save_options.py
+#saspro/save_options.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -35,6 +35,8 @@ _BIT_DEPTHS = {
     "xisf": ["16-bit", "32-bit unsigned", "32-bit floating point"],
     "psb":  ["16-bit", "32-bit floating point"], 
     "webp": ["8-bit"],
+    # SYQ Core 1: u8 / u16 / f32 (SASpro is f32-internal; no u32 or f64 export).
+    "syq":  ["8-bit", "16-bit", "32-bit floating point"],
 }
 
 _TIFF_COMP = ["None", "LZW", "ZIP (Deflate)"]

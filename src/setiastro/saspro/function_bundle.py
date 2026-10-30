@@ -1,4 +1,4 @@
-# pro/function_bundle.py
+#saspro/function_bundle.py
 from __future__ import annotations
 import json
 from typing import Iterable, List, Any, Dict
@@ -14,6 +14,8 @@ from PyQt6.QtCore import  QThread
 import time
 from setiastro.saspro.dnd_mime import MIME_CMD
 from setiastro.saspro.ops.commands import normalize_cid
+from setiastro.saspro.help_support import make_help_button
+
 def _pin_on_top_mac(win: QDialog):
     if sys.platform == "darwin":
         # Float above normal windows, behave like a palette/tool window
@@ -465,6 +467,8 @@ class FunctionBundleDialog(QDialog):
         left.addWidget(self.list, 1)
         row = QHBoxLayout()
         row.addWidget(self.btn_new); row.addWidget(self.btn_dup); row.addWidget(self.btn_del)
+        row.addStretch(1)
+        row.addWidget(make_help_button("function_bundles", self))
         left.addLayout(row)
 
         right = QVBoxLayout()
@@ -751,6 +755,7 @@ class FunctionBundleDialog(QDialog):
         "save_project",
         "save_active",
         "save_active_as",
+        "export_fits",
         "export_fits_bundle",
         "plate_solve",          # writes header/WCS, may or may not emit `changed`
         "psf_viewer",
@@ -1538,6 +1543,35 @@ class FunctionBundleManager:
     def list_bundles(self) -> list[dict]:
         return self._load_all()
 
+    def add_bundle(self, name: str, steps: list[dict]) -> str:
+        """Append a new bundle, de-duplicating the display name. Returns the
+        final name actually stored."""
+        bundles = self._load_all()
+
+        base = (name or "Function Bundle").strip() or "Function Bundle"
+        existing = {(b.get("name") or "").strip().lower() for b in bundles}
+        final = base
+        i = 2
+        while final.strip().lower() in existing:
+            final = f"{base} ({i})"
+            i += 1
+
+        clean = []
+        for st in steps or []:
+            if isinstance(st, dict) and st.get("command_id"):
+                entry = {"command_id": st["command_id"]}
+                p = st.get("preset")
+                entry["preset"] = dict(p) if isinstance(p, dict) else {}
+                clean.append(entry)
+
+        bundles.append({"name": final, "steps": clean})
+        try:
+            self._settings.setValue(self.SETTINGS_KEY, json.dumps(bundles, ensure_ascii=False))
+            self._settings.sync()
+        except Exception:
+            pass
+        return final
+
     def get_bundle(self, name: str) -> dict | None:
         if not name:
             return None
@@ -1563,6 +1597,20 @@ def get_bundle_manager(app=None) -> FunctionBundleManager:
     if _bundle_mgr is None:
         _bundle_mgr = FunctionBundleManager(app)
     return _bundle_mgr
+
+def add_function_bundle(name: str, steps: list[dict], parent=None) -> str:
+    """Persist a new Function Bundle and refresh an open dialog so it won't
+    clobber the new bundle on its next save. Returns the stored name."""
+    mgr = get_bundle_manager()
+    final = mgr.add_bundle(name, steps)
+
+    global _dialog_singleton
+    try:
+        if _dialog_singleton is not None:
+            _dialog_singleton.reload_from_settings_after_import()
+    except Exception:
+        pass
+    return final
 
 # ---------- script / command entry point ----------
 def _normalize_steps_for_hcd(steps: list[Any]) -> list[Dict[str, Any]]:

@@ -1,111 +1,54 @@
 import sys
-import typing_extensions
 import urllib
 # Standard library imports
-from itertools import combinations
 from tifffile import imwrite
-from datetime import timedelta
-import pickle
 import os
 os.environ['LIGHTKURVE_STYLE'] = 'default'
 import tempfile
 import time
 import json
-import logging
 import math
 from datetime import datetime, timedelta, timezone
-from decimal import getcontext
 from urllib.parse import quote
-from urllib.parse import quote_plus
 import webbrowser
-import warnings
-import shutil
-import subprocess
 from setiastro.saspro.xisf import XISF
 import requests
 import csv
 import lz4.block
 import zstandard
-import base64
 import ast
 from setiastro.saspro.main_helpers import non_blocking_sleep
 import platform
 from pathlib import Path
-import glob
-from typing import List, Tuple, Dict, Set
-import time
-from datetime import datetime
-import pywt
+from typing import List, Tuple, Set
 from io import BytesIO
-import io
 import re
 from collections import defaultdict
-from scipy.spatial import Delaunay, KDTree
-# from scipy.ndimage import gaussian_filter, laplace  <-- Removed unused
-# import scipy.ndimage as ndi                         <-- Removed unused
-# from scipy.ndimage import zoom                      <-- Removed unused (replaced by cv2.resize)
-import multiprocessing
+from scipy.spatial import KDTree
 import matplotlib
 matplotlib.use("QtAgg") 
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib.colors import hsv_to_rgb
 import numpy as np
-from typing import List, Tuple, Optional
-from skimage.restoration import richardson_lucy, denoise_bilateral, denoise_tv_chambolle
-from skimage.color import rgb2gray, rgb2lab, lab2rgb
-from skimage.transform import warp_polar, warp
-from skimage import img_as_float32
-from numpy.fft import fft2, ifft2, fftshift, ifftshift
-from typing import Optional, Tuple, Callable
-from scipy.signal import medfilt
-import matplotlib.ticker as mtick
-from scipy.interpolate import RBFInterpolator
-import random
+from typing import List, Tuple, Optional, Callable
 import inspect
 #if running in IDE which runs ipython or jupiter in backend reconfigure may not be available
 if (sys.stdout is not None) and (hasattr(sys.stdout, "reconfigure")):
     sys.stdout.reconfigure(encoding='utf-8')
-
 try:
-    from photutils.isophote import Ellipse, EllipseGeometry, build_ellipse_model
+    from photutils.isophote import Ellipse
 except Exception as e:
     Ellipse = EllipseGeometry = build_ellipse_model = None
-
-from astropy.stats import sigma_clipped_stats
-from collections.abc import MutableMapping
 from astropy.io.votable import parse_single_table
-from astropy.timeseries import LombScargle, BoxLeastSquares
-from photutils.detection import DAOStarFinder
-from scipy.spatial import ConvexHull
-from astropy.table import Table, vstack
-from numba import njit, prange
-from scipy.optimize import curve_fit
-import exifread
-from setiastro.saspro import astroalign
+from astropy.table import Table
 import sqlite3
-from datetime import datetime
-import traceback
 import sep
-from astroquery.mast import Tesscut
-
-from lightkurve import TessTargetPixelFile
-import oktopus
+from setiastro.saspro.help_support import make_help_button
+from setiastro.saspro import cds_health
 import lightkurve as lk
-from scipy.interpolate import griddata
-from astropy.io.fits import Header as FitsHeader
 lk.MPLSTYLE = None
-
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-
-from astropy.wcs.utils import skycoord_to_pixel
 from astropy.coordinates import SkyCoord
 from astropy import units as u
 import plotly.graph_objects as go
-
 from astropy.io.fits import Header
-from pyvo.dal.exceptions import DALServiceError
-
 # Reproject for WCS-based alignment
 try:
     from reproject import reproject_interp
@@ -116,11 +59,7 @@ except ImportError:
 
 OPENCV_AVAILABLE = True
 
-
-
 # Third-party library imports
-import requests
-import numpy as np
 import pandas as pd
 import cv2
 from PIL import Image, ImageDraw, ImageFont
@@ -128,31 +67,14 @@ from PIL import Image, ImageDraw, ImageFont
 # Astropy and Astroquery imports
 from astropy.io import fits
 from astropy.time import Time
-from astropy.coordinates import SkyCoord, EarthLocation, AltAz, get_body, get_sun
-import astropy.units as u
 from astropy.wcs import WCS
 from astroquery.simbad import Simbad
 from astroquery.mast import Mast
 from astroquery.vizier import Vizier
-import tifffile as tiff
-
 from astropy.utils.data import conf
 
-from scipy.interpolate import PchipInterpolator
-from scipy.interpolate import Rbf
-# from scipy.ndimage import median_filter  <-- Removed unused
-# from scipy.ndimage import convolve       <-- Removed unused
-# from scipy.signal import fftconvolve     <-- Removed unused
-from scipy.interpolate import interp1d
-
-
 import numpy.ma as ma
-
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
 from matplotlib.patches import Circle
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from setiastro.saspro.plate_solver import plate_solve_doc_inplace, _active_doc_from_parent, _get_seed_mode, _set_seed_mode, _as_header
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
 
@@ -161,35 +83,52 @@ from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
 #################################
 from collections import defaultdict
 import fnmatch
-import pyqtgraph as pg
-import psutil
-from PyQt6.QtGui import QIntValidator
+
 # ----- QtWidgets -----
-from PyQt6.QtWidgets import (    QApplication,    QMainWindow,    QWidget,    QVBoxLayout,    QHBoxLayout,    QLabel,    QPushButton,    QFileDialog,    QGraphicsView,    QGraphicsScene,    QMessageBox,    QInputDialog,    QTreeWidget,
-    QTreeWidgetItem,    QGraphicsPolygonItem,    QFrame,    QToolTip,    QCheckBox,    QDialog,    QFormLayout,    QSpinBox,    QDialogButtonBox,    QGridLayout,    QGraphicsEllipseItem,    QGraphicsLineItem,    QGraphicsRectItem,
-    QGraphicsPathItem,    QDoubleSpinBox,    QColorDialog,    QFontDialog,    QStyle,    QSlider,    QTabWidget,    QScrollArea,    QSizePolicy,    QSpacerItem,    QAbstractItemView,    QToolBar,    QGraphicsPixmapItem,    QRubberBand,
-    QGroupBox,    QGraphicsTextItem,    QComboBox,    QLineEdit,    QRadioButton,    QButtonGroup,    QHeaderView,    QStackedWidget,    QSplitter,    QMenuBar,    QTextEdit,    QPlainTextEdit,          QProgressBar,    QGraphicsItem,
-    QToolButton,    QStatusBar,    QMenu,    QTableWidget,    QTableWidgetItem,    QListWidget,    QListWidgetItem,    QSplashScreen,    QProgressDialog,     QDockWidget,    QAbstractItemView,    QStyledItemDelegate,    QListView,    QCompleter    , QDateTimeEdit
+from PyQt6.QtWidgets import (    QApplication,    QWidget,    QVBoxLayout,    QHBoxLayout,    QLabel,    QPushButton,    QFileDialog,    QGraphicsView,    QGraphicsScene,    QMessageBox,    QInputDialog,    QTreeWidget,
+    QTreeWidgetItem,    QFrame,    QCheckBox,    QDialog,    QFormLayout,    QSpinBox,    QDialogButtonBox,    QGridLayout,    QGraphicsEllipseItem,    QGraphicsLineItem,    QGraphicsRectItem,
+    QGraphicsPathItem,    QDoubleSpinBox,    QColorDialog,    QFontDialog,    QStyle,    QAbstractItemView,    
+    QGroupBox,    QGraphicsTextItem,    QComboBox,    QLineEdit,    QProgressBar,    QGraphicsItem,
+    QToolButton,    QStatusBar,    QMenu,     QProgressDialog,     QDockWidget,    QDateTimeEdit
 )
 
 # ----- QtGui -----
-from PyQt6.QtGui import (QPixmap,QImage,    QPainter,    QPen,    QColor,    QTransform,    QIcon,    QPainterPath,    QKeySequence,    QFont,    QMovie,    QCursor,    QBrush,    QShortcut,    QPolygon,
-    QFontMetrics,        QPolygonF,    QKeyEvent,    QPalette,     QWheelEvent,     QDoubleValidator,    QFontDatabase,    QGuiApplication,    QStandardItemModel,    QStandardItem,    QAction  # NOTE: In PyQt6, QAction is in QtGui (moved from QtWidgets)
+from PyQt6.QtGui import (QPixmap,QImage,    QPainter,    QPen,    QColor,    QTransform,    QIcon,    QPainterPath,    QKeySequence,    QFont,    QBrush,    QShortcut,    
+    QPalette,     QAction  
 )
 
 # ----- QtCore -----
-from PyQt6.QtCore import (    Qt,    QRectF,    QLineF,    QPointF,    QThread,    pyqtSignal,    QCoreApplication,    QPoint,    QTimer,    QRect,    QFileSystemWatcher,    QEvent,    pyqtSlot,    QLocale,    QProcess,    QSize,
-    QObject,    QSettings,    QRunnable,    QThreadPool,    QSignalBlocker,    QStandardPaths,    QModelIndex,    QMetaObject, QDateTime, QEventLoop
+from PyQt6.QtCore import (    Qt,    QRectF,    QLineF,    QPointF,    QThread,    pyqtSignal,    QTimer,    QEvent,    pyqtSlot,  
+   QSettings,    QSignalBlocker,    QDateTime, QEventLoop, QStandardPaths
 )
 
 
 # Math functions
 from math import sqrt
-import math
 
 from setiastro.saspro.legacy.image_manager import load_image, save_image
 from setiastro.saspro.imageops.stretch import stretch_color_image, stretch_mono_image
 from setiastro.saspro import minorbodycatalog as mbc
+
+# Interactive 3D orbit viewer (shared with the Supernova/Asteroid Hunter).
+# Guarded so a missing pyqtgraph.opengl / PyOpenGL degrades to a message
+# on the "SASpro Orbit Explorer" choice rather than breaking the module.
+try:
+    from setiastro.saspro.orbit_explorer import (
+        open_orbit_explorer, extract_elements_from_row,
+    )
+    _HAS_ORBIT_EXPLORER = True
+    _ORBIT_EXPLORER_ERR = ""
+except Exception as _oe_err:                     # pragma: no cover
+    _HAS_ORBIT_EXPLORER = False
+    _ORBIT_EXPLORER_ERR = str(_oe_err)
+
+    def extract_elements_from_row(_row):
+        return None
+
+    def open_orbit_explorer(*_a, **_k):
+        return None
+
 from setiastro.saspro.resources import get_icon_path
 
 # Determine if running inside a PyInstaller bundle
@@ -702,8 +641,44 @@ CATEGORY_TO_COLOR = {
 
 
 
+# SIMBAD endpoint configuration.
+#
+# TIMEOUT was renamed to lowercase `timeout` in astroquery 0.4.8, so on a
+# current astroquery the old spelling is a silent no-op and every call falls
+# back to the OS TCP timeout (~130 s on Linux, ~21 s on Windows). Set both
+# names. And keep the value well under the old 300 s — five minutes is a
+# sane ceiling for a slow-but-alive archive and exactly what makes a dead
+# one feel like a hang.
 Simbad.ROW_LIMIT = 0  # Remove row limit for full results
-Simbad.TIMEOUT = 300  # Increase timeout for long queries
+
+_SIMBAD_TIMEOUT_S = 45
+
+
+def _configure_simbad_endpoint(server: str | None = None,
+                               timeout: float = _SIMBAD_TIMEOUT_S) -> str:
+    """
+    Point astroquery at `server` (or whichever mirror cds_health last found
+    healthy) and bound its timeouts. Returns the hostname actually selected so
+    callers can build matching sim-sam / sim-basic URLs against the same host.
+    """
+    import astroquery.simbad as _aqs
+
+    host = server or cds_health.current_server()
+    for setter in (
+        lambda: setattr(_aqs.conf, "server", host),
+        lambda: setattr(Simbad, "server", host),
+        lambda: setattr(_aqs.conf, "timeout", float(timeout)),
+        lambda: setattr(Simbad, "timeout", float(timeout)),
+        lambda: setattr(Simbad, "TIMEOUT", float(timeout)),
+    ):
+        try:
+            setter()
+        except Exception:
+            pass
+    return host
+
+
+_configure_simbad_endpoint()
 
 # Astrometry.net API constants
 ASTROMETRY_API_URL = "http://nova.astrometry.net/api/"
@@ -743,6 +718,7 @@ from PyQt6.QtGui import QPainter, QPen, QColor
 class MarkerLayer(QGraphicsItem):
     def __init__(self, image_w, image_h, show_names_fn, color_fn, style_fn,
                  selected_name_fn=lambda: None, show_active_name_fn=lambda: False,
+                 name_font_fn=None, name_color_fn=None,
                  radius_px=6, cell=64, parent=None):
         super().__init__(parent)
         self._w, self._h = image_w, image_h
@@ -755,6 +731,10 @@ class MarkerLayer(QGraphicsItem):
         self._style = style_fn
         self._selected_name = selected_name_fn
         self._show_active_name = show_active_name_fn
+        # Object-name label styling (configurable in WIMI Settings). Defaults
+        # keep the old look (Arial 12, white) when no getters are supplied.
+        self._name_font = name_font_fn or (lambda: QFont("Arial", 12))
+        self._name_color = name_color_fn or (lambda: QColor(255, 255, 255))
         self.setZValue(100)
         self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption, True)
@@ -867,12 +847,27 @@ class MarkerLayer(QGraphicsItem):
                             p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
                     if pt.get("name") and (show_names or (show_active and is_sel)):
-                        text_pen = QPen(QColor(255, 255, 255))
+                        text_pen = QPen(self._name_color())
                         text_pen.setCosmetic(True)
                         p.setPen(text_pen)
+                        # Configurable font, drawn screen-constant: the point
+                        # size is divided by the current zoom so the label is
+                        # the same on-screen size at any zoom (the markers are
+                        # screen-constant too). pointSizeF is preferred; fall
+                        # back to pixelSize when the font was built that way.
+                        nf = QFont(self._name_font())
+                        base_pt = nf.pointSizeF()
+                        p.save()
+                        if base_pt > 0:
+                            nf.setPointSizeF(max(0.1, base_pt / scene_scale))
+                        else:
+                            base_px = nf.pixelSize() if nf.pixelSize() > 0 else 12
+                            nf.setPixelSize(max(1, int(round(base_px / scene_scale))))
+                        p.setFont(nf)
                         # Offset name label by fixed screen amount
                         label_offset = (FIXED_SCREEN_R + 2.0) / scene_scale
                         p.drawText(QPointF(x + label_offset, y - label_offset), str(pt["name"]))
+                        p.restore()
                         p.setPen(base_pen)
 
 def _qt_is_alive(obj) -> bool:
@@ -1021,9 +1016,9 @@ class CustomGraphicsView(QGraphicsView):
 
             s = (source or "").strip().lower()
 
-            # --- Minor-body overlays → 3d-asteroids.space ---
+            # --- Minor-body overlays → choose how to explore ---
             if s.startswith("minordb"):
-                open_minor_body_3d_page(object_name, kind=kind)
+                prompt_minor_body_choice(self.parent, object_name, kind=kind)
                 return
 
             if source == "Simbad" and object_name:
@@ -1306,7 +1301,7 @@ class CustomGraphicsView(QGraphicsView):
 
         s = source.lower()
         if s.startswith("minordb"):
-            open_minor_body_3d_page(name, kind=kind)
+            prompt_minor_body_choice(self.parent, name, kind=kind)
             return
 
         try:
@@ -2963,6 +2958,9 @@ def _mask_safe_float(val):
         return None
     return f
 
+def _adql_quote(s) -> str:
+    """Quote a string as an ADQL literal. Doubles embedded single quotes."""
+    return "'" + str(s).replace("'", "''") + "'"
 
 def _fmt_mag(v):
     """Format a magnitude for the tree's Mag column; '' for missing/non-numeric."""
@@ -3121,6 +3119,179 @@ def open_minor_body_3d_page(name: str, kind: str = "Asteroid") -> None:
     url = f"https://3d-asteroids.space/{base}/{slug}"
     webbrowser.open(url)
 
+
+def open_jpl_sbdb_page(name: str, kind: str = "Asteroid") -> None:
+    """
+    Open JPL's Small-Body Database Lookup for this object — the
+    authoritative record (orbit, physical parameters, close approaches,
+    and JPL's own orbit viewer).
+
+    The tool takes a free-form identifier via `sstr`, so no slug or
+    provisional-designation guessing is needed: a plain number resolves
+    an asteroid, and the full designation resolves a comet. One endpoint
+    serves both.
+    """
+    if not name:
+        return
+    s = name.replace(chr(160), " ").strip()      # normalize non-breaking space
+    is_comet = bool(kind and str(kind).lower().startswith("comet"))
+
+    if is_comet:
+        # Comets: never reduce to a bare number ('1P' -> 1 would resolve
+        # to asteroid Ceres). Pass the designation as-is.
+        sstr = s
+    elif re.match(r'^\d{4}[ _-][A-Za-z]{1,2}\d*$', s):
+        # Unnumbered provisional ('2011 TK5'): the leading 4 digits are a
+        # YEAR, not a catalog number — pass the whole designation.
+        sstr = s
+    else:
+        # Numbered asteroid ('(6281) Strnad', '6281 Strnad', '1 Ceres'):
+        # the catalog number alone is the least ambiguous identifier.
+        m = re.match(r'^\(?\s*(\d+)\s*\)?', s)
+        sstr = m.group(1) if m else s
+
+    url = ("https://ssd.jpl.nasa.gov/tools/sbdb_lookup.html#/?sstr="
+           + quote(sstr))
+    webbrowser.open(url)
+
+
+def _lookup_minor_body_row(db_path, name: str, kind: str = ""):
+    """
+    Read one catalog row for `name` straight from the minor-body SQLite,
+    read-only, matching on the `designation` column. Tries the table the
+    `kind` suggests first, then the other. Returns a plain dict, or None.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    tables = (["comets", "asteroids"]
+              if str(kind or "").lower().startswith("comet")
+              else ["asteroids", "comets"])
+    try:
+        uri = f"file:{Path(db_path).as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+    except Exception:
+        return None
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        for tbl in tables:
+            try:
+                cur.execute(
+                    f"SELECT * FROM {tbl} WHERE designation = ? LIMIT 1", (name,))
+            except sqlite3.Error:
+                continue
+            r = cur.fetchone()
+            if r is not None:
+                return {k: r[k] for k in r.keys()}
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _open_sas_orbit_explorer(window, name: str, kind: str = "Asteroid") -> None:
+    """
+    Launch the in-app SASpro Orbit Explorer for a minor body. Needs the
+    observation JD and DB path the last minor-body search stashed on the
+    window, plus the body's Keplerian elements looked up by designation.
+    """
+    from PyQt6.QtWidgets import QMessageBox
+
+    if not _HAS_ORBIT_EXPLORER:
+        QMessageBox.information(
+            window, "Orbit Explorer",
+            "The 3D orbit explorer could not be loaded.\n\n"
+            f"{_ORBIT_EXPLORER_ERR}\n\n"
+            "It needs pyqtgraph.opengl and PyOpenGL (pip install PyOpenGL).")
+        return
+
+    jd = getattr(window, "_minor_jd", None)
+    db_path = getattr(window, "_minor_db_path", None)
+    if jd is None or not db_path:
+        QMessageBox.information(
+            window, "Orbit Explorer",
+            "Run a minor-body search first — I need the observation time it "
+            "was computed at to place the orbit.")
+        return
+
+    row = _lookup_minor_body_row(db_path, name, kind)
+    if row is None:
+        QMessageBox.information(
+            window, "Orbit Explorer",
+            f"Couldn't find {name} in the catalog to read its orbit.")
+        return
+
+    el = extract_elements_from_row(row)
+    if el is None:
+        QMessageBox.information(
+            window, "Orbit Explorer",
+            f"{name} has no usable orbital elements in the catalog, so its "
+            "orbit can't be drawn.")
+        return
+
+    H = None
+    for k in ("magnitude_H", "H", "absolute_magnitude"):
+        if k in row and row[k] not in (None, ""):
+            try:
+                H = float(row[k])
+                break
+            except Exception:
+                pass
+
+    body = {"designation": name, "kind": (kind or "minor body"),
+            "H": H, "elements": el}
+    icon = None
+    try:
+        icon = window.windowIcon()
+    except Exception:
+        icon = None
+    dlg = open_orbit_explorer(window, body, float(jd),
+                              settings=getattr(window, "settings", None),
+                              icon=icon)
+    if dlg is not None:
+        # Hold a reference so the non-modal window isn't garbage collected.
+        refs = getattr(window, "_orbit_dialogs", None)
+        if refs is None:
+            refs = window._orbit_dialogs = []
+        refs.append(dlg)
+
+
+def prompt_minor_body_choice(window, name: str, kind: str = "Asteroid") -> None:
+    """
+    Ask how to explore a minor body, then dispatch. Replaces the old
+    straight-to-3d-asteroids double-click: not every object is on that
+    site, and the in-app Orbit Explorer works for anything in the local
+    catalog.
+    """
+    from PyQt6.QtWidgets import QMessageBox
+
+    if not name:
+        return
+    box = QMessageBox(window)
+    box.setWindowTitle("Explore Minor Body")
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setText(f"How would you like to explore {name}?")
+    box.setInformativeText(
+        "Orbit Explorer draws it in 3D inside SASpro from the local catalog.\n"
+        "JPL Small-Body Database is the authoritative record (orbit, physical\n"
+        "parameters, close approaches). 3D Model Site is 3d-asteroids.space.")
+    b_orbit = box.addButton("SASpro Orbit Explorer", QMessageBox.ButtonRole.AcceptRole)
+    b_jpl = box.addButton("JPL Small-Body Database", QMessageBox.ButtonRole.AcceptRole)
+    b_model = box.addButton("3D Model Site", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton(QMessageBox.StandardButton.Cancel)
+    box.setDefaultButton(b_orbit)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is b_jpl:
+        open_jpl_sbdb_page(name, kind=kind)
+    elif clicked is b_model:
+        open_minor_body_3d_page(name, kind=kind)
+    elif clicked is b_orbit:
+        _open_sas_orbit_explorer(window, name, kind=kind)
+
 class _CrosshairOverlay(QWidget):
     """Transparent overlay that draws a crosshair at the viewport center."""
     MODES = ["off", "thin", "full", "gap"]
@@ -3203,6 +3374,148 @@ class AtlasCatalogThread(QThread):
                     time.sleep(1.5)
         # All attempts failed — emit empty list silently
         self.finished.emit([])
+
+class SimbadQueryWorker(QThread):
+    """
+    Runs the two-step SIMBAD lookup off the GUI thread so Query Simbad
+    doesn't freeze WIMI. Emits stage() for live progress text and
+    finished_ok(result, extras_dict) on success, failed(msg) on error.
+    `cancel()` is cooperative — it is checked between stages/attempts.
+    """
+    stage        = pyqtSignal(str)                # free-form status text
+    attempt_info = pyqtSignal(int, int)           # (current_attempt, max_attempts)
+    finished_ok  = pyqtSignal(object, dict)       # (astropy Table or None, extras_dict)
+    failed       = pyqtSignal(str)                # error message
+
+    def __init__(self, tap_query: str, sam_url: str, sam_params: dict,
+                 max_attempts: int = 5, retry_wait_s: float = 1.0, parent=None):
+        super().__init__(parent)
+        self._tap_query     = tap_query
+        self._sam_url       = sam_url
+        self._sam_params    = sam_params
+        self._max_attempts  = int(max_attempts)
+        self._retry_wait_s  = float(retry_wait_s)
+        self._cancel        = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def _check_cancel(self):
+        if self._cancel:
+            raise RuntimeError("Query cancelled by user")
+
+    def run(self):
+        try:
+            # ——— Stage 1: TAP query with retries ———
+            # (cds_health is imported at module level; no local import needed.)
+            self.stage.emit("Contacting SIMBAD TAP service…")
+            result = None
+            last_err = None
+            for attempt in range(1, self._max_attempts + 1):
+                self._check_cancel()
+                self.attempt_info.emit(attempt, self._max_attempts)
+                self.stage.emit(
+                    f"Querying SIMBAD TAP (attempt {attempt}/{self._max_attempts})…"
+                )
+                try:
+                    result = Simbad.query_tap(self._tap_query)
+                    last_err = None
+                    cds_health.note_success()
+                    break
+                except Exception as e:
+                    last_err = e
+                    # A connection failure means the host is not answering.
+                    # Retrying costs a full timeout per attempt to re-learn
+                    # something we already know, so stop on the first one.
+                    # Server-side errors (5xx, rate-limit) are still retried.
+                    if cds_health.note_failure(e, context="simbad/query_tap"):
+                        self.failed.emit(
+                            "SIMBAD is unreachable (connection failed).\n\n"
+                            "CDS appears to be down — further retries would "
+                            "only wait out the same timeout.\n\n"
+                            f"{type(e).__name__}: {e}"
+                        )
+                        return
+                    if attempt < self._max_attempts:
+                        self.stage.emit(
+                            f"TAP attempt {attempt} failed ({type(e).__name__}); "
+                            f"retrying in {self._retry_wait_s:.0f}s…"
+                        )
+                        # Cooperative sleep so cancel is responsive
+                        slept = 0.0
+                        step = 0.1
+                        while slept < self._retry_wait_s:
+                            if self._cancel:
+                                break
+                            time.sleep(step)
+                            slept += step
+
+            if last_err is not None:
+                self.failed.emit(
+                    "SIMBAD TAP service unreachable after "
+                    f"{self._max_attempts} attempts.\n\nLast error:\n{last_err}"
+                )
+                return
+
+            self._check_cancel()
+
+            if result is None or len(result) == 0:
+                # Empty result is NOT an error — upstream decides what to do
+                self.stage.emit("SIMBAD returned no objects in this region.")
+                self.finished_ok.emit(None, {})
+                return
+
+            self.stage.emit(f"TAP returned {len(result)} rows. Fetching star extras…")
+
+            # ——— Stage 2: sim-sam for FLUX/PLX/SP extras ———
+            self._check_cancel()
+            extras = {}
+
+            # No stellar types selected -> the caller passed sam_url=None.
+            # Nothing to fetch; skip the slowest request in the query.
+            if not self._sam_url:
+                self.stage.emit("No star types selected; skipping photometry fetch.")
+                self._check_cancel()
+                self.stage.emit("Merging results…")
+                self.finished_ok.emit(result, {})
+                return
+
+            try:
+                self.stage.emit("Downloading star photometry/parallax (sim-sam)…")
+                # (connect, read). 300 s was a single combined timeout — five
+                # minutes of nothing when the host is dead. 5 s to establish a
+                # connection is generous; 90 s of read covers a genuinely slow
+                # VOTable for a wide field.
+                resp = requests.get(self._sam_url, params=self._sam_params,
+                                    timeout=(5, 90))
+                resp.raise_for_status()
+
+                self._check_cancel()
+                self.stage.emit("Parsing VOTable response…")
+                vot = parse_single_table(BytesIO(resp.content))
+                tbl = vot.to_table(use_names_over_ids=True)
+                extras = {row["MAIN_ID"]: row for row in tbl}
+                self.stage.emit(f"Got extras for {len(extras)} stars.")
+            except Exception as e:
+                # Non-fatal — the caller will note we have no extras
+                self.stage.emit(
+                    f"sim-sam extras unavailable ({type(e).__name__}); continuing without."
+                )
+                extras = {}
+
+            self._check_cancel()
+            self.stage.emit("Merging results…")
+            self.finished_ok.emit(result, extras)
+
+        except RuntimeError as e:
+            # Cancellation path
+            if "cancelled" in str(e).lower():
+                self.failed.emit("Cancelled.")
+            else:
+                self.failed.emit(f"{type(e).__name__}: {e}")
+        except Exception as e:
+            import traceback
+            self.failed.emit(f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
 
 def _ra_in_atlas(ra_deg: float, dec_deg: float, atlas_entries: list) -> bool:
     """
@@ -3492,6 +3805,8 @@ class WIMIDialog(QDialog):
         self.copy_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_CommandLink))
         self.copy_button.clicked.connect(self.copy_ra_dec_to_clipboard)
         button_layout.addWidget(self.copy_button)
+
+        button_layout.addWidget(make_help_button("whats_in_my_image", self))
 
         # Settings button (wrench icon)
         self.settings_button = QPushButton("⚙ Settings")
@@ -3799,6 +4114,69 @@ class WIMIDialog(QDialog):
             lambda on: self.settings.setValue("wimi/augment_with_gaia", bool(on)))
         self.advanced_search_panel.addWidget(self.augment_with_gaia_checkbox)
 
+        # ─────────────────────────────────────────────────────────────
+        # Magnitude limit (post-search filter)
+        #
+        # Simbad / Vizier / MinorBodies / Gaia-augment all have their own
+        # idea of which bands they return (V, B, G, H, g, k, ...), and
+        # several catalogs return rows with no magnitude at all. Rather
+        # than push a mag constraint into every per-source query (which
+        # would mean threading it through five different code paths and
+        # relying on each catalog honoring our constraint), we apply the
+        # cut once, uniformly, right where results funnel into the tree
+        # and marker layer. See _filter_results_by_magnitude.
+        #
+        # Default is OFF (no limit) so this is a strict opt-in and
+        # existing user workflows don't change. When ON, any result
+        # with no numeric magnitude in a known field is DROPPED — the
+        # user asked for a magnitude limit, so "unknown mag" is treated
+        # as "fails the test" rather than silently passing through.
+        from PyQt6.QtWidgets import QCheckBox as _QCheckBox  # local alias; QCheckBox is already in scope
+        mag_filter_row = QHBoxLayout()
+        self.mag_limit_checkbox = QCheckBox(self.tr("Limit by magnitude"))
+        self.mag_limit_checkbox.setToolTip(
+            "When checked, drop any result fainter than the magnitude\n"
+            "below from the tree, markers, and all downstream views.\n"
+            "Any result with no magnitude in a known band (Vmag / Bmag /\n"
+            "Gmag / mag / H / g / k) is also dropped — if you asked for\n"
+            "a magnitude cut, 'unknown' fails it. Default: off."
+        )
+        self.mag_limit_checkbox.setChecked(
+            self.settings.value("wimi/mag_filter_enabled", False, type=bool))
+        self.mag_limit_spinbox = QDoubleSpinBox()
+        self.mag_limit_spinbox.setDecimals(2)
+        self.mag_limit_spinbox.setRange(-5.0, 30.0)       # Sun ≈ -26.7 is irrelevant;
+                                                          # realistic apparent-mag range for
+                                                          # cataloged non-solar objects
+        self.mag_limit_spinbox.setSingleStep(0.5)
+        self.mag_limit_spinbox.setValue(
+            self.settings.value("wimi/mag_filter_limit", 18.0, type=float))
+        self.mag_limit_spinbox.setSuffix(" mag")
+        self.mag_limit_spinbox.setToolTip(
+            "Drop results with magnitude > this value.\n"
+            "Fainter stars have larger magnitudes."
+        )
+        self.mag_limit_spinbox.setEnabled(self.mag_limit_checkbox.isChecked())
+
+        def _on_mag_filter_toggled(on: bool):
+            self.settings.setValue("wimi/mag_filter_enabled", bool(on))
+            self.mag_limit_spinbox.setEnabled(bool(on))
+            # Re-filter in place so the user sees the change immediately
+            # (no need to re-run the search).
+            self._reapply_mag_filter_live()
+
+        def _on_mag_filter_value_changed(v: float):
+            self.settings.setValue("wimi/mag_filter_limit", float(v))
+            if self.mag_limit_checkbox.isChecked():
+                self._reapply_mag_filter_live()
+
+        self.mag_limit_checkbox.toggled.connect(_on_mag_filter_toggled)
+        self.mag_limit_spinbox.valueChanged.connect(_on_mag_filter_value_changed)
+
+        mag_filter_row.addWidget(self.mag_limit_checkbox)
+        mag_filter_row.addWidget(self.mag_limit_spinbox, 1)
+        self.advanced_search_panel.addLayout(mag_filter_row)
+
         search_button_layout = QHBoxLayout()
 
         self.simbad_defined_region_button = QPushButton(self.tr("Search Defined Region"))
@@ -4002,8 +4380,15 @@ class WIMIDialog(QDialog):
         self.wcs = None  # Initialize WCS to None
         # Initialize selected color and font with default values
         self.selected_color = QColor(Qt.GlobalColor.red)  # Default annotation color
-        self.selected_font = QFont("Arial", 12)  # Default font for text annotations   
-        self.populate_object_tree() 
+        self.selected_font = QFont("Arial", 12)  # Default font for text annotations
+
+        # "Show Object Names" label styling — font + colour, independent of
+        # the annotation-tools font (which only affects added text). Drawn
+        # screen-constant, so the point size is the on-screen size at any
+        # zoom. Persisted in QSettings.
+        self.name_label_font, self.name_label_color = self._load_name_label_style()
+
+        self.populate_object_tree()
 
         self._green_box_timer = QTimer(self)
         self._green_box_timer.setSingleShot(True)
@@ -4290,7 +4675,9 @@ class WIMIDialog(QDialog):
                 color_fn=lambda: self.selected_color,
                 style_fn=lambda: self.marker_style,
                 selected_name_fn=lambda: self._selected_name,
-                show_active_name_fn=lambda: self.show_active_name
+                show_active_name_fn=lambda: self.show_active_name,
+                name_font_fn=lambda: self.name_label_font,
+                name_color_fn=lambda: self.name_label_color,
             )
             self.main_scene.addItem(self._marker_layer)
         else:
@@ -4380,16 +4767,182 @@ class WIMIDialog(QDialog):
         kept = []
         for obj in results:
             x, y = self.calculate_pixel_from_ra_dec(obj.get("ra"), obj.get("dec"))
+            on_frame = (x is not None and y is not None
+                        and 0 <= x < w and 0 <= y < h)
+            # Minor bodies are different from a catalog dump: the cone search
+            # already narrowed to a handful, each one is individually
+            # meaningful, and the object you are hunting often sits just past
+            # the sensor edge on the particular frame you loaded (it drifts
+            # into frame on another sub). Never silently drop those — keep
+            # every minor body that projected to a finite pixel and just flag
+            # whether it actually lands on the sensor. Non-minor results keep
+            # the strict on-frame-only behaviour.
+            if obj.get("_minor_body"):
+                if x is None or y is None:
+                    continue  # ephemeris failed (NaN) — nothing to show
+                obj["_on_frame"] = bool(on_frame)
+                kept.append(obj)
+                continue
             if x is None or y is None:
                 continue  # couldn't project onto the image
-            if 0 <= x < w and 0 <= y < h:
+            if on_frame:
                 kept.append(obj)
         return kept
 
+    @staticmethod
+    def _extract_mag_from_result(obj) -> float | None:
+        """
+        Return the first usable apparent magnitude from an object dict, or None.
+
+        Different sources write different keys:
+          - Simbad       -> Vmag (preferred), Bmag
+          - MinorBodies  -> mag (comet g/k or asteroid H, pre-decided per source)
+          - Gaia augment -> Gmag or gaia_gmag
+          - Deep Vizier  -> may use lowercase 'g' / 'r' / 'i' / 'B' / 'V'
+            depending on the catalog
+          - mag_display  -> a formatted string ('17.42') that any source may
+            fill when it had a value; parse as a last resort
+
+        We check keys in rough preference order (V -> B -> G -> generic),
+        skip values that aren't finite floats, and return the first hit.
+        A pure numeric string ('17.42') or a formatted mag_display ('17.42')
+        is also accepted. None means "no usable magnitude in any known field".
+        """
+        if not isinstance(obj, dict):
+            return None
+        # Preference order: V band (reddest common), B, G, generic 'mag',
+        # minor-body H, SDSS g/r/i. Fall back to the formatted display cell
+        # which several code paths populate even when the raw keys aren't.
+        keys_in_order = (
+            "Vmag", "V", "vmag",
+            "Bmag", "B", "bmag",
+            "Gmag", "gaia_gmag", "G",
+            "mag", "magnitude",
+            "H", "magnitude_H",
+            "g", "r", "i",
+            "mag_display",
+        )
+        for k in keys_in_order:
+            if k not in obj:
+                continue
+            v = obj[k]
+            if v is None:
+                continue
+            # Catalogs frequently sentinel-fill with "N/A" / "" / NaN
+            if isinstance(v, str):
+                s = v.strip()
+                if not s or s.upper() in ("N/A", "NA", "NONE", "UNKNOWN", "-"):
+                    continue
+                try:
+                    f = float(s)
+                except ValueError:
+                    continue
+            else:
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    continue
+            if not math.isfinite(f):
+                continue
+            # 0.000 exactly is almost always a sentinel for "missing" in
+            # Simbad V/B columns (a real V=0 star is a once-in-the-sky
+            # object). Skip it like Simbad's own tooling does. If we're
+            # looking at the formatted display cell, 0.000 means a true
+            # bright object that was written with a leading zero — but
+            # the display cell is last-resort so even then skipping is
+            # the safer bet.
+            if f == 0.0:
+                continue
+            return f
+        return None
+
+    def _filter_results_by_magnitude(self, results):
+        """
+        Apply the user's magnitude limit to a result list.
+
+        When the "Limit by magnitude" checkbox is off, this is a no-op.
+        When on, drops any result whose extracted apparent magnitude is
+        either (a) missing / unparseable in every known band, or (b)
+        fainter (numerically larger) than the spinbox threshold.
+
+        See `_extract_mag_from_result` for the band-preference logic.
+        Called from `_cg_set_query_results_proxy` and from
+        `_reapply_mag_filter_live` (which re-filters the last unfiltered
+        snapshot in response to UI changes).
+        """
+        try:
+            if not bool(self.mag_limit_checkbox.isChecked()):
+                return list(results)
+            limit = float(self.mag_limit_spinbox.value())
+        except Exception:
+            # UI not yet constructed / torn down — fail open rather than
+            # silently drop every result from an edge-case code path.
+            return list(results)
+        kept = []
+        for obj in results:
+            m = self._extract_mag_from_result(obj)
+            if m is None:
+                continue
+            if m <= limit:
+                kept.append(obj)
+        return kept
+
+    def _reapply_mag_filter_live(self):
+        """
+        Re-filter the most recent unfiltered result set in-place in response
+        to the user toggling the checkbox or changing the limit. Avoids
+        re-querying every catalog just to narrow the result list.
+
+        Replays everything downstream of the fetch:
+          - rebuild self.results from the stashed unfiltered snapshot,
+            re-applying BOTH the image-bounds filter AND the magnitude cut
+          - re-tag categories/colors (same as _cg_set_query_results_proxy)
+          - refresh the markers, the tree widget, and the object counter
+
+        No-ops silently if nothing has been searched yet.
+        """
+        src = getattr(self, "_results_unfiltered", None)
+        if not src:
+            return
+        try:
+            results = self._filter_results_to_image(src)
+            results = self._filter_results_by_magnitude(results)
+            for obj in results:
+                short_type = obj.get("short_type", "")
+                category = OTYPE_TO_CATEGORY.get(short_type, "Errors & Artefacts")
+                obj["category"] = category
+                obj["color"] = CATEGORY_TO_COLOR.get(category, QColor(255, 255, 255))
+            self.results = results
+            self._ensure_marker_layer()
+            self._set_marker_points_from_results()
+            # Keep the sidebar tree and the object counter in sync too.
+            try:
+                self.update_results_tree()
+            except Exception:
+                pass
+            try:
+                self.update_object_count()
+            except Exception:
+                pass
+            QTimer.singleShot(0, self.update_green_box)
+        except Exception as e:
+            # Live re-filter failures must never corrupt state — leave the
+            # existing self.results in place and surface the error.
+            print(f"[WIMI] magnitude re-filter failed: {e}")
+
     def _cg_set_query_results_proxy(self, results):
+        # Keep an UNFILTERED snapshot so toggling the magnitude limit (or
+        # changing its value) can re-filter without re-running the search.
+        # list() makes a shallow copy — results are dicts so the per-object
+        # content is still shared, which is fine for a read-only replay.
+        self._results_unfiltered = list(results)
         # Remove anything not actually inside the image frame before it
         # populates the tree / markers / any consumer of self.results.
         results = self._filter_results_to_image(results)
+        # Apply the user's magnitude cut (no-op when the checkbox is off).
+        # Order matters: image-bounds first (cheap WCS projection), magnitude
+        # second (only pays the dict walk for objects we would keep anyway).
+        results = self._filter_results_by_magnitude(results)
         for obj in results:
             short_type = obj.get("short_type", "")
             category = OTYPE_TO_CATEGORY.get(short_type, "Errors & Artefacts")
@@ -5625,8 +6178,8 @@ class WIMIDialog(QDialog):
                                 # blackbody Teff — large divergence = peculiar star
                                 if flag_outliers and Teff is not None:
                                     T_col, _ = _teff_from_color(bp_rp=bp_rp, bv=bv)
-                                    if T_bv is not None:
-                                        ratio = Teff / T_bv if T_bv > 0 else 1.0
+                                    if T_col is not None:
+                                        ratio = Teff / T_col if T_col > 0 else 1.0
                                         outlier = ratio < 0.5 or ratio > 2.0
                     except Exception:
                         pass  # fall through to catalog
@@ -6675,11 +7228,11 @@ class WIMIDialog(QDialog):
         print(f"[DEBUG] Matched source: {source!r}")  # ← debug print
 
         s = source.strip().lower()
-        # --- Minor-body rows (local MinorDB results) → 3d-asteroids.space ----
+        # --- Minor-body rows (local MinorDB results) → choose how to explore ----
         if s.startswith("minordb"):
             kind = (entry.get("long_type") if entry else "") or ""
             # 'kind' will usually be "Asteroid" or "Comet"
-            open_minor_body_3d_page(object_name, kind=kind)
+            prompt_minor_body_choice(self, object_name, kind=kind)
             return
         
         if s == "simbad" and object_name:
@@ -6743,6 +7296,16 @@ class WIMIDialog(QDialog):
         # 2) pick a header
         meta = dict(getattr(doc, "metadata", {}) or {})
         header = None
+
+        # Keep this view's SASpro metadata reachable for the observation-time
+        # lookup. SASpro carries DATE-OBS / DATE-LOC / EXPTIME in the image
+        # metadata (FITSKeywords), and a plate solve updates that same
+        # metadata, so the timestamp is already here — there is no need to go
+        # digging for a separate original_header. Also drop any cached
+        # observation time so the newly loaded view is re-read rather than
+        # reusing the previous image's timestamp.
+        self._loaded_meta = meta
+        self.observation_datetime = None
 
         # prefer an explicit WCS header saved by a solver
         if "wcs_header" in meta and meta["wcs_header"]:
@@ -7040,6 +7603,10 @@ class WIMIDialog(QDialog):
         # persist basics
         self.image_data = img_array
         self.original_header = original_header
+        # A fresh file: forget any cached observation time and view metadata
+        # so the time is re-read from THIS file's header, not the last one.
+        self.observation_datetime = None
+        self._loaded_meta = None
         self.bit_depth = bit_depth
         self.is_mono = is_mono
 
@@ -7727,99 +8294,197 @@ class WIMIDialog(QDialog):
             return None, None, None
 
     # ─────────────────────────────────────────
+    # SASpro metadata keyword access
+    # ─────────────────────────────────────────
+    def _build_metadata_kw(self):
+        """
+        Return a `_kw(*names)` getter over the current view's SASpro metadata.
+
+        SASpro keeps the camera's FITS keywords (DATE-OBS, DATE-LOC, SITELAT,
+        SITELONG, EXPTIME, …) in the document's image metadata (FITSKeywords),
+        and a plate solve updates that same metadata. The getter checks that
+        store first, then any FITS Header fallbacks (wcs_header, a direct-file
+        original header, the live WCS header). First finite value wins.
+        """
+        kw_dicts = []    # XISF-style FITSKeywords dicts (SASpro's own store)
+        headers  = []    # FITS Header / mapping fallbacks
+
+        meta = getattr(self, "_loaded_meta", None)
+        if isinstance(meta, dict):
+            for mk in ("image_meta", "file_meta", "XISF"):
+                mm = meta.get(mk)
+                if isinstance(mm, dict) and isinstance(mm.get("FITSKeywords"), dict):
+                    kw_dicts.append(mm["FITSKeywords"])
+            for hk in ("original_header", "wcs_header"):
+                if meta.get(hk) is not None:
+                    headers.append(meta[hk])
+        # Direct-file-open path keeps these on self.
+        im = getattr(self, "image_meta", None)
+        if isinstance(im, dict) and isinstance(im.get("FITSKeywords"), dict):
+            kw_dicts.append(im["FITSKeywords"])
+        oh = getattr(self, "original_header", None)
+        if oh is not None:
+            headers.append(oh)
+        w = getattr(self, "wcs", None)
+        if w is not None:
+            try:
+                headers.append(w.to_header(relax=True))
+            except Exception:
+                pass
+
+        def _kw(*names):
+            """First value for any of `names`, metadata store before headers."""
+            for d in kw_dicts:
+                for n in names:
+                    ent = d.get(n)
+                    if not ent:
+                        continue
+                    try:
+                        v = (ent[0].get("value")
+                             if isinstance(ent, (list, tuple)) else ent)
+                    except Exception:
+                        v = None
+                    if v not in (None, ""):
+                        return v
+            for h in headers:
+                for n in names:
+                    try:
+                        if n in h and h[n] not in (None, ""):
+                            return h[n]
+                    except Exception:
+                        continue
+            return None
+
+        return _kw
+
+    def _observer_site(self):
+        """
+        Observer location (lat_deg, lon_deg, elev_m) for the topocentric
+        parallax correction, or None.
+
+        The camera already recorded where it was standing — SGP/NINA write
+        SITELAT / SITELONG (space-separated sexagesimal, the sign belongs to
+        the WHOLE value) and SITEELEV — so read it straight from the SASpro
+        metadata. Falls back to the site saved in Settings. Without it the
+        ephemeris is geocentric, which is up to ~18" off on a close object.
+        """
+        _kw = self._build_metadata_kw()
+        lat = _wimi_parse_sexagesimal(_kw("SITELAT", "LAT-OBS", "OBSGEO-B", "LATITUDE"))
+        lon = _wimi_parse_sexagesimal(_kw("SITELONG", "LONG-OBS", "OBSGEO-L", "LONGITUD"))
+        elev = None
+        try:
+            ev = _kw("SITEELEV", "ALT-OBS", "OBSGEO-H", "ELEVATIO")
+            elev = float(ev) if ev not in (None, "") else None
+        except Exception:
+            elev = None
+
+        # Fall back to a site stored in Settings (same keys the Hunter uses).
+        if (lat is None or lon is None) and getattr(self, "settings", None) is not None:
+            try:
+                s_lat = self.settings.value("site/latitude_deg", None)
+                s_lon = self.settings.value("site/longitude_deg", None)
+                if s_lat not in (None, "") and s_lon not in (None, ""):
+                    lat = float(s_lat)
+                    lon = float(s_lon)
+                    if elev is None:
+                        s_elev = self.settings.value("site/elevation_m", 0.0)
+                        elev = float(s_elev) if s_elev not in (None, "") else 0.0
+            except Exception:
+                pass
+
+        if lat is None or lon is None:
+            return None
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            return None
+        return (float(lat), float(lon), float(elev or 0.0))
+
+    # ─────────────────────────────────────────
     # Observation datetime helpers
     # ─────────────────────────────────────────
     def _get_observation_datetime_from_header(self):
         """
-        Try to extract observation datetime from:
+        Observation time (UTC) from the SASpro image metadata.
 
-          1) self.original_header   (full FITS header, if present)
-          2) self.wcs.wcs.dateobs   (DATE-OBS stored in the WCS header)
-          3) MJD-OBS in the WCS header
+        SASpro keeps the camera's FITS keywords (DATE-OBS, DATE-LOC,
+        EXPTIME, …) in the document metadata, and a plate solve updates
+        that same metadata — so the timestamp is already attached to the
+        view; there is no need to go digging for a separate original
+        header. DATE-OBS is UTC by the FITS standard, and a DATE-LOC card
+        beside it is the LOCAL wall-clock time, which confirms the DATE-OBS
+        really is UTC (NINA, SGP and ACP all write the pair). We read the
+        keywords here, evaluate at mid-exposure, and never run DATE-OBS
+        through a timezone conversion.
 
-        Returns a Python datetime (UTC) or None.
+        Returns a naive UTC datetime, or None (the caller then prompts).
         """
+        _kw = self._build_metadata_kw()
+        w = getattr(self, "wcs", None)
 
-        def _extract_from_header(hdr: fits.Header):
-            """Best-effort extraction from a FITS Header."""
-            # 1) DATE-OBS (+ optional TIME-OBS)
+        # exposure length, for the mid-exposure shift
+        try:
+            exptime = float(_kw("EXPTIME", "EXPOSURE", "EXPOSURE_TIME") or 0.0)
+        except Exception:
+            exptime = 0.0
+
+        # DATE-OBS (UTC) [+ TIME-OBS], then MJD-OBS, WCS dateobs, JD
+        t = None
+        source = None
+        d = _kw("DATE-OBS", "DATE_OBS")
+        if d is not None:
+            s = str(d).strip()
+            if "T" not in s:
+                tv = _kw("TIME-OBS", "TIME_OBS")
+                if tv:
+                    s = f"{s}T{str(tv).strip()}"
+            for fmt in ("isot", None):
+                try:
+                    t = (Time(s, format=fmt, scale="utc") if fmt
+                         else Time(s, scale="utc"))
+                    break
+                except Exception:
+                    t = None
+            if t is not None:
+                dloc = _kw("DATE-LOC", "DATE_LOC", "LOCALTIM")
+                confirmed = bool(dloc) and str(dloc).strip() != s
+                source = ("DATE-OBS (UTC — DATE-LOC present separately)"
+                          if confirmed else "DATE-OBS (UTC)")
+        if t is None:
+            mjd = _kw("MJD-OBS", "MJD_OBS")
+            if mjd is not None:
+                try:
+                    t = Time(float(mjd), format="mjd", scale="utc")
+                    source = "MJD-OBS (UTC)"
+                except Exception:
+                    t = None
+        if t is None and w is not None:
             try:
-                if "DATE-OBS" in hdr:
-                    val = str(hdr["DATE-OBS"]).strip()
-
-                    # Already full ISO timestamp
-                    if "T" in val:
-                        t = Time(val, format="isot", scale="utc")
-                        return t.to_datetime()
-
-                    # DATE-OBS + TIME-OBS split
-                    if "TIME-OBS" in hdr:
-                        val2 = str(hdr["TIME-OBS"]).strip()
-                        t = Time(f"{val}T{val2}", format="isot", scale="utc")
-                        return t.to_datetime()
-            except Exception as e:
-                print(f"[WIMI] DATE-OBS parse failed from header: {e!r}")
-
-            # 2) MJD-OBS
-            try:
-                if "MJD-OBS" in hdr:
-                    t = Time(float(hdr["MJD-OBS"]), format="mjd", scale="utc")
-                    return t.to_datetime()
-            except Exception as e:
-                print(f"[WIMI] MJD-OBS parse failed from header: {e!r}")
-
-            # 3) JD
-            try:
-                if "JD" in hdr:
-                    t = Time(float(hdr["JD"]), format="jd", scale="utc")
-                    return t.to_datetime()
-            except Exception as e:
-                print(f"[WIMI] JD parse failed from header: {e!r}")
-
+                do = getattr(getattr(w, "wcs", None), "dateobs", None)
+                if do:
+                    t = Time(str(do),
+                             format=("isot" if "T" in str(do) else "iso"),
+                             scale="utc")
+                    source = "WCS DATE-OBS (UTC)"
+            except Exception:
+                t = None
+        if t is None:
+            jd = _kw("JD", "JD-OBS")
+            if jd is not None:
+                try:
+                    t = Time(float(jd), format="jd", scale="utc")
+                    source = "JD (UTC)"
+                except Exception:
+                    t = None
+        if t is None:
+            self._obs_time_source = None
             return None
 
-        # --- 1) Try original_header if we have it ---
-        hdr = getattr(self, "original_header", None)
-        if isinstance(hdr, fits.Header):
-            dt = _extract_from_header(hdr)
-            if dt is not None:
-                print(f"[WIMI] Observation time from original_header: {dt.isoformat()}")
-                return dt
-
-        # --- 2) Fall back to WCS header (this matches your Metadata.WCS.* block) ---
-        w = getattr(self, "wcs", None)
-        if w is not None:
-            # 2a) native dateobs field
-            dateobs = None
-            try:
-                dateobs = getattr(w.wcs, "dateobs", None)
-            except Exception:
-                dateobs = None
-
-            if dateobs:
-                try:
-                    # Handles 'YYYY-MM-DDTHH:MM:SS...' (your case)
-                    fmt = "isot" if "T" in dateobs else "iso"
-                    t = Time(dateobs, format=fmt, scale="utc")
-                    dt = t.to_datetime()
-                    print(f"[WIMI] Observation time from WCS.dateobs: {dt.isoformat()}")
-                    return dt
-                except Exception as e:
-                    print(f"[WIMI] failed to parse WCS.dateobs={dateobs!r}: {e!r}")
-
-            # 2b) If that fails, try MJD-OBS in the WCS header
-            try:
-                w_hdr = w.to_header(relax=True)
-                if "MJD-OBS" in w_hdr:
-                    t = Time(float(w_hdr["MJD-OBS"]), format="mjd", scale="utc")
-                    dt = t.to_datetime()
-                    print(f"[WIMI] Observation time from WCS MJD-OBS: {dt.isoformat()}")
-                    return dt
-            except Exception as e:
-                print(f"[WIMI] failed to parse MJD-OBS from WCS header: {e!r}")
-
-        # --- 3) Give up; caller will prompt ---
-        return None
+        dt = t.to_datetime()                 # naive, UTC
+        if exptime > 0:
+            dt = dt + timedelta(seconds=exptime / 2.0)
+        self._obs_time_source = source
+        print(f"[WIMI] Observation time from {source}: {dt.isoformat()} "
+              f"(mid-exposure, exptime={exptime:g}s)")
+        return dt
 
 
     def _prompt_for_observation_datetime(self):
@@ -7832,8 +8497,11 @@ class WIMIDialog(QDialog):
 
         layout = QFormLayout(dialog)
         lbl = QLabel(
-            "The FITS header does not contain an observation date/time.\n"
-            "Please enter the midpoint of the exposure:"
+            "This image's metadata has no observation date/time "
+            "(no DATE-OBS / MJD-OBS / JD).\n"
+            "Enter the midpoint of the exposure. Astro capture software "
+            "writes DATE-OBS in UTC, so leave the timezone on UTC unless "
+            "you know this value was recorded in local time."
         )
         lbl.setWordWrap(True)
         layout.addRow(lbl)
@@ -7859,22 +8527,12 @@ class WIMIDialog(QDialog):
         tz_combo.addItems(common)
         tz_combo.insertSeparator(len(common))
         tz_combo.addItems([t for t in all_tz if t not in common])
+        # Default to UTC. FITS DATE-OBS is UTC by the standard, so UTC is the
+        # right assumption for a hand-entered exposure midpoint too — we do
+        # NOT pre-select the computer's local zone (that was the old
+        # behaviour, and it silently shifted correct UTC entries by the local
+        # offset, forcing the user to hunt for "Universal" in the list).
         tz_combo.setCurrentText("UTC")
-        # Try to pre-select local timezone
-        try:
-            import tzlocal
-            local_tz = tzlocal.get_localzone_name()
-            idx = tz_combo.findText(local_tz)
-            if idx >= 0:
-                tz_combo.setCurrentIndex(idx)
-            else:
-                # Try matching against common list
-                for tz in common:
-                    if local_tz.split("/")[-1] in tz:
-                        tz_combo.setCurrentText(tz)
-                        break
-        except Exception:
-            pass
 
         layout.addRow("Timezone:", tz_combo)
 
@@ -8136,13 +8794,24 @@ class WIMIDialog(QDialog):
             )
             return
 
-        # 5) Populate tree & overlay (unchanged)
+        # 5) Populate tree & overlay
         self.results_tree.clear()
         query_results = []
+
+        # Image size, so we can tell the user which bodies actually fall on
+        # the sensor vs just past its edge at this frame's time.
+        try:
+            img_w = int(self.main_image.width())
+            img_h = int(self.main_image.height())
+        except Exception:
+            img_w = img_h = 0
+        n_on = n_off = 0
 
         for r in results:
             ra  = float(r["ra"])
             dec = float(r["dec"])
+            if not (math.isfinite(ra) and math.isfinite(dec)):
+                continue  # ephemeris failed to converge for this body
             name  = r.get("name", r.get("designation", "N/A"))
             mag   = r.get("mag", "N/A")
             qtype = r.get("type", "Minor body")
@@ -8152,6 +8821,17 @@ class WIMIDialog(QDialog):
             dist_num = _wimi_num_or_none(dist)
             dist_disp = f"{dist_num:g} AU" if dist_num is not None else "N/A"
 
+            # On- or off-sensor at this frame's observation time?
+            px, py = self.calculate_pixel_from_ra_dec(ra, dec)
+            on_frame = (px is not None and py is not None
+                        and img_w > 0 and img_h > 0
+                        and 0 <= px < img_w and 0 <= py < img_h)
+            if on_frame:
+                n_on += 1
+            else:
+                n_off += 1
+            long_type = qtype if on_frame else f"{qtype} — off-frame"
+
             query_results.append({
                 "ra": ra,
                 "dec": dec,
@@ -8159,18 +8839,32 @@ class WIMIDialog(QDialog):
                 "diameter": "N/A",              # minor bodies carry no angular size here
                 "mag_display": _fmt_mag(mag),   # apparent magnitude -> Mag column
                 "short_type": "MP",
-                "long_type": qtype,
+                "long_type": long_type,
                 "redshift": "N/A",          # not meaningful for minor bodies
                 "parallax_mas": "N/A",
                 "comoving_distance": dist,  # kept as-is (AU) for any legacy reader
                 "distance_display": dist_disp,
                 "source": src,
+                # Flag so _filter_results_to_image keeps this row even when it
+                # lands off the sensor, instead of silently culling it.
+                "_minor_body": True,
+                "_on_frame": on_frame,
             })
 
         self.main_preview.set_query_results(query_results)
         self.query_results = query_results
         self.update_results_tree()
         self.update_object_count()
+
+        # Tell the user what was found, and crucially that some bodies are in
+        # the field but just past the frame edge at THIS frame's time — load
+        # the sub where the object has drifted into frame to see it on-image.
+        total_mb = n_on + n_off
+        if total_mb:
+            msg = f"{total_mb} minor bod{'y' if total_mb == 1 else 'ies'} in field"
+            if n_off:
+                msg += f" — {n_on} on-frame, {n_off} just off the sensor edge"
+            self.status_label.setText("Status: " + msg + ".")
 
     def _query_minor_planets_from_db(
         self,
@@ -8220,6 +8914,12 @@ class WIMIDialog(QDialog):
 
         # 1) Convert observation datetime to JD
         jd = Time(obs_datetime).jd
+
+        # Stash the exact epoch and DB file this search used, so a later
+        # double-click can open the in-app Orbit Explorer placed at the
+        # same instant and read the clicked body's elements by designation.
+        self._minor_jd = float(jd)
+        self._minor_db_path = str(db_path)
 
         print(
             f"[MinorBodies] Search: RA={ra_center:.6f} deg  "
@@ -8398,6 +9098,17 @@ class WIMIDialog(QDialog):
             def progress_cb(done: int, total: int) -> bool:
                 return True
 
+        # Observer site (topocentric parallax). Read from the image metadata
+        # (SITELAT/SITELONG/SITEELEV), falling back to Settings. Without it
+        # the ephemeris is geocentric — up to ~18" off on a close object.
+        site = self._observer_site()
+        if site is not None:
+            print(f"[MinorBodies] observer site: lat={site[0]:.5f} "
+                  f"lon={site[1]:.5f} elev={site[2]:.0f} m (topocentric)")
+        else:
+            print("[MinorBodies] no observer site in metadata or Settings — "
+                  "geocentric positions")
+
         # 4) Compute positions with Skyfield at this JD
         print(
             f"[MinorBodies] compute_positions_skyfield: sending {total_rows} rows, jd={jd}"
@@ -8406,7 +9117,7 @@ class WIMIDialog(QDialog):
             asteroid_rows=rows_df,
             jd=jd,
             ephemeris_path=str(self._minorbody_data_dir()),
-            topocentric=None,
+            topocentric=site,
             progress_cb=progress_cb,
             debug=True,
         )
@@ -8910,10 +9621,10 @@ class WIMIDialog(QDialog):
         return query_results
 
     def query_simbad(self, radius_deg, max_results=None):
-        """Two-step SIMBAD lookup with debug prints for flux/plx/sp data."""
+        """Two-step SIMBAD lookup, run in a worker thread with a live progress dialog."""
         max_results = max_results if max_results is not None else self.max_results
 
-        # ——— 1) Validate inputs ———
+        # ——— 1) Validate inputs (unchanged) ———
         if not self.circle_center or self.circle_radius <= 0:
             QMessageBox.warning(self, "No Search Area",
                                 "Please define a search circle by Shift-clicking and dragging.")
@@ -8933,8 +9644,51 @@ class WIMIDialog(QDialog):
                                 "Please select at least one object type.")
             return
 
-        # ——— 2) TAP query on BASIC ———
-        query = f"""
+        # ——— 1b) CDS preflight ———
+        # SIMBAD is not optional here the way it is in SFCC/SSSC — it IS the
+        # query. So probe (hard 4 s deadline, falls over to the Harvard
+        # mirror) and tell the user plainly rather than spending minutes of
+        # retries to reach the same conclusion.
+        self.status_label.setText("Status: Checking SIMBAD availability…")
+        QApplication.processEvents()
+        if not cds_health.simbad_available(
+                status_cb=lambda m: (self.status_label.setText(f"Status: {m}"),
+                                     QApplication.processEvents())):
+            self.status_label.setText("Status: SIMBAD unavailable.")
+            QMessageBox.warning(
+                self, "SIMBAD Unavailable",
+                "SIMBAD is not responding on either CDS mirror.\n\n"
+                f"{cds_health.status_text()}\n\n"
+                "CDS (Strasbourg) has scheduled and unscheduled outages; "
+                "check https://cds.unistra.fr/ and try again later.\n\n"
+                "Minor-body search and the local Gaia DR3 augment both work "
+                "offline and are unaffected.")
+            return
+        simbad_host = _configure_simbad_endpoint()
+
+        # ——— 2) Build TAP + sim-sam requests ———
+        #
+        # Push the otype selection into ADQL instead of filtering after the
+        # fact. This is a correctness fix, not just a speed one: TOP N is
+        # applied by SIMBAD BEFORE our client-side filter ran, so asking for
+        # (say) nebulae only in a star-rich field would fill all N rows with
+        # stars, drop every one of them locally, and report "No objects
+        # found" while the nebulae sat unreturned in the cone.
+        #
+        # basic.otype is the same column the client filter compared against,
+        # so this is the identical predicate evaluated server-side — no
+        # hierarchy semantics change. When everything is checked (the default)
+        # the clause is omitted entirely rather than emitting ~200 redundant
+        # literals.
+        _all_leaf_types = {li.text(0) for li in self._iterate_leaf_items()}
+        _sel_types = set(selected_types)
+        if _sel_types and _sel_types != _all_leaf_types:
+            _codes = ",".join(_adql_quote(c) for c in sorted(_sel_types))
+            otype_clause = f"\n                AND otype IN ({_codes})"
+        else:
+            otype_clause = ""
+
+        tap_query = f"""
             SELECT TOP {max_results}
                 ra, dec, main_id,
                 rvz_redshift, otype, galdim_majaxis, galdim_minaxis,
@@ -8943,59 +9697,9 @@ class WIMIDialog(QDialog):
             WHERE CONTAINS(
                 POINT('ICRS', basic.ra, basic.dec),
                 CIRCLE('ICRS', {ra_center}, {dec_center}, {radius_deg})
-            ) = 1
+            ) = 1{otype_clause}
         """
 
-        result = None
-        last_err = None
-
-        for attempt in range(5):
-            try:
-                result = Simbad.query_tap(query)
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                if attempt < 4:
-                    non_blocking_sleep(1)
-                else:
-                    # After 5 attempts total, stop with a helpful message
-                    err_txt = str(last_err) if last_err is not None else "Unknown error"
-                    QMessageBox.warning(
-                        self,
-                        "SIMBAD network error",
-                        (
-                            "We couldn't reach SIMBAD due to a network or service error.\n\n"
-                            "We tried 5 times and then stopped.\n\n"
-                            "What to try:\n"
-                            " • Check your internet connection / VPN / firewall\n"
-                            " • Verify SIMBAD is reachable: https://simbad.cds.unistra.fr/simbad/\n"
-                            " • Then try again\n\n"
-                            f"Last error:\n{err_txt}"
-                        )
-                    )
-                    return
-
-        if result is None or len(result) == 0:
-            # SIMBAD found nothing here — but don't stop if the Gaia augment is
-            # on: local Gaia DR3 stars in this region should still be returned.
-            # Only a truly empty result (SIMBAD *and* Gaia) means "nothing here".
-            self.results_tree.clear()
-            query_results = self._augment_results_with_local_gaia(
-                [], ra_center, dec_center, radius_deg)
-            if not query_results:
-                QMessageBox.information(
-                    self,
-                    "No Results",
-                    "No objects found in the specified area."
-                )
-            self.main_preview.set_query_results(query_results)
-            self.query_results = query_results
-            self.update_results_tree()
-            self.update_object_count()
-            return
-
-        # ——— 3a) list of all “star” & binary/variable OTYPE codes ———
         star_codes = [
             "*","V*","Pe*","HB*","Y*O","Ae*","Em*","Be*","BS*","RG*","AB*",
             "C*","S*","sg*","s*r","s*y","s*b","HS*","pA*","WD*","LM*","BD*",
@@ -9005,156 +9709,349 @@ class WIMIDialog(QDialog):
             "**","EB*","Ce*","Ce?","cC*","**?",
             "EB?","Sy?","CV?","No?","XB?","LX?","HX?","RR?","WV?","LP?","Mi?"
         ]
+        # Narrow the stellar-extras fetch to the star types actually selected.
+        # sim-sam is the slowest leg of the query (it's the one carrying the
+        # 90 s read timeout), and it exists only to attach B/V/parallax to
+        # STARS. If the user asked for nebulae only there are no stars to
+        # attach anything to, so skip the request entirely rather than
+        # download a VOTable we then discard.
+        if _sel_types != _all_leaf_types:
+            star_codes = [c for c in star_codes if c in _sel_types]
 
-        # 3b) build the two sub-criteria, un-encoded:
-        ra_str  = f"{ra_center:.8f}"
-        dec_str = f"{dec_center:+.8f}"   # keep the +/– sign
-        rad_str = f"{radius_deg:.8f}d"
+        if not star_codes:
+            sam_url = None
+            sam_params = {}
+        else:
+            ra_str  = f"{ra_center:.8f}"
+            dec_str = f"{dec_center:+.8f}"
+            rad_str = f"{radius_deg:.8f}d"
+            region_crit = f"region(CIRCLE,{ra_str} {dec_str},{rad_str})"
+            codes_list  = ",".join(_adql_quote(c) for c in star_codes)
+            otype_crit  = f"otypes in ({codes_list})"
+            criteria    = f"{region_crit}&{otype_crit}"
 
-        region_crit = f"region(CIRCLE,{ra_str} {dec_str},{rad_str})"
-        codes_list  = ",".join(f"'{c}'" for c in star_codes)
-        otype_crit  = f"otypes in ({codes_list})"
+            # Use whichever mirror answered the probe, so the TAP call and the
+            # sim-sam extras call don't end up split across two hosts.
+            sam_url = f"https://{simbad_host}/simbad/sim-sam"
+            sam_params = {
+                "Criteria":      criteria,
+                "OutputMode":    "LIST",
+                "maxObject":     str(max_results),
+                "output.format": "votable",
+                "output.params": ",".join([
+                    "MAIN_ID","RA","DEC",
+                    "FLUX(B)","FLUX(V)",
+                    "PLX_VALUE","RVZ_REDSHIFT",
+                    "OTYPE","SP_TYPE"
+                ])
+            }
 
-        # combine with a literal '&' (not "AND")
-        criteria = f"{region_crit}&{otype_crit}"
+        # ——— 3) Progress dialog + worker + event loop (same pattern as minor-body) ———
+        prog = QProgressDialog(
+            "Preparing SIMBAD query…",
+            "Cancel",
+            0, 0,  # indeterminate; worker switches to determinate per-attempt
+            self,
+        )
+        prog.setWindowTitle("Query SIMBAD")
+        prog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        prog.setAutoClose(True)
+        prog.setAutoReset(True)
+        prog.setMinimumDuration(0)
+        prog.setMinimumWidth(420)
+        prog.show()
 
-        # ——— 3c) fetch _only_ those via sim-sam ———
-        sam_url = "https://simbad.cds.unistra.fr/simbad/sim-sam"
-        params = {
-            "Criteria":      criteria,
-            "OutputMode":    "LIST",
-            "maxObject":     str(max_results),
-            "output.format": "votable",
-            "output.params": ",".join([
-                "MAIN_ID","RA","DEC",
-                "FLUX(B)","FLUX(V)",
-                "PLX_VALUE","RVZ_REDSHIFT",
-                "OTYPE","SP_TYPE"
-            ])
-        }
+        worker = SimbadQueryWorker(
+            tap_query=tap_query,
+            sam_url=sam_url,
+            sam_params=sam_params,
+            max_attempts=5,
+            retry_wait_s=1.0,
+            parent=self,
+        )
 
-        try:
-            resp = requests.get(sam_url, params=params, timeout=300)
-            resp.raise_for_status()
+        loop = QEventLoop()
+        container = {"result": None, "extras": None, "error": None, "empty": False}
 
-            vot = parse_single_table(BytesIO(resp.content))
-            tbl = vot.to_table(use_names_over_ids=True)
-            extras = { row["MAIN_ID"]: row for row in tbl }
+        def on_stage(msg: str):
+            try:
+                prog.setLabelText(msg)
+            except Exception:
+                pass
 
-        except Exception as e:
-            print(f"DEBUG: sim-sam failed: {e}")
-            QMessageBox.warning(
-                self,
-                "Star-only Extras Failed",
-                "Could not fetch star flux/parallax—continuing without them."
-            )
-            extras = {}
+        def on_attempt(cur: int, total: int):
+            # Flash the window title with retry count
+            try:
+                prog.setWindowTitle(f"Query SIMBAD — attempt {cur}/{total}")
+            except Exception:
+                pass
 
-        # ——— 4) Merge & populate results_tree exactly as before ———
+        def on_ok(result, extras: dict):
+            if result is None:
+                container["empty"] = True
+            else:
+                container["result"] = result
+            container["extras"] = extras or {}
+            loop.quit()
+
+        def on_fail(msg: str):
+            container["error"] = msg
+            loop.quit()
+
+        def on_cancel():
+            worker.cancel()
+            # Don't quit loop here — wait for worker to actually finish
+
+        worker.stage.connect(on_stage)
+        worker.attempt_info.connect(on_attempt)
+        worker.finished_ok.connect(on_ok)
+        worker.failed.connect(on_fail)
+        prog.canceled.connect(on_cancel)
+
+        worker.start()
+        loop.exec()
+
+        # Ensure worker is fully done
+        if worker.isRunning():
+            worker.wait(2000)
+
+        # Keep `prog` alive — we'll reuse it for the parse/draw stages below.
+        # It only closes after everything is done (or on cancel/error).
+
+        # ——— 4) Handle outcome ———
+        if container["error"] is not None:
+            # Cancellation shows a quieter message
+            if container["error"].strip().lower().startswith("cancelled"):
+                return
+            QMessageBox.warning(self, "SIMBAD Query Failed", container["error"])
+            return
+
+        if container["empty"]:
+            self.results_tree.clear()
+            query_results = self._augment_results_with_local_gaia(
+                [], ra_center, dec_center, radius_deg)
+            if not query_results:
+                QMessageBox.information(
+                    self, "No Results",
+                    "No objects found in the specified area."
+                )
+            self.main_preview.set_query_results(query_results)
+            self.query_results = query_results
+            self.update_results_tree()
+            self.update_object_count()
+            return
+
+        result = container["result"]
+        extras = container["extras"]
+
+        # ——— 5) Merge rows with live progress ———
+        n_total = int(len(result))
+        prog.setLabelText(f"Parsing SIMBAD rows (0 / {n_total})…")
+        prog.setMaximum(max(1, n_total))
+        prog.setValue(0)
+        QApplication.processEvents()
+
         self.results_tree.clear()
         query_results = []
 
-        for row in result:
+        # Cancellation check helper
+        def _cancelled():
+            return prog.wasCanceled()
+
+        # Throttle processEvents() — calling it every row is itself slow
+        tick = max(1, n_total // 100)   # ~100 UI updates total
+
+        for i, row in enumerate(result):
+            if _cancelled():
+                prog.close()
+                return
+
             name       = row["main_id"]
             short_type = row["otype"]
-            if short_type not in selected_types:
-                continue
+            if short_type in selected_types:
+                ra, dec = float(row["ra"]), float(row["dec"])
+                diam_raw = row.get("galdim_majaxis")
+                diam_arcmin = _mask_safe_float(diam_raw)
+                minor_arcmin = _mask_safe_float(row.get("galdim_minaxis"))
+                pa_deg       = _mask_safe_float(row.get("galdim_angle"))
+                diam = diam_arcmin if diam_arcmin is not None else "N/A"
 
-            # basics
-            ra, dec = float(row["ra"]), float(row["dec"])
-            diam_raw = row.get("galdim_majaxis")  # arcmin, may be masked
-            diam_arcmin = _mask_safe_float(diam_raw)
-            # minor axis (arcmin) and major-axis position angle (deg, N->E) --
-            # already selected in the TAP query above, previously discarded.
-            minor_arcmin = _mask_safe_float(row.get("galdim_minaxis"))
-            pa_deg       = _mask_safe_float(row.get("galdim_angle"))
+                rz_raw   = row["rvz_redshift"]
+                red_z    = _mask_safe_float(rz_raw)
 
-            # For nebulae SIMBAD sometimes has nothing in galdim_majaxis.
-            # The otype can tell us to expect a size even when it's missing.
-            # We store in arcmin consistently; _set_marker_points_from_results converts.
-            diam = diam_arcmin if diam_arcmin is not None else "N/A"
+                extra = extras.get(name, {})
+                Bmag  = _mask_safe_float(extra.get("FLUX_B"))
+                Vmag  = _mask_safe_float(extra.get("FLUX_V"))
+                plx   = _mask_safe_float(extra.get("PLX_VALUE"))
+                spec  = extra.get("SP_TYPE")
 
-            rz_raw   = row["rvz_redshift"]
-            red_z    = _mask_safe_float(rz_raw)  # ← no warning, None if masked
-
-            # pull extras only if it’s a star
-            extra = extras.get(name, {})
-
-            Bmag  = _mask_safe_float(extra.get("FLUX_B"))
-            Vmag  = _mask_safe_float(extra.get("FLUX_V"))
-            plx   = _mask_safe_float(extra.get("PLX_VALUE"))
-            spec  = extra.get("SP_TYPE")
-
-            if plx is not None and plx > 0.0:
-                pv = plx  # already positive; absolute if you want
-                dist_pc  = 1000.0 / pv
-                dist_ly  = dist_pc * 3.261563777
-                # store comoving distance in Gly for consistency with your zs_raw pipeline:
-                distance = round(dist_ly / 1e9, 9)
-                z_val    = "N/A"   # a parallax is not a redshift — keep them apart
-                plx_val  = pv
-                dist_ly_val = dist_ly
-            else:
-                # no usable parallax → fall back to redshift if present
-                z_val    = red_z if red_z is not None else "N/A"
-                plx_val  = "N/A"
-                if isinstance(z_val, (int, float)):
-                    distance = calculate_comoving_distance(z_val)   # GLy, or None if z<0
-                    if distance is None:
+                if plx is not None and plx > 0.0:
+                    pv = plx
+                    dist_pc  = 1000.0 / pv
+                    dist_ly  = dist_pc * 3.261563777
+                    distance = round(dist_ly / 1e9, 9)
+                    z_val    = "N/A"
+                    plx_val  = pv
+                    dist_ly_val = dist_ly
+                else:
+                    z_val    = red_z if red_z is not None else "N/A"
+                    plx_val  = "N/A"
+                    if isinstance(z_val, (int, float)):
+                        distance = calculate_comoving_distance(z_val)
+                        if distance is None:
+                            distance    = "N/A"
+                            dist_ly_val = "N/A"
+                        else:
+                            dist_ly_val = float(distance) * 1e9
+                    else:
                         distance    = "N/A"
                         dist_ly_val = "N/A"
+
+                absV = None
+                if Vmag is not None and plx is not None and plx > 0:
+                    absV = Vmag - (5 * np.log10(1000.0 / plx) - 5)
+
+                long_type = otype_long_name_lookup.get(short_type, short_type)
+
+                if diam_arcmin is not None:
+                    if diam_arcmin >= 1.0:
+                        diam_display = f"{diam_arcmin:.2f}'"
                     else:
-                        dist_ly_val = float(distance) * 1e9
+                        diam_display = f"{diam_arcmin * 60.0:.1f}\""
                 else:
-                    distance    = "N/A"
-                    dist_ly_val = "N/A"
+                    diam_display = "N/A"
 
-            # absolute V magnitude if we have Vmag & plx
-            absV = None
-            if Vmag is not None and plx is not None and plx > 0:
-                absV = Vmag - (5 * np.log10(1000.0 / plx) - 5)
+                query_results.append({
+                    'ra': ra, 'dec': dec, 'name': name,
+                    'diameter': diam,
+                    'minor_arcmin': minor_arcmin,
+                    'pa_deg': pa_deg,
+                    'diameter_display': diam_display,
+                    'diameter_unit': 'arcmin',
+                    'short_type': short_type,
+                    'long_type': long_type,
+                    'redshift': z_val,
+                    'comoving_distance': distance,
+                    'distance_ly': dist_ly_val,
+                    'source': "Simbad",
+                    'Bmag': Bmag, 'Vmag': Vmag,
+                    'mag_display': (_fmt_mag(Vmag) or _fmt_mag(Bmag)),
+                    'parallax_mas': plx_val,
+                    'spectral_type': spec,
+                    'absolute_mag': absV
+                })
 
-            long_type = otype_long_name_lookup.get(short_type, short_type)
+            # Progress update (throttled)
+            if (i + 1) % tick == 0 or (i + 1) == n_total:
+                prog.setValue(i + 1)
+                prog.setLabelText(f"Parsing SIMBAD rows ({i + 1} / {n_total})…")
+                QApplication.processEvents()
 
-            # add to tree
-            # Human-readable diameter display
-            if diam_arcmin is not None:
-                if diam_arcmin >= 1.0:
-                    diam_display = f"{diam_arcmin:.2f}'"
-                else:
-                    diam_display = f"{diam_arcmin * 60.0:.1f}\""
-            else:
-                diam_display = "N/A"
+        # ——— 6) Gaia augmentation ———
+        if _cancelled():
+            prog.close()
+            return
 
-            query_results.append({
-                'ra': ra, 'dec': dec, 'name': name,
-                'diameter': diam,           # arcmin float or "N/A" (major axis)
-                'minor_arcmin': minor_arcmin,      # arcmin float or None (minor axis)
-                'pa_deg': pa_deg,                  # deg (N->E) or None (major-axis PA)
-                'diameter_display': diam_display,  # human-readable (arcmin/arcsec)
-                'diameter_unit': 'arcmin',  # explicit so downstream code is unambiguous
-                'short_type': short_type,
-                'long_type': long_type,
-                'redshift': z_val,                 # true z, or "N/A"
-                'comoving_distance': distance,     # GLy (kept for 3D model / collage)
-                'distance_ly': dist_ly_val,        # canonical light-years for display
-                'source': "Simbad",
-                'Bmag': Bmag, 'Vmag': Vmag,
-                'mag_display': (_fmt_mag(Vmag) or _fmt_mag(Bmag)),  # V (fallback B) -> Mag column
-                'parallax_mas': plx_val,           # mas, or "N/A"
-                'spectral_type': spec,
-                'absolute_mag': absV
-            })
+        prog.setMaximum(0)   # indeterminate while augmenting
+        prog.setValue(0)
+        prog.setLabelText("Augmenting with local Gaia DR3 (if enabled)…")
+        QApplication.processEvents()
 
-        # Local Gaia DR3 augment (checkbox-gated; no-op if unchecked or no library).
-        query_results = self._augment_results_with_local_gaia(
-            query_results, ra_center, dec_center, radius_deg)
+        try:
+            query_results = self._augment_results_with_local_gaia(
+                query_results, ra_center, dec_center, radius_deg)
+        except Exception as _ae:
+            prog.setLabelText(f"Gaia augment failed ({type(_ae).__name__}); continuing…")
+            QApplication.processEvents()
 
-        # ——— 5) Finally hand off to your preview/plotter ———
+        if _cancelled():
+            prog.close()
+            return
+
+        # ——— 7) Hand off to main preview (marker draw) ———
+        n_final = len(query_results)
+        prog.setLabelText(f"Drawing {n_final} markers on image…")
+        QApplication.processEvents()
+
         self.main_preview.set_query_results(query_results)
         self.query_results = query_results
-        self.update_results_tree()
+
+        if _cancelled():
+            prog.close()
+            return
+
+        # ——— 8) Populate results tree with batched inserts + progress ———
+        # QTreeWidget.addTopLevelItem is O(n) per call with sorting enabled.
+        # Disable updates + sorting during bulk insert for a big speedup, and
+        # use the batched addTopLevelItems API.
+        prog.setMaximum(max(1, n_final))
+        prog.setValue(0)
+        prog.setLabelText(f"Populating results table (0 / {n_final})…")
+        QApplication.processEvents()
+
+        tree = self.results_tree
+        tree.setUpdatesEnabled(False)
+        was_sorting = tree.isSortingEnabled()
+        tree.setSortingEnabled(False)
+        try:
+            tree.clear()
+            batch = []
+            batch_size = 500
+            for i, obj in enumerate(query_results):
+                if _cancelled():
+                    break
+                z_cell, plx_cell, dist_cell = wimi_result_columns(obj)
+                item = QTreeWidgetItem([
+                    str(obj['ra']),
+                    str(obj['dec']),
+                    obj['name'],
+                    str(obj.get('diameter_display', obj['diameter'])),
+                    obj['short_type'],
+                    obj['long_type'],
+                    z_cell,
+                    plx_cell,
+                    dist_cell,
+                    str(obj.get('mag_display', '')),
+                ])
+                batch.append(item)
+                if len(batch) >= batch_size or (i + 1) == n_final:
+                    tree.addTopLevelItems(batch)
+                    batch = []
+                    prog.setValue(i + 1)
+                    prog.setLabelText(f"Populating results table ({i + 1} / {n_final})…")
+                    QApplication.processEvents()
+            if batch and not _cancelled():
+                tree.addTopLevelItems(batch)
+        finally:
+            tree.setSortingEnabled(was_sorting)
+            tree.setUpdatesEnabled(True)
+
+        # ——— 9) Final counts & close ———
+        prog.setLabelText("Finalizing…")
+        QApplication.processEvents()
         self.update_object_count()
+
+        try:
+            prog.close()
+        except Exception:
+            pass
+
+        # Now that the otype filter runs server-side, hitting TOP N means
+        # "there are more objects of this type in the cone than you asked
+        # for" — actionable, unlike before when the cap was mostly consumed
+        # by rows the client filter was about to throw away.
+        if n_total >= max_results:
+            self.status_label.setText(
+                f"Status: showing the first {max_results:,} matches — there "
+                f"may be more. Raise Max Results in Settings.")
+
+        # STOP HERE. Everything below this point is the pre-worker synchronous
+        # implementation, kept by accident when the threaded path was added.
+        # Without this return it re-ran the entire query — a second
+        # Simbad.query_tap retry loop and a second 300 s requests.get — on the
+        # GUI thread, with no progress dialog and no cancel. That is the "WIMI
+        # hangs forever" report. The dead block below can be deleted outright.
+        return
 
 
 
@@ -9216,11 +10113,50 @@ class WIMIDialog(QDialog):
         coord = SkyCoord(ra_center, dec_center, unit="deg")
         unique_entries = {}
 
+        # VizieR is a CDS service and goes down with SIMBAD, so the same
+        # breaker covers it. This loop hits 12 catalogs sequentially on the
+        # GUI thread with no timeout — during an outage that is 12 full TCP
+        # timeouts with a frozen window. Probe once, bound the per-query
+        # timeout, and abandon the loop the moment the breaker opens.
+        if not cds_health.simbad_available(
+                status_cb=lambda m: (self.status_label.setText(f"Status: {m}"),
+                                     QApplication.processEvents())):
+            self.status_label.setText("Status: CDS unavailable.")
+            QMessageBox.warning(
+                self, "CDS Unavailable",
+                "VizieR (CDS, Strasbourg) is not responding.\n\n"
+                f"{cds_health.status_text()}\n\n"
+                "The deep VizieR search needs the CDS archive. "
+                "Try again later.")
+            return
+        try:
+            Vizier.TIMEOUT = 45
+        except Exception:
+            pass
+        _vz_budget = cds_health.Budget(150.0)
+
         try:
             for catalog_id in catalog_ids:
-                result = Vizier.query_region(
-                    coord, radius=radius_arcmin * u.arcmin, catalog=catalog_id
-                )
+                if _vz_budget.expired() or not cds_health.simbad_available():
+                    self.status_label.setText(
+                        "Status: CDS unavailable — VizieR search stopped early.")
+                    QApplication.processEvents()
+                    break
+                self.status_label.setText(
+                    "Status: VizieR — querying "
+                    f"{CATALOG_NAMES.get(catalog_id, catalog_id)}…")
+                QApplication.processEvents()
+                try:
+                    result = Vizier.query_region(
+                        coord, radius=radius_arcmin * u.arcmin, catalog=catalog_id
+                    )
+                except Exception as e:
+                    if cds_health.note_failure(e, context=f"vizier/{catalog_id}"):
+                        self.status_label.setText(
+                            "Status: VizieR unreachable — stopping search.")
+                        QApplication.processEvents()
+                        break
+                    continue   # this one catalog failed; try the rest
                 if not result:
                     continue
 
@@ -9357,7 +10293,7 @@ class WIMIDialog(QDialog):
             self.results_tree.clear()
             query_results = []
 
-            # Process each observation in the results
+            #sasprocess each observation in the results
             for obj in limited_observations:
 
                 def safe_get(value):
@@ -9406,6 +10342,39 @@ class WIMIDialog(QDialog):
         self.main_preview.clear_query_results()
         self.status_label.setText("Results cleared.")
 
+    def _load_name_label_style(self):
+        """Load the Show-Object-Names label font + colour from QSettings."""
+        s = getattr(self, "settings", None) or QSettings()
+        font = QFont("Arial", 12)
+        try:
+            fs = s.value("wimi/name_label_font", "", type=str)
+            if fs:
+                f = QFont()
+                if f.fromString(fs):
+                    font = f
+        except Exception:
+            pass
+        color = QColor(255, 255, 255)
+        try:
+            cs = s.value("wimi/name_label_color", "", type=str)
+            if cs:
+                c = QColor(cs)
+                if c.isValid():
+                    color = c
+        except Exception:
+            pass
+        return font, color
+
+    def _save_name_label_style(self):
+        """Persist the current Show-Object-Names label font + colour."""
+        s = getattr(self, "settings", None) or QSettings()
+        try:
+            s.setValue("wimi/name_label_font", self.name_label_font.toString())
+            s.setValue("wimi/name_label_color",
+                       self.name_label_color.name(QColor.NameFormat.HexArgb))
+        except Exception:
+            pass
+
     def open_settings_dialog(self):
         """Open settings dialog to adjust max results and marker type."""
         dialog = QDialog(self)
@@ -9439,6 +10408,66 @@ class WIMIDialog(QDialog):
         marker_style_combo.setCurrentText(getattr(self, "marker_style", "Circle"))
         layout.addRow("Marker Style:", marker_style_combo)
 
+        # --- Object-name label font + colour ----------------------------
+        # Separate from the annotation-tools font (which only styles added
+        # text). Edits a working copy; committed on OK.
+        state = {
+            "font": QFont(self.name_label_font),
+            "color": QColor(self.name_label_color),
+        }
+
+        preview = QLabel("Sample  (6281) Strnad", dialog)
+        preview.setAutoFillBackground(True)
+        preview.setMinimumHeight(34)
+        preview.setFrameShape(QFrame.Shape.StyledPanel)
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        def _refresh_preview():
+            f = QFont(state["font"])
+            # Clamp the on-canvas point size into something legible in this
+            # little swatch, without changing the stored size.
+            f.setPointSizeF(max(8.0, min(22.0, f.pointSizeF() if f.pointSizeF() > 0 else 12.0)))
+            preview.setFont(f)
+            pal = preview.palette()
+            pal.setColor(QPalette.ColorRole.WindowText, state["color"])
+            pal.setColor(QPalette.ColorRole.Window, QColor(40, 40, 40))
+            preview.setPalette(pal)
+            fnt = state["font"]
+            bits = [fnt.family(),
+                    f"{(fnt.pointSizeF() if fnt.pointSizeF() > 0 else fnt.pixelSize()):g} pt"]
+            if fnt.bold():
+                bits.append("Bold")
+            if fnt.italic():
+                bits.append("Italic")
+            font_btn.setText("  ".join(bits))
+
+        font_btn = QPushButton(dialog)
+        font_btn.setToolTip("Family, size and style of the object-name labels")
+
+        def _pick_font():
+            f, ok = QFontDialog.getFont(state["font"], dialog, "Object Name Font")
+            if ok:
+                state["font"] = f
+                _refresh_preview()
+        font_btn.clicked.connect(_pick_font)
+
+        color_btn = QPushButton("Colour…", dialog)
+        color_btn.setToolTip("Colour of the object-name labels")
+
+        def _pick_color():
+            c = QColorDialog.getColor(
+                state["color"], dialog, "Object Name Colour",
+                QColorDialog.ColorDialogOption.ShowAlphaChannel)
+            if c.isValid():
+                state["color"] = c
+                _refresh_preview()
+        color_btn.clicked.connect(_pick_color)
+
+        layout.addRow("Object Name Font:", font_btn)
+        layout.addRow("Object Name Colour:", color_btn)
+        layout.addRow("Preview:", preview)
+        _refresh_preview()
+
         # --- Force Blind Solve ---
         force_blind_solve_button = QPushButton("Force Blind Solve", dialog)
         force_blind_solve_button.clicked.connect(self.force_blind_solve)
@@ -9449,11 +10478,19 @@ class WIMIDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             parent=dialog
         )
-        buttons.accepted.connect(lambda: self.update_settings(
-            max_results_spinbox.value(),              # <-- IMPORTANT: call it
-            marker_style_combo.currentText(),
-            dialog
-        ))
+
+        def _accept():
+            # Commit the label style first, then the rest (which repaints).
+            self.name_label_font = QFont(state["font"])
+            self.name_label_color = QColor(state["color"])
+            self._save_name_label_style()
+            self.update_settings(
+                max_results_spinbox.value(),
+                marker_style_combo.currentText(),
+                dialog,
+            )
+
+        buttons.accepted.connect(_accept)
         buttons.rejected.connect(dialog.reject)
         layout.addRow(buttons)
 
@@ -9536,6 +10573,45 @@ class WIMIDialog(QDialog):
         super().closeEvent(event)
 
 # Function to calculate comoving radial distance (in Gly)
+def _wimi_parse_sexagesimal(val):
+    """
+    Parse 'DD MM SS.SS', '-DD:MM:SS', '+DD MM SS' or a plain decimal into
+    degrees.
+
+    SGP/NINA write SITELAT/SITELONG as space-separated sexagesimal, and the
+    sign belongs to the WHOLE value rather than just the degrees field —
+    treating '-90 11 44.16' as -90 + 11/60 + 44/3600 puts the observer in
+    the wrong place by over 20 arcminutes of longitude.
+    """
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return float(s)                      # already decimal
+    except ValueError:
+        pass
+    neg = s.startswith("-")
+    parts = [p for p in s.replace(":", " ").replace(",", " ").split() if p]
+    try:
+        nums = [abs(float(p)) for p in parts]
+    except ValueError:
+        return None
+    if not nums:
+        return None
+    deg = nums[0]
+    if len(nums) > 1:
+        deg += nums[1] / 60.0
+    if len(nums) > 2:
+        deg += nums[2] / 3600.0
+    return -deg if neg else deg
+
+
 def _wimi_num_or_none(x):
     """Best-effort float. Returns None for None/masked/'N/A'/'--'/non-numeric/non-finite."""
     if x is None:

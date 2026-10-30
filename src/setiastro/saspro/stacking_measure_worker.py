@@ -196,10 +196,51 @@ def _quick_preview_any(fp: str, target_xbin: int, target_ybin: int):
             hdr = {}
 
         a = np.asarray(img)
+        if a.ndim == 3 and a.shape[0] == 3 and a.shape[-1] != 3:
+            a = np.transpose(a, (1, 2, 0))   # FITS colour is (3, H, W) -> HWC
         if a.ndim == 3 and a.shape[-1] == 1:
             a = a[...,0]
-        # if it's color, make a luma-like 2×2 superpixel preview; if mono/CFA, same superpixel trick
-        if a.ndim == 3 and a.shape[-1] == 3:
+        # 2D CFA frames (BAYERPAT in the header) build the preview from the
+        # MAX of each 2×2 Bayer block instead of its mean. The old flat
+        # ``(R + Gr + Gb + B) / 4`` silently diluted narrowband-OSC star
+        # peaks by ~4× — a bright Ha star lives in the single R pixel of
+        # its 2×2 block, so averaging it with its three dark Bayer siblings
+        # dropped it below sep's 5-σ detector and under-represented the
+        # frame to the quality scorer. OSC measurement looked "hella
+        # quicker" than mono because many narrowband stars never made it
+        # past detection, so the capped-at-100 FWHM loop ran on a thinner
+        # candidate set (SAME code, just a thinner preview). Taking the
+        # per-block MAX preserves the peak regardless of which Bayer colour
+        # carries the signal, so OSC and mono see comparable star density,
+        # run the full candidate budget, and produce comparable weights.
+        _cfa_bp = None
+        if a.ndim == 2 and hdr is not None:
+            _bp_raw = None
+            try:
+                _bp_raw = hdr.get("BAYERPAT") if hasattr(hdr, "get") else None
+                if not _bp_raw and hasattr(hdr, "get"):
+                    _fkw = hdr.get("FITSKeywords", None)
+                    if isinstance(_fkw, dict):
+                        _vals = _fkw.get("BAYERPAT", None)
+                        if _vals:
+                            _bp_raw = _vals[0].get("value")
+            except Exception:
+                _bp_raw = None
+            if _bp_raw:
+                _bpn = str(_bp_raw).strip().upper()
+                if _bpn in ("RGGB", "BGGR", "GRBG", "GBRG"):
+                    _cfa_bp = _bpn
+        if _cfa_bp is not None:
+            _h, _w = a.shape[:2]
+            _h2, _w2 = _h - (_h % 2), _w - (_w % 2)
+            if _h2 > 0 and _w2 > 0:
+                _ca = a[:_h2, :_w2].astype(np.float32, copy=False)
+                _tl = _ca[0:_h2:2, 0:_w2:2]; _tr = _ca[0:_h2:2, 1:_w2:2]
+                _bl = _ca[1:_h2:2, 0:_w2:2]; _br = _ca[1:_h2:2, 1:_w2:2]
+                prev2d = np.maximum(np.maximum(_tl, _tr), np.maximum(_bl, _br))
+            else:
+                prev2d = a.astype(np.float32, copy=False)
+        elif a.ndim == 3 and a.shape[-1] == 3:
             prev2d = _superpixel2x2(a)
         else:
             prev2d = _superpixel2x2(a)
@@ -249,12 +290,13 @@ def _star_count_ecc_size(preview, **kwargs):
 
 
 # ── copied verbatim from stacking_suite._measure_fwhm_halfres ─────────────────
-def _measure_fwhm_halfres(img2d, *, max_stars: int = 100, stamp: int = 11,
-                          detect_sigma: float = 5.0) -> float:
+def _measure_fwhm_halfres(img2d, *, max_stars=100, stamp=11, detect_sigma=5.0):
     a = np.asarray(img2d, dtype=np.float32)
     if a.ndim != 2 or a.size == 0:
         return 0.0
-
+    if not np.isfinite(a).all():                 # fill NaN with background first
+        fin = a[np.isfinite(a)]
+        a = np.where(np.isfinite(a), a, float(np.median(fin)) if fin.size else 0.0)
     med = float(np.median(a))
     mad = float(np.median(np.abs(a - med))) * 1.4826
     if not (mad > 0):
@@ -312,13 +354,13 @@ def _measure_fwhm_halfres(img2d, *, max_stars: int = 100, stamp: int = 11,
 
 # ── copied verbatim from stacking_suite._mad_noise ────────────────────────────
 def _mad_noise(arr) -> float:
-    """Robust MAD-based noise estimate, star-insensitive."""
     a = np.asarray(arr, dtype=np.float32).ravel()
+    a = a[np.isfinite(a)]                         # drop NaN
     if a.size == 0:
         return 0.0
     med = float(np.median(a))
     mad = float(np.median(np.abs(a - med)))
-    return mad * 1.4826  # scale to Gaussian-sigma equivalent
+    return mad * 1.4826
 
 
 # ── the process-pool entry point ──────────────────────────────────────────────
@@ -337,12 +379,27 @@ def measure_file(fp, target_xbin, target_ybin):
     if preview is None:
         return ("noprev", fp, None)
     try:
-        mean  = float(np.mean(preview))
-        pmin  = float(np.nanmin(preview))
-        med   = float(np.median(preview - pmin))
-        c, ecc, _blind = _star_count_ecc_size(preview)
-        size  = _measure_fwhm_halfres(preview)
-        noise = _mad_noise(preview)
+        preview = np.asarray(preview, dtype=np.float32)
+
+        # NaN = satellite-trail no-data. The star detector (cv2) and plain
+        # np.mean/np.median all return garbage/NaN on it, which floors the
+        # frame's weight. Measure on the FINITE, NONZERO pixels only; give the
+        # star detector a NaN-free copy (fill non-finite with the background).
+        finite = np.isfinite(preview)
+        vals   = preview[finite & (preview != 0.0)]
+        if vals.size == 0:
+            return ("err", fp, "no finite data in preview")
+
+        pmin  = float(np.min(vals))
+        med   = float(np.median(vals - pmin))     # background — the old Bg=nan
+        mean  = float(np.mean(vals))
+
+        bg_fill = float(np.median(vals))
+        preview_filled = np.where(finite, preview, bg_fill).astype(np.float32, copy=False)
+
+        c, ecc, _blind = _star_count_ecc_size(preview_filled)
+        size  = _measure_fwhm_halfres(preview_filled)
+        noise = _mad_noise(vals)                  # noise on finite pixels only
         return ("ok", fp, (mean, med, c, ecc, size, noise))
     except Exception as e:
         return ("err", fp, f"{type(e).__name__}: {e}")

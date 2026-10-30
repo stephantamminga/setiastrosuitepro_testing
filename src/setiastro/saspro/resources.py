@@ -1,4 +1,4 @@
-# pro/resources.py
+#saspro/resources.py
 """
 Centralized resource paths for Seti Astro Suite Pro.
 
@@ -100,7 +100,7 @@ class Icons:
     APP_ICO = property(lambda self: _resource_path('astrosuitepro.ico'))
     BACKGROUND = property(lambda self: _resource_path('background.png')) 
     
-    # Processing tools
+    #sasprocessing tools
     GREEN = property(lambda self: _resource_path('green.png'))
     NEUTRAL = property(lambda self: _resource_path('neutral.png'))
     WHITE_BALANCE = property(lambda self: _resource_path('whitebalance.png'))
@@ -118,6 +118,7 @@ class Icons:
     STAR_SPIKE = property(lambda self: _resource_path('starspike.png'))
     ASTRO_SPIKE = property(lambda self: _resource_path('Astro_Spikes.png'))
     STAR_STRETCH = property(lambda self: _resource_path('starstretch.png'))
+    COSMETIC_CORRECTION = property(lambda self: _resource_path('cosmeticcorrection.png'))
     
     # Luminance
     L_EXTRACT = property(lambda self: _resource_path('LExtract.png'))
@@ -303,6 +304,17 @@ class Icons:
     SYQON_AXIOM = property(lambda self: _resource_path('axiom.png'))
     SYQON_PARALLAX = property(lambda self: _resource_path('parallax.png'))
 
+    # Dock panel rail icons
+    PANEL_CONSOLE   = property(lambda self: _resource_path('consolepanel.png'))
+    PANEL_EXPLORER  = property(lambda self: _resource_path('explorerpanel.png'))
+    PANEL_HEADER    = property(lambda self: _resource_path('headerpanel.png'))
+    PANEL_LAYERS    = property(lambda self: _resource_path('layerspanel.png'))
+    PANEL_MINIMIZED = property(lambda self: _resource_path('minimizedpanel.png'))
+    PANEL_MONITOR   = property(lambda self: _resource_path('monitorpanel.png'))
+    PANEL_STACKING  = property(lambda self: _resource_path('stackingpanel.png'))
+    PANEL_SYSTEM    = property(lambda self: _resource_path('systempanel.png'))
+    PANEL_SEARCH    = property(lambda self: _resource_path('searchpanel.png'))
+
 # Singleton instances for easy access
 _icons_instance = None
 _resources_instance = None
@@ -449,6 +461,7 @@ _LEGACY_ICON_MAP = {
     'stacking_path': 'stacking.png',
     'pedestal_icon_path': 'pedestal.png',
     'surfacemosaic_path': 'surfacemosaic.png',
+    'cosmeticcorrection_path': 'cosmeticcorrection.png',
     'starspike_path': 'starspike.png',
     'astrospike_path': 'Astro_Spikes.png',
     'aperture_path': 'aperture.png',
@@ -527,17 +540,13 @@ _LEGACY_DATA_MAP = {
 }
 
 def __getattr__(name: str):
-    # --- legacy paths (lazy) ---
     if name in _LEGACY_ICON_MAP:
         return get_icon_path(_LEGACY_ICON_MAP[name])
     if name in _LEGACY_DATA_MAP:
         return get_data_path(_LEGACY_DATA_MAP[name])
 
-    # --- special exports ---
     if name == 'background_startup_path':
         return _resource_path('Background_startup.jpg')
-    if name == 'resource_monitor_qml':
-        return _resource_path(os.path.join("qml", "ResourceMonitor.qml"))
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -661,14 +670,10 @@ def optional_model_path(filename: str) -> str | None:
     _assert_not_internal_models_path(str(p))
     return str(p)
 
-# QML helper
-resource_monitor_qml = _resource_path(os.path.join("qml", "ResourceMonitor.qml"))
-
 # Export list for `from setiastro.saspro.resources import *`
 __all__ = [
     'Icons', 'Resources',
     'get_icons', 'get_resources',
     'get_icon_path', 'get_data_path',
-    'resource_monitor_qml',
     'background_startup_path',
 ] + list(_LEGACY_ICON_MAP.keys()) + list(_LEGACY_DATA_MAP.keys())

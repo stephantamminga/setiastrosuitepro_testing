@@ -1,4 +1,4 @@
-# pro/signature_insert.py
+#saspro/signature_insert.py
 from __future__ import annotations
 import math
 import numpy as np
@@ -14,6 +14,8 @@ from PyQt6.QtWidgets import (
     QGraphicsPixmapItem, QGraphicsEllipseItem, QGraphicsRectItem, QSpinBox, QScrollArea, QToolButton, QSizePolicy
 )
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.help_support import make_help_button
+
 
 def _qcolor_to_rgba(c: QColor) -> str:
     # store as "#AARRGGBB" so alpha is preserved if you ever want it
@@ -972,6 +974,7 @@ class SignatureInsertDialogPro(QDialog):
         zg.addWidget(b_fit)
         zg.addStretch(1)
 
+
         # ---- Apply / Clear -------------------------------------------------
         apply_grp = QGroupBox("Apply / Clear")
         self.grp_apply = apply_grp
@@ -995,6 +998,7 @@ class SignatureInsertDialogPro(QDialog):
             self._collapsible_sections[key] = sec
             col.addWidget(sec)
 
+
         add_sec("load", "Load / Add", self.grp_load, True)
         add_sec("text", "Text", self.grp_text, False)
         add_sec("tech", "Technical Card", self.grp_tech_card, False)
@@ -1004,7 +1008,8 @@ class SignatureInsertDialogPro(QDialog):
         add_sec("position", "Send to Position", self.grp_position, False)
         add_sec("zoom", "Zoom", self.grp_zoom, False)
         add_sec("apply", "Apply / Clear", self.grp_apply, True)
-
+        self.btn_doc_help = make_help_button("signature_insert", self)
+        col.addWidget(self.btn_doc_help)
         col.addStretch(1)
 
         left = QWidget()
@@ -1944,7 +1949,9 @@ class SignatureInsertDialogPro(QDialog):
         return [it for it in self.scene.selectedItems() if isinstance(it, QGraphicsPixmapItem)]
 
     def _add_text_item(self, text: str, font: QFont, color: QColor):
-        ti = OutlinedTextItem(text, font, color, outline=None, outline_w=0.0)
+        ow = float(self.outline_w.value())
+        oc = getattr(self, "_text_outline_color", QColor("black")) if ow > 0 else None
+        ti = OutlinedTextItem(text, font, color, outline=oc, outline_w=ow)
         ti.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
         ti.setZValue(1)
         ti.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
@@ -1956,6 +1963,7 @@ class SignatureInsertDialogPro(QDialog):
 
         TransformHandle(ti, self.scene)
         self.text_inserts.append(ti)
+        self._apply_current_controls_to_new_item(ti)
         ti.setSelected(True)
         return ti
 
@@ -2070,6 +2078,18 @@ class SignatureInsertDialogPro(QDialog):
             if isinstance(ti, OutlinedTextItem):
                 self.outline_w.setValue(int(round(ti._outline_w)))
 
+        # Mirror the selected item's actual scale/opacity back into the sliders so
+        # the next drag doesn't snap it to a stale value (TransformHandle mutates
+        # scale directly, behind the sliders' back).
+        pix = self._selected_pixmap_items()
+        tgt = pix[0] if pix else (texts[0] if texts else None)
+        if tgt is not None:
+            for w, v in ((self.sl_scale, int(round(tgt.scale() * 100))),
+                         (self.sl_opacity, int(round(tgt.opacity() * 100)))):
+                w.blockSignals(True)
+                w.setValue(max(w.minimum(), min(w.maximum(), v)))
+                w.blockSignals(False)
+
         selected_set = set(texts)
         for it in self.text_inserts:
             if it not in selected_set:
@@ -2104,7 +2124,7 @@ class SignatureInsertDialogPro(QDialog):
         if not ok or not txt.strip():
             return
         f = self._current_qfont()
-        c = QColor("white")  # default
+        c = getattr(self, "_text_fill_color", QColor("white"))
         ti = self._add_text_item(txt, f, c)
         # drop it near center
         base = next((i for i in self.scene.items()
@@ -2201,6 +2221,21 @@ class SignatureInsertDialogPro(QDialog):
         pm = QPixmap.fromImage(self._numpy_to_qimage(np.asarray(d.image, dtype=np.float32)))
         self._add_insert(pm)
 
+    def _apply_current_controls_to_new_item(self, item: QGraphicsItem):
+        """
+        Push the current (possibly restored-from-QSettings) slider values onto a
+        freshly created item. Without this, new items stay at scale/opacity 1.0
+        until the user nudges a slider and fires valueChanged.
+
+        Scale is only applied to pixmap inserts, matching _scale_selected().
+        """
+        try:
+            if isinstance(item, QGraphicsPixmapItem) and item in self.inserts:
+                item.setScale(max(0.01, float(self.sl_scale.value()) / 100.0))
+            item.setOpacity(max(0.0, min(1.0, float(self.sl_opacity.value()) / 100.0)))
+        except Exception:
+            pass
+
     def _add_insert(self, pm: QPixmap):
         it = QGraphicsPixmapItem(pm)
         it.setFlags(
@@ -2212,10 +2247,12 @@ class SignatureInsertDialogPro(QDialog):
         it.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         it.setTransformOriginPoint(it.boundingRect().center())
         it.setZValue(1)
-        it.setOpacity(1.0)
         it._is_insert_item = True
         self.scene.addItem(it)
         self.inserts.append(it)
+
+        # Must come after inserts.append() — the helper tests membership.
+        self._apply_current_controls_to_new_item(it)
 
         TransformHandle(it, self.scene)
 
@@ -2478,8 +2515,6 @@ class SignatureInsertDialogPro(QDialog):
 
         if hasattr(self.doc, "set_image"):
             self.doc.set_image(arr, step_name="Signature / Insert")
-        elif hasattr(self.doc, "apply_numpy"):
-            self.doc.apply_numpy(arr, step_name="Signature / Insert")
         else:
             self.doc.image = arr
 

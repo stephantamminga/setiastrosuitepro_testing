@@ -113,6 +113,22 @@ def is_supported_runtime_python(version: tuple[int, int] | None = None) -> bool:
     return major == 3 and minor in _SUPPORTED_PY_MINORS
 
 
+def _required_runtime_minor() -> int | None:
+    """
+    The ONLY Python minor whose torch build can be imported IN-PROCESS.
+
+    torch is loaded into *this* interpreter (import_torch adds the venv
+    site-packages to sys.path and imports torch here), so the runtime venv must
+    be built with a Python of the same major.minor. A frozen build embeds a
+    fixed PyInstaller Python (sys.version_info) that cannot change, so that
+    embedded minor -- NOT whatever system Python happens to be installed -- is
+    the one and only acceptable venv version. Returns None if not CPython 3.x.
+    """
+    if sys.version_info.major != 3:
+        return None
+    return sys.version_info.minor
+
+
 def _discover_existing_runtime_dir(status_cb=print) -> Path | None:
     global _RUNTIME_DISCOVERY_LOGGED
 
@@ -120,9 +136,12 @@ def _discover_existing_runtime_dir(status_cb=print) -> Path | None:
     if not base.exists():
         return None
 
-    cur_minor = None  # frozen builds shouldn't lock to build Python version
-    if not getattr(sys, "frozen", False):
-        cur_minor = sys.version_info.minor if sys.version_info.major == 3 else None
+    # The runtime venv is imported IN-PROCESS, so it must match this interpreter
+    # exactly -- including in frozen builds, where the embedded Python is fixed.
+    # (Previously frozen builds set cur_minor=None and accepted any supported
+    #  venv, which is exactly how a py312 app ended up bound to a py314 torch
+    #  venv. The guard just below now protects frozen builds too.)
+    cur_minor = _required_runtime_minor()
 
     # If the current interpreter is a supported version, ONLY accept a runtime
     # that matches it exactly. Never fall back to a different Python version's
@@ -212,31 +231,17 @@ def _user_runtime_dir(status_cb=print) -> Path:
         if existing:
             _RUNTIME_DIR_CACHED = existing
         else:
-            # In frozen builds sys.version_info is the bundled PyInstaller Python
-            # which may not match the system Python we'll actually use for the venv.
-            # Probe the system Python first so the tag is correct from the start.
-            if getattr(sys, "frozen", False):
-                try:
-                    cmd = _find_system_python_cmd()
-                    out = subprocess.check_output(
-                        cmd + ["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
-                        **_safe_text_kwargs(),
-                    ).strip()
-                    maj, min_ = map(int, out.split("."))
-                    if maj == 3 and min_ in _SUPPORTED_PY_MINORS:
-                        tag = _tag_for_pyver(maj, min_)
-                        _RUNTIME_DIR_CACHED = _runtime_base_dir() / tag
-                except Exception:
-                    pass
-
-            # Fall back to sys.version_info if probe failed or not frozen
-            if _RUNTIME_DIR_CACHED is None:
-                maj, min_ = sys.version_info.major, sys.version_info.minor
-                if maj == 3 and min_ in _SUPPORTED_PY_MINORS:
-                    tag = _tag_for_pyver(maj, min_)
-                else:
-                    tag = _tag_for_pyver(3, _SUPPORTED_PY_MINORS[0])
-                _RUNTIME_DIR_CACHED = _runtime_base_dir() / tag
+            # The runtime venv is imported IN-PROCESS, so it is tagged by THIS
+            # interpreter's minor -- the embedded Python in a frozen build, the
+            # running Python from source. It must NOT be tagged by whatever
+            # system Python happens to be installed: a py312 app importing a
+            # py314 venv is unloadable by construction.
+            want = _required_runtime_minor()
+            if want is not None and want in _SUPPORTED_PY_MINORS:
+                tag = _tag_for_pyver(3, want)
+            else:
+                tag = _tag_for_pyver(3, _SUPPORTED_PY_MINORS[0])
+            _RUNTIME_DIR_CACHED = _runtime_base_dir() / tag
 
     if not _RUNTIME_USERDIR_LOGGED:
         _rt_dbg(f"_user_runtime_dir() -> {_RUNTIME_DIR_CACHED}", status_cb)
@@ -720,6 +725,46 @@ def _preload_torch_dlls(site: Path, status_cb=print) -> None:
         status_cb(f"[RT] Could not preload (may be fine if lazy/GPU-only): {names}")
 
 
+def _host_abi_tag() -> str:
+    """CPython ABI tag of the interpreter that will import torch (e.g. 'cp312')."""
+    return f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+
+def _installed_torch_abi_tag(site: Path) -> str | None:
+    """
+    ABI tag torch was actually built for, read from its compiled core extension
+    filename (torch/_C.cp314-win_amd64.pyd -> 'cp314';
+    torch/_C.cpython-312-...so -> 'cp312'). None if not found.
+    """
+    import re
+    torch_dir = Path(site) / "torch"
+    if not torch_dir.is_dir():
+        return None
+    for pat in ("_C*.pyd", "_C*.so"):
+        for f in sorted(torch_dir.glob(pat)):
+            name = f.name
+            m = re.search(r"cp(\d{2,3})", name)          # cp312 / cp314
+            if m:
+                return "cp" + m.group(1)
+            m = re.search(r"cpython-(\d)(\d+)", name)     # cpython-312
+            if m:
+                return "cp" + m.group(1) + m.group(2)
+    return None
+
+
+def _abi_mismatch(site: Path) -> tuple[str, str] | None:
+    """
+    (installed_tag, host_tag) when the installed torch is built for a different
+    Python than this process -- i.e. it can NEVER load in-process -- else None.
+    This is precisely the failure the out-of-process venv probe cannot see.
+    """
+    installed = _installed_torch_abi_tag(site)
+    host = _host_abi_tag()
+    if installed and installed != host:
+        return installed, host
+    return None
+
+
 def _diagnose_win_torch_dlls(site: Path) -> str:
     """Pinpoint why the in-process torch import failed on Windows.
 
@@ -754,6 +799,22 @@ def _diagnose_win_torch_dlls(site: Path) -> str:
 
     lines = []
 
+    # If the compiled extension is built for a different Python than this
+    #sasprocess, the "missing dependency" is the interpreter DLL itself
+    # (pythonXY.dll), not a shadowed/absent CRT. Report that and stop -- the
+    # resident-CRT walk below would only mislead here.
+    _mm = _abi_mismatch(site)
+    if _mm is not None:
+        _inst, _host = _mm
+        return (
+            "Windows DLL diagnostic:\n"
+            f"  torch is built for {_inst} but this process is {_host}.\n"
+            f"  torch\\_C.{_inst}-....pyd depends on python{_inst[2:]}.dll, which "
+            f"does not exist in a {_host} process -- this IS the WinError 126, not "
+            f"a missing or shadowed CRT. Rebuild the runtime with Python "
+            f"{_host[2]}.{_host[3:]}."
+        )
+
     def _resident_path(name: str):
         """Full path of `name` if it is already loaded in THIS process, else None."""
         try:
@@ -779,7 +840,16 @@ def _diagnose_win_torch_dlls(site: Path) -> str:
         resident = _resident_path(name)
         if resident:
             in_torch = torch_lib.is_dir() and Path(resident).parent == torch_lib
-            tag = " (torch\\lib — expected)" if in_torch else " (NOT torch\\lib — possible shadow)"
+            if in_torch:
+                tag = " (torch\\lib — expected)"
+            elif name in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"):
+                # A frozen app legitimately ships the CRT in _internal / Qt bin;
+                # a resident copy there is normal, NOT a torch shadow. Only the
+                # OpenMP runtime (libiomp5md) or torch-owned DLLs resident from
+                # outside torch\\lib are genuine shadow suspects.
+                tag = " (app/system CRT — normal for a frozen app, not a shadow)"
+            else:
+                tag = " (NOT torch\\lib — possible shadow)"
             lines.append(f"  {name}: RESIDENT <- {resident}{tag}")
         else:
             try:
@@ -1133,6 +1203,20 @@ def _ensure_venv(rt: Path, status_cb=print) -> Path:
                     "Install a supported Python version and relaunch SAS Pro."
                 )
 
+            # In-process import guard: torch is loaded into THIS interpreter, so
+            # the venv interpreter's minor MUST equal ours. Refuse the build
+            # otherwise. This is the one comparison that turns a guaranteed
+            # WinError 126 (and a ~2.5 GB wasted download) into a clear message.
+            want = _required_runtime_minor()
+            if want is not None and min_ != want:
+                raise RuntimeError(
+                    f"Refusing to build the AI runtime with Python {maj}.{min_}: "
+                    f"SAS Pro runs Python 3.{want} and imports torch in-process, "
+                    f"so the runtime must be Python 3.{want}. Wheels for 3.{min_} "
+                    f"cannot load into a 3.{want} process. Install Python 3.{want} "
+                    f"and relaunch."
+                )
+
             expected_tag = _tag_for_pyver(maj, min_)
             if rt.name != expected_tag:
                 correct_rt = _runtime_base_dir() / expected_tag
@@ -1177,6 +1261,15 @@ def _ensure_venv(rt: Path, status_cb=print) -> Path:
         if ver and (ver[0] != 3 or ver[1] not in _SUPPORTED_PY_MINORS):
             status_cb(
                 f"Runtime venv is Python {ver[0]}.{ver[1]} which is no longer supported. Rebuilding."
+            )
+            shutil.rmtree(p["venv"], ignore_errors=True)
+            return _ensure_venv(rt, status_cb=status_cb)
+
+        want = _required_runtime_minor()
+        if ver and want is not None and ver[1] != want:
+            status_cb(
+                f"Runtime venv is Python {ver[0]}.{ver[1]} but SAS Pro runs "
+                f"Python 3.{want} (torch is imported in-process). Rebuilding to match."
             )
             shutil.rmtree(p["venv"], ignore_errors=True)
             return _ensure_venv(rt, status_cb=status_cb)
@@ -1922,6 +2015,11 @@ def import_torch(
     require_torchaudio: bool = False,
     allow_install: bool = False,
 ):
+    # Guard: callers may pass status_cb=None. Normalize to a no-op so the
+    # many status_cb(...) calls below don't crash with 'NoneType' not callable.
+    if not callable(status_cb):
+        status_cb = lambda *a, **k: None    
+
     """Return the runtime-venv torch module, installing if allow_install=True."""
     global _TORCH_CACHED
     if _TORCH_CACHED is not None:
@@ -1978,22 +2076,40 @@ def import_torch(
         except Exception:
             pass
 
-    def _raise_missing_runtime(info: dict) -> None:
+    def _raise_missing_runtime(info: dict, fallback_detail: str | None = None) -> None:
         missing = [k for k in ("torch", "torchvision") if not info[k][0]]
         if require_torchaudio and not info["torchaudio"][0]:
             missing.append("torchaudio")
-        if prefer_cuda or prefer_xpu or prefer_dml or prefer_rocm:
-            msg = (
-                "GPU acceleration runtime is not installed or is incomplete.\n\n"
-                f"Missing packages in runtime venv: {', '.join(missing)}\n\n"
-                "Please go to Settings -> Preferences and install GPU Acceleration "
-                "before running Cosmic Clarity, SyQon, or other hardware accelerated tools."
+        gpu = prefer_cuda or prefer_xpu or prefer_dml or prefer_rocm
+        head = (
+            "GPU acceleration runtime is not installed or is incomplete."
+            if gpu else
+            "Hardware acceleration runtime is not installed or is incomplete."
+        )
+        parts = [head, f"Missing packages in runtime venv: {', '.join(missing)}"]
+        # When the in-process fallback below tried to import torch/torchvision
+        # itself and hit a concrete error (typically an ABI mismatch such as
+        # ``operator torchvision::nms does not exist`` from a torch and
+        # torchvision that were built against different releases, or a HIP
+        # library the installed torch expects that this GPU / driver does not
+        # actually support), thread that error through the message so the
+        # popup shows something searchable instead of a generic "install GPU
+        # Acceleration" hint that will not help.
+        if fallback_detail:
+            parts.append(f"Underlying error: {fallback_detail}")
+            parts.append(
+                "This usually means the installed torch and torchvision were "
+                "built against different versions of each other, or the GPU / "
+                "driver combination is not fully supported by the installed "
+                "runtime."
             )
-        else:
-            msg = (
-                "Hardware acceleration runtime is not installed or is incomplete.\n\n"
-                f"Missing packages in runtime venv: {', '.join(missing)}"
+        if gpu:
+            parts.append(
+                "Please go to Settings -> Preferences and install GPU "
+                "Acceleration before running Cosmic Clarity, SyQon, or other "
+                "hardware accelerated tools."
             )
+        msg = "\n\n".join(parts)
         status_cb(f"[RT] {msg}")
         raise RuntimeError(msg)
 
@@ -2012,6 +2128,37 @@ def import_torch(
 
     rt = _user_runtime_dir(status_cb=status_cb)
     vp = _ensure_venv(rt, status_cb=status_cb)
+
+    # In-process loadability guard. Must run BEFORE any import path -- including
+    # the fast caches below -- because a wrong-ABI runtime can never import here,
+    # and the out-of-process venv probe (which runs the venv's own python) will
+    # happily report ok=True for it. Subprocess-free (a filesystem glob), so it
+    # does not defeat the zero-subprocess fast-cache path below.
+    try:
+        if platform.system() == "Windows":
+            _abi_sites = [vp.parent.parent / "Lib" / "site-packages"]
+        else:
+            _abi_sites = list((vp.parent.parent / "lib").glob("python3.*/site-packages"))
+    except Exception:
+        _abi_sites = []
+    for _site in _abi_sites:
+        _mm = _abi_mismatch(_site)
+        if _mm is not None:
+            _inst, _host = _mm
+            _detail = (
+                "AI runtime / interpreter version mismatch.\n"
+                f"  App interpreter : {_host} (Python {sys.version_info.major}.{sys.version_info.minor})\n"
+                f"  Installed torch : {_inst}\n\n"
+                f"torch/_C.{_inst}-... is built for Python {_inst[2]}.{_inst[3:]} and "
+                f"cannot load into this Python {sys.version_info.major}.{sys.version_info.minor} "
+                f"process (it needs python{_inst[2:]}.dll, which is not this "
+                f"interpreter). The runtime was built with the wrong Python.\n\n"
+                f"Fix: delete the runtime folder below and reinstall Hardware "
+                f"Acceleration; SAS Pro will rebuild it with Python "
+                f"3.{sys.version_info.minor}.\n  {rt}"
+            )
+            status_cb("[RT] " + _detail.replace("\n", " "))
+            raise RuntimeError(_detail)
 
     # Ultra-fast file cache path
     try:
@@ -2106,8 +2253,96 @@ def import_torch(
     )
 
     if not ok_all:
+        # In-process false-negative recovery.
+        #
+        # The subprocess probe above runs ``venv_python -c "import torch"``.
+        # It's the safest way to check whether the venv is really installable
+        # WITHOUT risking a hard crash of THIS interpreter — but it can also
+        # be a false negative. Two scenarios we've hit in the wild:
+        #
+        #   1. A user manually pip-installed a working torch build into the
+        #      venv (e.g. ROCm on Linux). No fast-path marker got written,
+        #      so we fell through to the subprocess probe, which reports
+        #      "not installed" because the parent process's environment
+        #      (LD_LIBRARY_PATH pointing at bundled libs, PYTHONHOME, or a
+        #      PyInstaller _MEIPASS trail) breaks the venv python's own
+        #      import of torch — even though the same import works fine
+        #      IN THIS process, which has already been configured for the
+        #      venv's runtime.
+        #   2. Any environment where the parent has GPU-vendor env vars
+        #      that only make sense once torch is loaded in-process
+        #      (ROCM_PATH pointing at libs an isolated subprocess can't
+        #      resolve, etc.).
+        #
+        # settings.py's Backend line proves this happens: it does an
+        # in-process import via ``importlib.import_module("torch")`` and
+        # cheerfully shows "ROCm (…)" while THIS function was about to
+        # raise "GPU acceleration runtime is not installed" for the same
+        # runtime. Reconcile the two by trying an in-process import here
+        # before we conclude anything. If it works, we know torch is
+        # really usable and we cache/marker it so the next launch takes
+        # the fast path.
+        _fallback_detail: str | None = None
+        try:
+            sp = str(site)
+            if sp not in sys.path:
+                sys.path.insert(0, sp)
+            _demote_shadow_torch_paths(status_cb=status_cb)
+            _purge_bad_torch_from_sysmodules(status_cb=status_cb, rocm=prefer_rocm)
+            _register_dll_dirs_for_frozen(site, vp, status_cb=status_cb)
+            if getattr(sys, "frozen", False):
+                try:
+                    os.chdir(Path.home())
+                except Exception:
+                    pass
+            import torch as _t_probe
+            import torchvision as _tv_probe  # noqa: F401
+            if require_torchaudio:
+                import torchaudio as _ta_probe  # noqa: F401
+            # Only accept it if it actually resolves under the runtime
+            # venv's site — otherwise we'd be honouring a system torch we
+            # explicitly don't want to promote. ``_torch_sanity_check``
+            # separately guards against shadow torches and missing C-ext.
+            tf = getattr(_t_probe, "__file__", "") or ""
+            site_str = str(site)
+            site_alt = str(site.parent / "site-packages")
+            site_dist = str(site.parent / "dist-packages")
+            resolves_under_venv = tf and (
+                site_str in tf or site_alt in tf or site_dist in tf
+            )
+            if resolves_under_venv:
+                _torch_sanity_check(status_cb=status_cb)
+                status_cb(
+                    "[RT] Subprocess probe reported torch missing, but "
+                    f"in-process import from the venv succeeded ({tf}). "
+                    "Trusting the in-process import."
+                )
+                _TORCH_CACHED = _t_probe
+                # Write the marker + fast-path cache so future launches
+                # skip the subprocess probe entirely.
+                try:
+                    _write_torch_marker(marker, status_cb=status_cb)
+                except Exception:
+                    pass
+                _write_cache_best_effort(rt, site, venv_ver)
+                return _t_probe
+            else:
+                _fallback_detail = (
+                    f"in-process torch resolved outside the venv ({tf!r})"
+                )
+                status_cb(
+                    "[RT] In-process fallback imported torch but it does "
+                    f"not resolve under the venv ({tf!r}); ignoring."
+                )
+        except Exception as e:
+            _fallback_detail = f"{type(e).__name__}: {e}"
+            status_cb(
+                f"[RT] In-process fallback also failed "
+                f"({_fallback_detail}); honouring the subprocess probe."
+            )
+
         if not allow_install:
-            _raise_missing_runtime(info)
+            _raise_missing_runtime(info, fallback_detail=_fallback_detail)
 
         status_cb("[RT] Runtime torch stack missing/incomplete; explicit install allowed. Starting…")
         try:
@@ -2156,7 +2391,7 @@ def import_torch(
         # After a fresh install, skip the in-process import entirely.
         # The first in-process import after a cold install can fail on some cp314
         # builds due to torch.hub side-effect imports that don't work in this
-        # process context. The marker is written and the next launch will use
+        #sasprocess context. The marker is written and the next launch will use
         # the fast marker path which works cleanly.
         status_cb(
             "[RT] Hardware Acceleration installed successfully. "
@@ -2224,14 +2459,34 @@ def import_torch(
 
         ok_all_final, info_final = _venv_has_torch_stack(vp, status_cb=status_cb, require_torchaudio=require_torchaudio)
         msg = "\n".join([f"{k}: ok={ok} :: {out}" for k, (ok, out) in info_final.items()])
+
+        # If the installed runtime's ABI doesn't match this interpreter, THAT is
+        # the cause -- say so exactly, and skip the DLL forensic (its shadow
+        # heuristics are noise here and point away from the real problem).
+        _mm = _abi_mismatch(site)
+        if _mm is not None:
+            _inst, _host = _mm
+            raise RuntimeError(
+                "AI runtime / interpreter version mismatch.\n"
+                f"  App interpreter : {_host} (Python {sys.version_info.major}.{sys.version_info.minor})\n"
+                f"  Installed torch : {_inst}\n\n"
+                f"torch/_C.{_inst}-... is built for Python {_inst[2]}.{_inst[3:]} and can "
+                f"never load into this Python {sys.version_info.major}.{sys.version_info.minor} "
+                f"process. The runtime was built with the wrong interpreter.\n\n"
+                f"Fix: delete the runtime folder below and reinstall Hardware "
+                f"Acceleration so it rebuilds with Python 3.{sys.version_info.minor}:\n"
+                f"  {rt}\n\n"
+                f"Original error: {type(e).__name__}: {e}"
+            ) from e
+
         try:
             win_diag = _diagnose_win_torch_dlls(site)
         except Exception:
             win_diag = ""
         raise RuntimeError(
-            "Runtime venv probe says torch stack exists, but in-process import failed.\n"
-            "This typically indicates a frozen-stdlib / PyInstaller packaging issue, "
-            "shadowed torch import, or broken wheel.\n\n"
+            "Runtime venv probe says torch stack exists, but the in-process import failed.\n"
+            "The runtime ABI matches this interpreter, so this points to a packaging "
+            "issue, a shadowed torch import, or a broken wheel.\n\n"
             f"Original error: {type(e).__name__}: {e}\n\n"
             f"Probe ok_all={ok_all_final}\n"
             "Runtime venv probe:\n" + msg
@@ -2299,24 +2554,44 @@ def _find_system_python_cmd() -> list[str]:
     Find the best available system Python for creating a SASpro runtime venv.
     Preference order: 3.12, 3.13, 3.14.
     """
-    # When frozen (PyInstaller), sys.executable is the .exe — never use it as Python.
-    # Always search for a real system Python in the frozen case.
+    want = _required_runtime_minor()  # == sys.version_info.minor
+
+    # Source run: this very interpreter builds AND imports the venv, so it
+    # matches by construction; use it directly.
     if not getattr(sys, "frozen", False):
         maj, min_ = sys.version_info.major, sys.version_info.minor
         if maj == 3 and min_ in _SUPPORTED_PY_MINORS:
             return [sys.executable]
+        raise RuntimeError(
+            f"SAS Pro is running on Python {maj}.{min_}, which the AI runtime "
+            f"does not support ({supported_python_versions_text()}). Relaunch "
+            f"with a supported Python."
+        )
 
-    for minor in _SUPPORTED_PY_MINORS:
-        cmd = _find_system_python_cmd_for_minor(minor)
-        if cmd:
-            return cmd
+    # Frozen: sys.executable is the .exe. torch is imported into the embedded
+    # Python 3.{want}, so the venv MUST be built with a system Python 3.{want}
+    # EXACTLY. A 3.13/3.14 interpreter would build wheels that can never load
+    # into this 3.{want} process -- the WinError 126 users hit. Do NOT fall back
+    # to any-supported-minor here.
+    if want is None or want not in _SUPPORTED_PY_MINORS:
+        raise RuntimeError(
+            f"This SAS Pro build embeds Python 3.{want}, which is not a supported "
+            f"AI-runtime Python ({supported_python_versions_text()})."
+        )
+
+    cmd = _find_system_python_cmd_for_minor(want)
+    if cmd:
+        return cmd
 
     raise RuntimeError(
-        "Could not find Python 3.12, 3.13, or 3.14 to create the SASpro runtime venv.\n"
-        "Install one of these Python versions and relaunch SAS Pro.\n\n"
-        "Windows:  install from python.org and ensure 'py -3.12' (or -3.13/-3.14) works\n"
-        "macOS:    brew install python@3.12\n"
-        "Linux:    sudo apt install python3.12  (or your distro equivalent)"
+        f"SAS Pro's bundled interpreter is Python 3.{want}. The GPU/AI runtime is "
+        f"loaded inside this same interpreter, so it must be built with a matching "
+        f"system Python 3.{want}; packages built for other versions (3.13, 3.14, "
+        f"...) cannot load into a 3.{want} process.\n\n"
+        f"No Python 3.{want} was found on this system. Install it and relaunch:\n\n"
+        f"Windows:  py install 3.{want}   (then check 'py -3.{want}' works)\n"
+        f"macOS:    brew install python@3.{want}\n"
+        f"Linux:    install python3.{want} from your package manager"
     )
 
 

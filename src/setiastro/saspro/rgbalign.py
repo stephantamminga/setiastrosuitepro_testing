@@ -1,4 +1,4 @@
-# pro/rgbalign.py
+#saspro/rgbalign.py
 from __future__ import annotations
 
 import os
@@ -14,7 +14,7 @@ from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QCursor
 
 
 from setiastro.saspro import astroalign
-
+from setiastro.saspro.help_support import make_help_button
 import sep
 sep.set_extract_pixstack(20000000)
 
@@ -739,7 +739,7 @@ class RGBAlignDialog(QDialog):
         self.chk_new_doc.setChecked(True)
         lay.addWidget(self.chk_new_doc)
 
-        # progress
+        #sasprogress
         self.progress_label = QLabel("Idle.")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -767,6 +767,8 @@ class RGBAlignDialog(QDialog):
         btns.addWidget(self.btn_run)
         btns.addWidget(self.btn_manual)
         btns.addWidget(self.btn_close)
+        btns.addStretch(1)
+        btns.addWidget(make_help_button("rgb_align", self))
         lay.addLayout(btns)
 
         self.btn_run.clicked.connect(self._start_align)

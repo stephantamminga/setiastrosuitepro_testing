@@ -138,7 +138,7 @@ import math
 from setiastro.saspro.autostretch import autostretch
 from setiastro.saspro.autostretch import autostretch as _autostretch
 from setiastro.saspro.rgb_extract import extract_rgb_channels
-
+from setiastro.saspro.help_support import make_help_button
 
 
 from setiastro.saspro.legacy.numba_utils import (
@@ -187,7 +187,7 @@ from setiastro.saspro.resources import (
     colorwheel_path, font_path, csv_icon_path, spinner_path, wims_path, narrowbandnormalization_path,
     wimi_path, linearfit_path, debayer_path, aberration_path, acv_icon_path, snr_path,nbextract_icon,sssc_path,
     functionbundles_path, viewbundles_path, selectivecolor_path, selectivelum_path, rgbalign_path, planetarystacker_path,syqon_path,rcastro_path,
-    background_path, script_icon_path, planetprojection_path,clonestampicon_path, finderchart_path,magnitude_path,
+    background_path, script_icon_path, planetprojection_path,clonestampicon_path, finderchart_path,magnitude_path, cosmeticcorrection_path,
 )
 
 import faulthandler
@@ -273,7 +273,7 @@ from setiastro.saspro.file_utils import (
 # GUI Mixins for modular code organization
 from setiastro.saspro.gui.mixins import (
     DockMixin, MenuMixin, ToolbarMixin, FileMixin,
-    ThemeMixin, GeometryMixin, ViewMixin, HeaderMixin, MaskMixin, UpdateMixin
+    ThemeMixin, GeometryMixin, ViewMixin, HeaderMixin, MaskMixin, UpdateMixin, DockRailMixin
 )
 
 import sys
@@ -469,7 +469,7 @@ def _normalize_title_for_compare(t: str) -> str:
     return t.strip()
 
 class AstroSuiteProMainWindow(
-    DockMixin, MenuMixin, ToolbarMixin, FileMixin,
+    DockMixin, DockRailMixin, MenuMixin, ToolbarMixin, FileMixin,
     ThemeMixin, GeometryMixin, ViewMixin, HeaderMixin, MaskMixin, UpdateMixin,
     QMainWindow
 ):
@@ -505,6 +505,7 @@ class AstroSuiteProMainWindow(
         self._stats_timer.timeout.connect(self._update_usage_stats)
         self._stats_timer.start(60000)  # Update every minute
         self._shutting_down = False
+        self._icon_table = None
         self.dock_host = None
         
         from setiastro.saspro.doc_manager import DocManager
@@ -647,7 +648,7 @@ class AstroSuiteProMainWindow(
         self._init_console_dock()
         self._init_header_viewer_dock()
         self._init_layers_dock()
-        self._init_resource_monitor_overlay()
+        self._init_resource_monitor_dock()
         self._shutting_down = False
         self._init_status_log_dock()
         self._init_log_dock()
@@ -658,6 +659,7 @@ class AstroSuiteProMainWindow(
         self._init_menubar()
         self._init_toolbar()
         self._install_command_search()
+        self._init_dock_rails() 
 
         # Keep explorer in sync
         self.docman.documentAdded.connect(self._add_doc_to_explorer)
@@ -2359,6 +2361,30 @@ class AstroSuiteProMainWindow(
     def starnet_path(self) -> str:
         return self.settings.value("paths/starnet", "", type=str)
 
+    def _open_icon_table(self):
+        from setiastro.saspro.icon_table import IconTablePanel
+        if self._icon_table is None:
+            self._icon_table = IconTablePanel(self, self.shortcuts, parent=self)
+            self._icon_table.restore_window_state()
+        self._icon_table.show()
+        self._icon_table.raise_()
+        self._icon_table.activateWindow()
+
+    def _restore_icon_table_if_needed(self):
+        """Called on startup if the icon table was open at last shutdown."""
+        try:
+            from setiastro.saspro.icon_table import open_icon_table
+            # open_icon_table constructs the panel; its restore_window_state()
+            # picks up saved geometry before we show it.
+            if self._icon_table is None:
+                from setiastro.saspro.icon_table import IconTablePanel
+                self._icon_table = IconTablePanel(self, self.shortcuts, parent=self)
+                self._icon_table.restore_window_state()
+            self._icon_table.show()
+            self._icon_table.raise_()
+        except Exception:
+            pass
+
     def _unwrap_history_doc(self, d):
         """
         Return the *real* document that owns the history stack for `d`.
@@ -2662,7 +2688,12 @@ class AstroSuiteProMainWindow(
         QMessageBox.information(self, "WCS Updated", text)
 
     def _bake_display_stretch(self):
-        """Apply the current Display-Stretch to the image data (undoable, non-replayable)."""
+        """Bake the *currently displayed* Display-Stretch into the image data.
+
+        Applies the exact LUT the view is showing (via the view's own apply path)
+        rather than recomputing a stretch, which would drift from the preview if
+        the image was modified (e.g. denoised) since the stretch was toggled on.
+        """
         sw = self.mdi.activeSubWindow()
         if not sw:
             QMessageBox.information(self, "Display-Stretch", "No active image window.")
@@ -2674,98 +2705,63 @@ class AstroSuiteProMainWindow(
             QMessageBox.information(self, "Display-Stretch", "Active window has no image.")
             return
 
-        img = getattr(doc, "image", None)
-        a = np.asarray(img)
+        if not getattr(view, "autostretch_enabled", False):
+            QMessageBox.information(
+                self, "Display-Stretch",
+                "Display-Stretch isn't on for this view.\nTurn it on first, then bake it in."
+            )
+            return
+
+        a = np.asarray(doc.image)
         if a.size == 0:
             QMessageBox.information(self, "Display-Stretch", "Image is empty.")
             return
 
-        # --- Get the *current* display-stretch parameters ---
-        # start from global defaults
-        target       = float(self.settings.value("display/target", 0.30, type=float))
-        sigma        = float(self.settings.value("display/sigma", 5.0, type=float))
-        linked       = bool(self.settings.value("display/stretch_linked", False, type=bool))
-        use_24       = self.settings.value("display/autostretch_24bit", True, type=bool)
-        no_black_clip = bool(self.settings.value("display/no_black_clip", False, type=bool))
-
-        # if your view exposes per-view overrides, prefer those
-        if hasattr(view, "autostretch_target"):
-            try:
-                target = float(view.autostretch_target)
-            except Exception:
-                pass
-        if hasattr(view, "autostretch_sigma"):
-            try:
-                sigma = float(view.autostretch_sigma)
-            except Exception:
-                pass
-        if hasattr(view, "stretch_linked"):
-            try:
-                linked = bool(view.stretch_linked)
-            except Exception:
-                pass
-        if hasattr(view, "no_black_clip"):
-            try:
-                no_black_clip = bool(view.no_black_clip)
-            except Exception:
-                pass
-
-        # --- Run the same autostretch math used for display ---
-        try:
-            stretched01 = _autostretch(
-                a,
-                target_median=target,
-                linked=linked,
-                sigma=sigma,
-                use_24bit=use_24,
-                no_black_clip=no_black_clip,
+        stretched01 = None
+        if hasattr(view, "apply_current_display_stretch"):
+            stretched01 = view.apply_current_display_stretch()
+        if stretched01 is None:
+            QMessageBox.warning(
+                self, "Display-Stretch",
+                "Couldn't read the active display-stretch. Toggle it off and on, then retry."
             )
-        except Exception as e:
-            QMessageBox.warning(self, "Display-Stretch", f"Failed to apply autostretch:\n{e}")
             return
 
-        # --- Convert back to original dtype ---
+        # back to original dtype
         if np.issubdtype(a.dtype, np.integer):
             info = np.iinfo(a.dtype)
             out = (np.clip(stretched01, 0.0, 1.0) * float(info.max)).astype(a.dtype, copy=False)
         else:
-            # float images: bake 0-1 stretched data into same float dtype
             out = np.clip(stretched01, 0.0, 1.0).astype(a.dtype, copy=False)
 
-        # --- Commit to document with undo metadata (no command_id -> non-replayable) ---
         meta = {
             "step_name": "Display-Stretch (baked)",
-            "autostretch_target": float(target),
-            "autostretch_sigma": float(sigma),
-            "autostretch_linked": bool(linked),
-            "autostretch_no_black_clip": bool(no_black_clip),
+            "autostretch_target": float(getattr(view, "autostretch_target", 0.0)),
+            "autostretch_sigma": float(getattr(view, "autostretch_sigma", 0.0)),
+            "autostretch_linked": bool(getattr(view, "_autostretch_linked", False)),
+            "autostretch_no_black_clip": bool(getattr(view, "_no_black_clip", False)),
+            "baked_from_display_lut": True,
         }
 
         try:
             if hasattr(doc, "set_image"):
-                # your Document.set_image already manages undo/redo
                 doc.set_image(out, meta)
             elif hasattr(doc, "update_image"):
                 doc.update_image(out, meta)
             else:
-                # last-resort fallback (no undo)
                 doc.image = out
         except Exception as e:
             QMessageBox.critical(self, "Display-Stretch", f"Failed to update image:\n{e}")
             return
 
-        # Turn OFF display-stretch so the baked image looks exactly like the preview did
+        # turn display-stretch off so the baked (already-stretched) data shows linearly,
+        # i.e. identical to the preview
         if hasattr(view, "set_autostretch"):
             view.set_autostretch(False)
         self._sync_autostretch_action(False)
 
         try:
-            self._log(
-                f"Display-Stretch baked into image (target={target:.3f}, "
-                f"sigma={sigma:.2f}, linked={'on' if linked else 'off'}, "
-                f"no_black_clip={'on' if no_black_clip else 'off'}) "
-                f"-> {sw.windowTitle()}"
-            )
+            self._log(f"Display-Stretch baked into image -> {sw.windowTitle()}")
         except Exception:
             pass
 
@@ -2950,6 +2946,29 @@ class AstroSuiteProMainWindow(
                 return
 
         add_stars(self)
+
+    def _open_cosmetic_correction(self):
+        from setiastro.saspro.cosmetic_correction import (
+            open_cosmetic_correction_dialog,
+            open_cosmetic_correction_batch,
+        )
+        sw = self.mdi.activeSubWindow()
+        if not sw:
+            # No active image → jump straight into batch mode.
+            open_cosmetic_correction_batch(self)
+            self._log("Functions: opened Cosmetic Correction (batch, no active image).")
+            return
+
+        view = sw.widget()
+        # ROI-aware: always resolve via DocManager for THIS view
+        doc = self.doc_manager.get_document_for_view(view)
+        if doc is None or getattr(doc, "image", None) is None:
+            open_cosmetic_correction_batch(self)
+            self._log("Functions: opened Cosmetic Correction (batch, no image loaded).")
+            return
+
+        open_cosmetic_correction_dialog(self, doc=doc)
+        self._log("Functions: opened Cosmetic Correction.")
 
     def _open_graxpert(self):
         from setiastro.saspro.graxpert import remove_gradient_with_graxpert
@@ -3841,7 +3860,13 @@ class AstroSuiteProMainWindow(
         )
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
-        lay.addWidget(btns)
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_help = make_help_button("luminance_recombine", dlg)
+        btn_row.addWidget(btn_help)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btns)
+        lay.addLayout(btn_row)
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -4799,8 +4824,15 @@ class AstroSuiteProMainWindow(
         w.show()
 
     def _open_multiscale_decomp(self):
-        doc = self._active_doc()
-        if not doc:
+        sw = self.mdi.activeSubWindow()
+        if not sw:
+            QMessageBox.information(self, "Multiscale Decomposition", "No active image.")
+            return
+        view = sw.widget()
+        # ROI-aware: always resolve via DocManager for THIS view
+        # (so active_mask_id / masks are attached to the doc we pass in).
+        doc = self.doc_manager.get_document_for_view(view)
+        if not doc or getattr(doc, "image", None) is None:
             QMessageBox.information(self, "Multiscale Decomposition", "No active image.")
             return
         from setiastro.saspro.multiscale_decomp import MultiscaleDecompDialog
@@ -4812,7 +4844,7 @@ class AstroSuiteProMainWindow(
         except Exception:
             pass
 
-        dlg.show()  
+        dlg.show()
 
     def _open_slap_toolkit(self):
         from setiastro.saspro.slap_toolkit import show_slap_toolkit
@@ -4994,25 +5026,17 @@ class AstroSuiteProMainWindow(
 
 
     def _open_plate_solver(self):
-        from setiastro.saspro.plate_solver import plate_solve_doc_inplace, PlateSolverDialog
-        dlg = PlateSolverDialog(self.settings, parent=self)
-        dlg.setWindowIcon(QIcon(platesolve_path))
-        dlg.show()  # modal; keeps the dialog (and its QProcess) alive until done
+        from setiastro.saspro.plate_solver import open_plate_solver_with_preset
+        open_plate_solver_with_preset(self)
 
-        # After modal returns, refresh header viewer just in case it changed
-        try:
-            doc = self._active_doc()
-            if doc:
-                self._hdr_refresh_timer.start(0)
-        except Exception:
-            pass
-
-        # Optional: if you have a tree/list that depends on metadata, refresh it too
-        try:
-            if hasattr(self, "_refresh_treebox"):
-                self._refresh_treebox()
-        except Exception:
-            pass
+    def _apply_plate_solve_to_doc(self, doc, preset=None):
+        from setiastro.saspro.plate_solver import apply_plate_solve_to_doc
+        if doc is None or getattr(doc, "image", None) is None:
+            raise RuntimeError("No image to plate-solve.")
+        ok, res = apply_plate_solve_to_doc(self, doc, self.settings, preset or {})
+        if not ok:
+            raise RuntimeError(str(res) or "Plate solve failed.")
+        return res
 
     def _doc_has_wcs(self, doc) -> bool:
         if doc is None:
@@ -5315,59 +5339,74 @@ class AstroSuiteProMainWindow(
             except Exception:
                 pass
 
-    def _convert_rgb_to_mono_active(self):
-        """
-        Convert active RGB document to mono in-place (undoable) using the
-        currently selected luminance method — same math as Extract Luminance
-        but overwrites the current view instead of spawning a new one.
-        """
+    # ============================================================
+    # RGB / Mono / channel-order tools (replayable + bundle-able)
+    # ============================================================
+
+    def _resolve_active_doc(self):
+        dm = getattr(self, "docman", None)
+        if dm is None:
+            return None
+        try:
+            return dm.get_active_document()
+        except Exception:
+            return None
+
+    def _doc_name(self, doc) -> str:
+        try:
+            return getattr(doc, "display_name", lambda: None)() or getattr(doc, "name", "") or "Active"
+        except Exception:
+            return "Active"
+
+    # ---- RGB → Mono -------------------------------------------------------
+
+    def _rgb_to_mono_on_doc(self, doc, preset=None) -> bool:
+        """Convert an RGB doc to mono (undoable) using a luminance method.
+        Records a replay marker so it can be replayed / bundled. Works on any doc."""
         from setiastro.saspro.luminancerecombine import (
-            compute_luminance,
-            resolve_luma_profile_weights,
+            compute_luminance, resolve_luma_profile_weights,
         )
         import numpy as np
 
         dm = getattr(self, "docman", None)
-        if dm is None:
-            return
-        try:
-            doc = dm.get_active_document()
-        except Exception:
-            doc = None
-        if doc is None:
-            return
-
+        if dm is None or doc is None:
+            return False
         img = getattr(doc, "image", None)
         if img is None:
-            return
+            return False
 
         x = np.asarray(img)
+        name = self._doc_name(doc)
 
-        # Already mono?
         if x.ndim == 2 or (x.ndim == 3 and x.shape[-1] == 1):
-            try:
-                name = getattr(doc, "display_name", lambda: None)() or getattr(doc, "name", "") or "Active"
-            except Exception:
-                name = "Active"
             if hasattr(self, "_log"):
                 self._log(f"RGB → Mono: '{name}' is already mono (shape={x.shape}).")
-            return
-
-        # Must be RGB
+            return False
         if not (x.ndim == 3 and x.shape[-1] >= 3):
             if hasattr(self, "_log"):
                 self._log(f"RGB → Mono: unsupported shape {x.shape}.")
-            return
+            return False
 
-        method = getattr(self, "luma_method", "rec709")
+        preset = dict(preset or {})
+        method = preset.get("luma_method") or getattr(self, "luma_method", "rec709")
         resolved_method, w, profile_name = resolve_luma_profile_weights(method)
+
+        # Faithful replay of custom profiles: explicit weights in the preset win.
+        pw = preset.get("luma_weights")
+        if pw:
+            try:
+                w = np.asarray(pw, dtype=np.float32)
+            except Exception:
+                pass
+
         L = compute_luminance(x, method=resolved_method, weights=w).astype(np.float32)
 
-        try:
-            md = dict(getattr(doc, "metadata", None) or {})
-        except Exception:
-            md = {}
+        # Canonical replay preset (what _apply_rgb_to_mono_to_doc consumes).
+        rp = {"luma_method": resolved_method}
+        if w is not None:
+            rp["luma_weights"] = np.asarray(w, dtype=np.float32).tolist()
 
+        md = dict(getattr(doc, "metadata", None) or {})
         md["is_mono"] = True
         md["color_model"] = "Mono"
         md["channels"] = 1
@@ -5376,6 +5415,8 @@ class AstroSuiteProMainWindow(
             md["luma_weights"] = np.asarray(w, dtype=np.float32).tolist()
         if profile_name:
             md["luma_profile"] = str(profile_name)
+        md["command_id"] = "rgb_to_mono"     # → stamped into the replay marker
+        md["preset"] = dict(rp)
         md["__op_params__"] = {
             "op": "rgb_to_mono",
             "luma_method": resolved_method,
@@ -5383,25 +5424,9 @@ class AstroSuiteProMainWindow(
             "to_shape": tuple(L.shape),
         }
 
-        try:
-            name = getattr(doc, "display_name", lambda: None)() or getattr(doc, "name", "") or "Active"
-        except Exception:
-            name = "Active"
-
         suffix = profile_name or resolved_method
-
         try:
-            dm.update_active_document(
-                L,
-                metadata=md,
-                step_name=f"RGB → Mono ({suffix})",
-                doc=doc,
-            )
-            if hasattr(self, "_log"):
-                self._log(
-                    f"RGB → Mono: '{name}' converted using {suffix} "
-                    f"(shape {x.shape} → {L.shape})."
-                )
+            dm.update_active_document(L, metadata=md, step_name=f"RGB → Mono ({suffix})", doc=doc)
         except Exception:
             import traceback
             try:
@@ -5409,77 +5434,64 @@ class AstroSuiteProMainWindow(
                 QMessageBox.critical(self, "RGB → Mono", traceback.format_exc())
             except Exception:
                 pass
-
-    def _convert_mono_to_rgb_active(self):
-        """
-        Convert active mono document to RGB by duplicating the channel.
-        Updates the active document in-place (undoable).
-        """
-        dm = getattr(self, "docman", None)
-        if dm is None:
-            return
+            return False
 
         try:
-            doc = dm.get_active_document()
+            self._last_headless_command = {"command_id": "rgb_to_mono", "preset": dict(rp)}
         except Exception:
-            doc = None
-        if doc is None:
-            return
+            pass
+        if hasattr(self, "_log"):
+            self._log(f"RGB → Mono: '{name}' converted using {suffix} (shape {x.shape} → {L.shape}).")
+        return True
 
-        img = getattr(doc, "image", None)
-        if img is None:
-            return
+    def _convert_rgb_to_mono_active(self):
+        self._rgb_to_mono_on_doc(self._resolve_active_doc(), preset=None)
 
+    def _apply_rgb_to_mono_to_doc(self, doc, preset=None):
+        return self._rgb_to_mono_on_doc(doc, preset)
+
+    # ---- Mono → RGB -------------------------------------------------------
+
+    def _mono_to_rgb_on_doc(self, doc, preset=None) -> bool:
+        """Convert a mono doc to RGB by triplicating the channel (undoable)."""
         import numpy as np
 
-        x = np.asarray(img)
+        dm = getattr(self, "docman", None)
+        if dm is None or doc is None:
+            return False
+        img = getattr(doc, "image", None)
+        if img is None:
+            return False
 
-        # Already RGB?
+        x = np.asarray(img)
+        name = self._doc_name(doc)
+
         if x.ndim == 3 and x.shape[-1] == 3:
-            try:
-                name = getattr(doc, "display_name", lambda: None)() or getattr(doc, "name", "") or "Active"
-            except Exception:
-                name = "Active"
             if hasattr(self, "_log"):
                 self._log(f"Mono → RGB: '{name}' is already RGB (shape={getattr(x,'shape',None)}).")
-            return
+            return False
 
-        # Determine what we're converting FROM
-        src_desc = "unknown"
         if x.ndim == 2:
-            mono = x
-            src_desc = "mono (H×W)"
+            mono = x; src_desc = "mono (H×W)"
         elif x.ndim == 3 and x.shape[-1] == 1:
-            mono = x[..., 0]
-            src_desc = "mono (H×W×1)"
+            mono = x[..., 0]; src_desc = "mono (H×W×1)"
         else:
-            # Unknown format (e.g., multi-channel >3)
-            try:
-                name = getattr(doc, "display_name", lambda: None)() or getattr(doc, "name", "") or "Active"
-            except Exception:
-                name = "Active"
             if hasattr(self, "_log"):
                 self._log(f"Mono → RGB: '{name}' not convertible (shape={getattr(x,'shape',None)}).")
-            return
+            return False
 
-        before_shape = getattr(x, "shape", None)
-        before_dtype = getattr(x, "dtype", None)
-
+        before_shape, before_dtype = getattr(x, "shape", None), getattr(x, "dtype", None)
         mono = mono.astype(np.float32, copy=False)
         rgb = np.stack([mono, mono, mono], axis=-1)
 
-        # metadata: preserve existing, but force "not mono"
-        try:
-            md = dict(getattr(doc, "metadata", None) or {})
-        except Exception:
-            md = {}
-
+        rp = {"mode": "triplicate"}
+        md = dict(getattr(doc, "metadata", None) or {})
         md["is_mono"] = False
         md["color_model"] = "RGB"
         md["channels"] = 3
         md["source"] = (md.get("source") or "Edit")
-
-        # If you track op params for history explorer
+        md["command_id"] = "mono_to_rgb"
+        md["preset"] = dict(rp)
         md["__op_params__"] = {
             "op": "mono_to_rgb",
             "mode": "triplicate",
@@ -5488,27 +5500,8 @@ class AstroSuiteProMainWindow(
             "to_shape": tuple(rgb.shape),
         }
 
-        # name for logging
         try:
-            name = getattr(doc, "display_name", lambda: None)() or getattr(doc, "name", "") or "Active"
-        except Exception:
-            name = "Active"
-
-        try:
-            dm.update_active_document(
-                rgb,
-                metadata=md,
-                step_name="Mono → RGB",
-                doc=doc,  # explicit is safer
-            )
-
-            if hasattr(self, "_log"):
-                self._log(
-                    f"Mono → RGB: '{name}' converted {src_desc} "
-                    f"(shape={before_shape}, dtype={before_dtype}) → "
-                    f"RGB (shape={rgb.shape}, dtype={rgb.dtype})."
-                )
-
+            dm.update_active_document(rgb, metadata=md, step_name="Mono → RGB", doc=doc)
         except Exception:
             import traceback
             try:
@@ -5516,61 +5509,54 @@ class AstroSuiteProMainWindow(
                 QMessageBox.critical(self, "Mono → RGB", traceback.format_exc())
             except Exception:
                 pass
-
-    def _swap_rb_active(self):
-        """
-        Swap R and B channels in the active RGB document (undoable).
-        Intended for debayer/channel-order mismatches.
-        """
-        dm = getattr(self, "docman", None)
-        if dm is None:
-            return
+            return False
 
         try:
-            doc = dm.get_active_document()
+            self._last_headless_command = {"command_id": "mono_to_rgb", "preset": dict(rp)}
         except Exception:
-            doc = None
-        if doc is None:
-            return
+            pass
+        if hasattr(self, "_log"):
+            self._log(f"Mono → RGB: '{name}' converted {src_desc} "
+                    f"(shape={before_shape}, dtype={before_dtype}) → RGB (shape={rgb.shape}).")
+        return True
 
+    def _convert_mono_to_rgb_active(self):
+        self._mono_to_rgb_on_doc(self._resolve_active_doc(), preset=None)
+
+    def _apply_mono_to_rgb_to_doc(self, doc, preset=None):
+        return self._mono_to_rgb_on_doc(doc, preset)
+
+    # ---- Swap R ↔ B (bonus; same pattern) ---------------------------------
+
+    def _swap_rb_on_doc(self, doc, preset=None) -> bool:
+        import numpy as np
+
+        dm = getattr(self, "docman", None)
+        if dm is None or doc is None:
+            return False
         img = getattr(doc, "image", None)
         if img is None:
-            return
+            return False
 
-        import numpy as np
         x = np.asarray(img)
-
-        # Must be RGB
+        name = self._doc_name(doc)
         if not (x.ndim == 3 and x.shape[-1] == 3):
-            try:
-                name = getattr(doc, "display_name", lambda: None)() or getattr(doc, "name", "") or "Active"
-            except Exception:
-                name = "Active"
-
             if hasattr(self, "_log"):
                 self._log(f"Swap R/B: '{name}' is not RGB (shape={getattr(x,'shape',None)}).")
-            return
+            return False
 
-        before_shape = x.shape
-        before_dtype = x.dtype
-
-        # swap channels without changing dtype
-        # (copy is safest so we don't mutate shared views)
+        before_shape, before_dtype = x.shape, x.dtype
         out = x.copy()
         out[..., 0], out[..., 2] = x[..., 2], x[..., 0]
 
-        # metadata: preserve existing, but annotate operation
-        try:
-            md = dict(getattr(doc, "metadata", None) or {})
-        except Exception:
-            md = {}
-
+        rp = {}
+        md = dict(getattr(doc, "metadata", None) or {})
         md["color_model"] = md.get("color_model", "RGB")
         md["channels"] = 3
         md["is_mono"] = False
         md["source"] = (md.get("source") or "Edit")
-
-        # If you track op params for history explorer
+        md["command_id"] = "swap_rb"
+        md["preset"] = dict(rp)
         md["__op_params__"] = {
             "op": "swap_rb",
             "from_shape": tuple(before_shape),
@@ -5579,24 +5565,7 @@ class AstroSuiteProMainWindow(
         }
 
         try:
-            name = getattr(doc, "display_name", lambda: None)() or getattr(doc, "name", "") or "Active"
-        except Exception:
-            name = "Active"
-
-        try:
-            dm.update_active_document(
-                out,
-                metadata=md,
-                step_name="Swap R ↔ B",
-                doc=doc,
-            )
-
-            if hasattr(self, "_log"):
-                self._log(
-                    f"Swap R/B: '{name}' swapped channels "
-                    f"(shape={before_shape}, dtype={before_dtype})."
-                )
-
+            dm.update_active_document(out, metadata=md, step_name="Swap R ↔ B", doc=doc)
         except Exception:
             import traceback
             try:
@@ -5604,6 +5573,21 @@ class AstroSuiteProMainWindow(
                 QMessageBox.critical(self, "Swap R/B", traceback.format_exc())
             except Exception:
                 pass
+            return False
+
+        try:
+            self._last_headless_command = {"command_id": "swap_rb", "preset": {}}
+        except Exception:
+            pass
+        if hasattr(self, "_log"):
+            self._log(f"Swap R/B: '{name}' swapped channels (shape={before_shape}, dtype={before_dtype}).")
+        return True
+
+    def _swap_rb_active(self):
+        self._swap_rb_on_doc(self._resolve_active_doc(), preset=None)
+
+    def _apply_swap_rb_to_doc(self, doc, preset=None):
+        return self._swap_rb_on_doc(doc, preset)
 
 
     def _on_stackingsuite_relaunch(self, old_dir: str, new_dir: str):
@@ -5638,13 +5622,34 @@ class AstroSuiteProMainWindow(
 
     def _open_star_spikes(self, *, doc=None, preset: dict | None = None, title_hint: str | None = None):
         from setiastro.saspro.star_spikes import StarSpikesDialogPro
+
+        dm = getattr(self, "doc_manager", None) or getattr(self, "docman", None)
+
+        # When the caller didn't hand us a doc, resolve it the same way
+        # _open_statistical_stretch does: active subwindow -> view -> document.
+        # DocManager's cached active document is only updated on
+        # subWindowActivated and can be stale or None.
+        explicit = doc is not None
+        if doc is None:
+            sw = self.mdi.activeSubWindow()
+            if sw is not None:
+                view = sw.widget()
+                try:
+                    if dm is not None and hasattr(dm, "get_document_for_view"):
+                        doc = dm.get_document_for_view(view)
+                except Exception:
+                    doc = None
+                if doc is None:
+                    doc = getattr(view, "document", None)
+
         dlg = StarSpikesDialogPro(
             parent=self,
-            doc_manager=getattr(self, "docman", None),
+            doc_manager=dm,
             initial_doc=doc,
             jwstpupil_path=jwstpupil_path,
             aperture_help_path=aperture_path,
             spinner_path=spinner_path,  # optional; used if you want
+            follow_active=not explicit,
         )
         if preset:
             dlg.apply_preset(preset)
@@ -6386,7 +6391,39 @@ class AstroSuiteProMainWindow(
                 except Exception:
                     print("Replay-on-base Curves failed:", e)
             return
+        if cid == "cosmetic_correction":
+            try:
+                from setiastro.saspro.cosmetic_correction import apply_cosmetic_correction_preset_to_doc
+                preset_dict = preset if isinstance(preset, dict) else {}
 
+                # Re-run Cosmetic Correction on the *base* document
+                apply_cosmetic_correction_preset_to_doc(self, base_doc, preset_dict)
+
+                try:
+                    hs = float(preset_dict.get("hot_sigma", 3.0))
+                    cs = float(preset_dict.get("cold_sigma", 3.0))
+                    ch = bool(preset_dict.get("correct_hot", True))
+                    cc = bool(preset_dict.get("correct_cold", True))
+                    bp = str(preset_dict.get("bayer_pattern", "") or "").strip() or "auto"
+                    self._log(
+                        f"[Replay] Applied Cosmetic Correction to base of "
+                        f"'{target_sw.windowTitle()}' "
+                        f"(hot σ={hs:.2f} {'on' if ch else 'off'}, "
+                        f"cold σ={cs:.2f} {'on' if cc else 'off'}, bayer={bp})"
+                    )
+                except Exception:
+                    pass
+
+            except Exception as e:
+                try:
+                    QMessageBox.warning(
+                        self,
+                        "Cosmetic Correction",
+                        f"Replay-on-base failed:\n{e}",
+                    )
+                except Exception:
+                    print("Cosmetic Correction replay-on-base failed:", e)
+            return
         if cid == "satchroma":
             try:
                 from setiastro.saspro.satchroma_preset import apply_satchroma_via_preset
@@ -6829,8 +6866,6 @@ class AstroSuiteProMainWindow(
 
                     if hasattr(base_doc, "set_image"):
                         base_doc.set_image(out, step_name="WaveScale Dark Enhancer")
-                    elif hasattr(base_doc, "apply_numpy"):
-                        base_doc.apply_numpy(out, step_name="WaveScale Dark Enhancer")
                     else:
                         base_doc.image = out
 
@@ -7475,6 +7510,10 @@ class AstroSuiteProMainWindow(
                 open_syqontools_with_preset(self, preset)
                 return
 
+            if cid == "export_fits":
+                self._open_export_fits(preset)
+                return
+
             # Fallback: trigger QAction by cid (ok when no target)
             act = self._find_action_by_cid(cid)
             if act:
@@ -7492,6 +7531,13 @@ class AstroSuiteProMainWindow(
             base_doc = doc
 
         # --- Existing image-processing blocks (unchanged) ---
+        if cid == "export_fits":
+            try:
+                self._apply_export_fits_to_doc(doc, preset or {})
+            except Exception as e:
+                QMessageBox.warning(self, "Export FITS", str(e))
+            return
+
         if cid == "stat_stretch":
             try:
                 self._apply_stat_stretch_preset_to_doc(doc, preset)
@@ -8044,7 +8090,21 @@ class AstroSuiteProMainWindow(
             dlg.show()
             return
 
+        if cid == "cosmetic_correction":
+            try:
+                from setiastro.saspro.cosmetic_correction import apply_cosmetic_correction_preset_to_doc
+                apply_cosmetic_correction_preset_to_doc(self, doc, preset or {})
+                self._log(f"Applied Cosmetic Correction preset to '{target_sw.windowTitle()}'")
 
+                # remember last headless command for replay
+                try:
+                    self._last_headless_command = {"command_id": "cosmetic_correction", "preset": dict(preset or {})}
+                except Exception:
+                    pass
+
+            except Exception as e:
+                QMessageBox.warning(self, "Preset apply failed", str(e))
+            return
 
         if cid == "wavescale_hdr":
             # (unchanged block)
@@ -8078,7 +8138,6 @@ class AstroSuiteProMainWindow(
 
                 out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
                 if hasattr(doc, "set_image"): doc.set_image(out, step_name="WaveScale HDR")
-                elif hasattr(doc, "apply_numpy"): doc.apply_numpy(out, step_name="WaveScale HDR")
                 else: doc.image = out
 
                 self._log(f"WaveScale HDR applied to '{target_sw.windowTitle()}' (n_scales={n_scales}, comp={compression_factor}, gamma={mask_gamma})")
@@ -8111,7 +8170,6 @@ class AstroSuiteProMainWindow(
                     )
                     out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
                     if hasattr(doc, "set_image"): doc.set_image(out, step_name="WaveScale Dark Enhance")
-                    elif hasattr(doc, "apply_numpy"): doc.apply_numpy(out, step_name="WaveScale Dark Enhance")
                     else: doc.image = out
                 self._log(f"WaveScale Dark Enhancer applied to '{target_sw.windowTitle()}' (n_scales={n_scales}, boost={boost_factor}, gamma={mask_gamma}, iter={iterations})")
             except Exception as e:
@@ -8170,7 +8228,6 @@ class AstroSuiteProMainWindow(
                 from setiastro.saspro.signature_insert import apply_signature_preset_to_doc
                 out = apply_signature_preset_to_doc(doc, preset)
                 if hasattr(doc, "set_image"): doc.set_image(out, step_name="Signature / Insert")
-                elif hasattr(doc, "apply_numpy"): doc.apply_numpy(out, step_name="Signature / Insert")
                 else: doc.image = out
                 fp = preset.get("file_path", "<file>"); pos = preset.get("position", "bottom_right")
                 self._log(f"Signature preset applied to '{target_sw.windowTitle()}' (file={fp}, pos={pos}, scale={preset.get('scale',100)}%, rot={preset.get('rotation',0)}Â deg, op={preset.get('opacity',100)}%)")
@@ -8412,58 +8469,63 @@ class AstroSuiteProMainWindow(
                 QMessageBox.warning(self, "PSF Viewer", f"Open failed:\n{e}")
             return            
         if cid == "plate_solve":
-            # headless: solve the active document in-place
-            doc = self._active_doc() if hasattr(self, "_active_doc") else None
+            doc = None
+            if target_sw is not None:
+                try:
+                    doc = self._target_doc_from_subwindow(target_sw)
+                except Exception:
+                    doc = None
+            if doc is None and hasattr(self, "_active_doc"):
+                try:
+                    doc = self._active_doc()
+                except Exception:
+                    doc = None
             if not doc or getattr(doc, "image", None) is None:
                 QMessageBox.information(self, "Plate Solver", "No active image view.")
                 return
 
-            # optional: quick sanity check for ASTAP path
-            astap_path = self.settings.value("paths/astap", "", type=str)
-            if not astap_path or not os.path.exists(astap_path):
-                QMessageBox.information(
-                    self, "Plate Solver",
-                    "ASTAP executable not set. Go to Preferences -> ASTAP executable."
-                )
-                return
+            solver = str((preset or {}).get("solver") or (preset or {}).get("solver_pref") or "").lower()
+            pref = solver or (self.settings.value("plate_solver/preference", "both", type=str) or "both").lower()
+            if pref not in ("gaia_only", "astrometry_only"):
+                astap_path = self.settings.value("paths/astap", "", type=str)
+                if not astap_path or not os.path.exists(astap_path):
+                    QMessageBox.information(
+                        self, "Plate Solver",
+                        "ASTAP executable not set. Go to Preferences -> ASTAP executable."
+                    )
+                    return
 
-            try:       
-                from setiastro.saspro.plate_solver import plate_solve_doc_inplace         
-                ok, hdr_or_err = plate_solve_doc_inplace(self, doc, self.settings)
-                if ok:
-                    h = hdr_or_err  # astropy.io.fits.Header
+            try:
+                hdr = self._apply_plate_solve_to_doc(doc, preset or {})
+                h = hdr
 
-                    # build a nice one-line summary
-                    def _ff(x):
-                        try: return float(x)
-                        except Exception: return None
+                def _ff(x):
+                    try: return float(x)
+                    except Exception: return None
 
-                    ra  = _ff(h.get("CRVAL1"))
-                    dec = _ff(h.get("CRVAL2"))
-                    cd11 = _ff(h.get("CD1_1")); cd21 = _ff(h.get("CD2_1"))
-                    cd11 = cd11 if cd11 is not None else _ff(h.get("CDELT1"))
-                    cd21 = cd21 if cd21 is not None else _ff(h.get("CDELT2"))
-                    scale = None
-                    if cd11 is not None or cd21 is not None:
-                        a = cd11 or 0.0; b = cd21 or 0.0
-                        scale = (a*a + b*b) ** 0.5 * 3600.0  # "/px
+                ra  = _ff(h.get("CRVAL1")) if hasattr(h, "get") else None
+                dec = _ff(h.get("CRVAL2")) if hasattr(h, "get") else None
+                cd11 = _ff(h.get("CD1_1")) if hasattr(h, "get") else None
+                cd21 = _ff(h.get("CD2_1")) if hasattr(h, "get") else None
+                cd11 = cd11 if cd11 is not None else (_ff(h.get("CDELT1")) if hasattr(h, "get") else None)
+                cd21 = cd21 if cd21 is not None else (_ff(h.get("CDELT2")) if hasattr(h, "get") else None)
+                scale = None
+                if cd11 is not None or cd21 is not None:
+                    a = cd11 or 0.0; b = cd21 or 0.0
+                    scale = (a*a + b*b) ** 0.5 * 3600.0
 
-                    msg = "Plate solve complete"
-                    if ra is not None and dec is not None:
-                        msg += f" | RA={ra:.6f}Â deg, Dec={dec:.6f}Â deg"
-                    if scale is not None:
-                        msg += f" | scale~{scale:.3f}\"/px"
+                msg = "Plate solve complete"
+                if ra is not None and dec is not None:
+                    msg += f" | RA={ra:.6f} deg, Dec={dec:.6f} deg"
+                if scale is not None:
+                    msg += f" | scale~{scale:.3f}\"/px"
 
-                    if hasattr(self, "_log"):
-                        self._log(msg)
-                    else:
-                        print(msg)
-
-                    # views will already refresh via doc.changed in plate_solve_doc_inplace
+                if hasattr(self, "_log"):
+                    self._log(msg)
                 else:
-                    QMessageBox.warning(self, "Plate Solver", f"Plate solve failed:\n{hdr_or_err}")
+                    print(msg)
             except Exception as e:
-                QMessageBox.critical(self, "Plate Solver", f"Unhandled error:\n{e}")
+                QMessageBox.warning(self, "Plate Solver", f"Plate solve failed:\n{e}")
             self._hdr_refresh_timer.start(0)
             return
         if cid == "star_align":
@@ -9165,6 +9227,12 @@ class AstroSuiteProMainWindow(
 
         meta = {
             "step_name": "Star Stretch",
+            "command_id": "star_stretch",
+            "preset": {
+                "stretch_factor": amount,
+                "color_boost": sat,
+                "scnr_green": scnr,
+            },
             "star_stretch": {
                 "stretch_factor": amount,
                 "color_boost": sat,
@@ -9925,11 +9993,6 @@ class AstroSuiteProMainWindow(
             pass
 
         try:
-            self._fix_mdi_titlebar_emboss("#dcdcdc" if self._theme_mode()=="dark" else "#f0f0f0")
-        except Exception:
-            pass
-
-        try:
             drop_pos = getattr(self, "_pending_spawn_cursor_pos", None)
             if drop_pos is not None and sw is not None and force_new:
                 mdi_pos = self.mdi.mapFromGlobal(drop_pos)
@@ -10410,10 +10473,6 @@ class AstroSuiteProMainWindow(
             self._refresh_mask_action_states()
         except Exception:
             pass
-        try:
-            self._fix_mdi_titlebar_emboss("#dcdcdc" if self._theme_mode()=="dark" else "#f0f0f0")
-        except Exception:
-            pass
 
     def _sync_docman_active(self, doc):
         dm = self.doc_manager
@@ -10574,37 +10633,26 @@ class AstroSuiteProMainWindow(
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Update floating resource monitor position if it exists (from DockMixin)
-        if hasattr(self, "_update_monitor_position"):
-            self._update_monitor_position()
 
     def moveEvent(self, event):
         super().moveEvent(event)
-        # Update floating resource monitor position if it exists (from DockMixin)
-        if hasattr(self, "_update_monitor_position"):
-            self._update_monitor_position()
 
     def changeEvent(self, event):
         super().changeEvent(event)
         # 1. Existing logic for dock sync (re-instated from showEvent logic if needed, but usually changeEvent is enough)
         # (The snippet viewed previously showed showEvent firing a oneshot to call changeEvent)
         
-        # 2. Resource Monitor Sync
+        # 2. Resource Monitor Sync — it's a docked panel now, so pause its
+        # polling while the window is minimized and resume when restored,
+        # instead of showing/hiding a floating overlay.
         if event.type() == QEvent.Type.WindowStateChange:
-            if self.windowState() & Qt.WindowState.WindowMinimized:
-                # App minimized -> hide overlay
-                if hasattr(self, "resource_monitor") and self.resource_monitor:
-                    self.resource_monitor.hide()
-            elif not (self.windowState() & Qt.WindowState.WindowMinimized):
-                # Only auto-show if the initial fade-in is done
-                if getattr(self, "_fade_in_complete", False):
-                    # App restored -> show overlay if enabled in settings
-                    if hasattr(self, "resource_monitor") and self.resource_monitor:
-                        if self.settings.value("ui/resource_monitor_visible", True, type=bool):
-                            self.resource_monitor.show()
-                            # Ensure position is correct upon restore
-                            if hasattr(self, "_update_monitor_position"):
-                                self._update_monitor_position()
+            rmd = getattr(self, "resource_monitor_dock", None)
+            if rmd is not None:
+                try:
+                    minimized = bool(self.windowState() & Qt.WindowState.WindowMinimized)
+                    rmd.backend.set_active(not minimized)
+                except Exception:
+                    pass
 
     def save_ui_state(self):
         """Save window geometry, state, and shortcuts to settings."""
@@ -10638,13 +10686,17 @@ class AstroSuiteProMainWindow(
     def on_fade_in_complete(self):
         """Called when main window fade-in is finished."""
         self._fade_in_complete = True
-        # Sync Monitor Visibility
-        if hasattr(self, "resource_monitor") and self.resource_monitor:
-            if not self.isMinimized() and self.settings.value("ui/resource_monitor_visible", True, type=bool):
-                # Delay show to ensure visually pleasing sequence (monitor appears AFTER app)
-                QTimer.singleShot(500, self.resource_monitor.show)
-                # Ensure position
-                QTimer.singleShot(600, self._update_monitor_position)
+        # If the icon table was open at last shutdown, re-open it in place.
+        try:
+            from PyQt6.QtCore import QSettings
+            if QSettings().value("icon_table/visible", False, type=bool):
+                # Slight delay so fade + monitor come up first — same pattern
+                # you use for the resource monitor above.
+                QTimer.singleShot(500, self._restore_icon_table_if_needed)
+        except Exception:
+            pass        
+        # (The resource monitor is a docked panel now; it appears with the rest
+        # of the layout via restoreState — no deferred overlay show needed.)
 
     def keyPressEvent(self, event):
         """Handle key press events for secret shortcuts."""
@@ -10736,7 +10788,15 @@ class AstroSuiteProMainWindow(
             self.save_dock_host_state()
         except Exception:
             pass
-
+        # Persist icon-table geometry + visibility so it re-opens
+        # where the user last left it.
+        try:
+            if getattr(self, "_icon_table", None) is not None:
+                # Use runtime isVisible(); if the widget's been closed the
+                # value is already False.
+                self._icon_table.save_window_state()
+        except Exception:
+            pass
         s.sync()
 
     def restore_main_window_state(self):
@@ -10761,6 +10821,57 @@ class AstroSuiteProMainWindow(
             self.showMaximized()
 
 
+    def _unhook_stdout_stderr(self):
+        """
+        Restore the real stdout/stderr and repair references that third-party
+        libraries captured while our QtLogStream was installed.
+
+        colorama.init() snapshots sys.stdout into colorama.initialise and uses
+        that snapshot from an atexit callback. That callback runs *after* Qt has
+        destroyed the QtLogStream, producing:
+            RuntimeError: wrapped C/C++ object of type QtLogStream has been deleted
+        Restoring sys.stdout alone is not enough, because colorama is not reading
+        sys.stdout -- it holds its own reference to the dead wrapper.
+        """
+        if getattr(self, "_stdio_unhooked", False):
+            return
+        self._stdio_unhooked = True
+
+        out = getattr(self, "_orig_stdout", None) or sys.__stdout__
+        err = getattr(self, "_orig_stderr", None) or sys.__stderr__
+
+        # Neutralize any live wrappers so nothing can write through them again.
+        # Guard with isinstance: real text streams also have a detach(), and
+        # calling it on them would rip out their underlying buffer.
+        try:
+            from setiastro.saspro.mdi_widgets import QtLogStream
+            for cur in (sys.stdout, sys.stderr):
+                if isinstance(cur, QtLogStream):
+                    try:
+                        cur.detach()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            if out is not None:
+                sys.stdout = out
+            if err is not None:
+                sys.stderr = err
+        except Exception:
+            pass
+
+        # Hand colorama back the real streams for its atexit callback.
+        try:
+            import colorama.initialise as _ci
+            if out is not None:
+                _ci.orig_stdout = out
+            if err is not None:
+                _ci.orig_stderr = err
+        except Exception:
+            pass
+
     def closeEvent(self, e):
         self._update_usage_stats()
         self._shutting_down = True
@@ -10772,6 +10883,7 @@ class AstroSuiteProMainWindow(
 
         # Optimization: If restarting (e.g. language change), bypass confirmation and close immediately
         if getattr(self, "_is_restarting", False):
+            self._unhook_stdout_stderr()
             e.accept()
             return
         
@@ -10782,15 +10894,13 @@ class AstroSuiteProMainWindow(
             return
 
         try:
-            if hasattr(self, "_orig_stdout") and self._orig_stdout is not None:
-                sys.stdout = self._orig_stdout
-            if hasattr(self, "_orig_stderr") and self._orig_stderr is not None:
-                sys.stderr = self._orig_stderr
+            pass  # stdout/stderr are restored in _do_shutdown_steps()
         except Exception:
             pass        
 
         # --- Confirmation Logic ---
         self._shutting_down = True
+
         # Gather open docs
         docs = []
         for sw in self.mdi.subWindowList():
@@ -10837,15 +10947,13 @@ class AstroSuiteProMainWindow(
         e.ignore() # Defer close until animation completes
         self.setEnabled(False) # Prevent further interaction
         
-        # Hide monitor immediately before shutdown/fade
-        if hasattr(self, "resource_monitor") and self.resource_monitor:
+        # Stop the resource monitor's background polling before shutdown/fade.
+        rmd = getattr(self, "resource_monitor_dock", None)
+        if rmd is not None:
             try:
-                if hasattr(self.resource_monitor, "backend"):
-                    self.resource_monitor.backend.stop()
+                rmd.backend.stop()
             except Exception:
                 pass
-            self.resource_monitor.hide()
-            self.resource_monitor.close()
         try:
             host = getattr(self, "dock_host", None)
             if host is not None:
@@ -10880,9 +10988,14 @@ class AstroSuiteProMainWindow(
         self.close()
 
     def _do_shutdown_steps(self, e):
+        self._unhook_stdout_stderr()
         self._force_close_all = True
         self._shutting_down = True
-
+        # User has confirmed exit. Un-shelve any minimized views before we
+        # persist UI state and before Qt tears the shelf down.
+        shelf = getattr(self, "window_shelf", None)
+        if shelf is not None and not shelf._is_dead(shelf):
+            shelf.restore_all()
         self.save_ui_state()
 
         # Now safe to fully close the dock host

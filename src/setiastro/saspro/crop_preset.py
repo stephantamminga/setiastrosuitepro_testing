@@ -1,4 +1,4 @@
-# pro/crop_preset.py
+#saspro/crop_preset.py
 from __future__ import annotations
 import math
 from typing import Sequence
@@ -142,6 +142,14 @@ def apply_crop_via_preset(mw, doc, preset: dict) -> np.ndarray:
             meta = update_wcs_after_crop(meta, M_src_to_dst=M, out_w=w_out, out_h=h_out)
     except Exception:
         pass
+
+    # Replay marker — stamp explicitly so it overrides any stale command_id
+    # copied in from doc.metadata (the convo-style leak), and carries the
+    # exact preset this call consumed.
+    meta["command_id"] = "crop"
+    meta["preset"] = dict(pr)
+    meta.pop("cid", None)
+    meta.pop("preset_dict", None)
 
     # Apply to document or open new
     if create_new:

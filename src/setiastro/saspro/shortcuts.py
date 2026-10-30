@@ -24,7 +24,8 @@ try:
 except Exception:
     sip = None
     
-from setiastro.saspro.dnd_mime import MIME_VIEWSTATE, MIME_CMD, MIME_MASK, MIME_ACTION
+from setiastro.saspro.dnd_mime import (MIME_VIEWSTATE, MIME_CMD, MIME_MASK,
+                                       MIME_ACTION, MIME_SHORTCUT_MOVE)
 
 from pathlib import Path
 import os  # ← NEW
@@ -40,7 +41,8 @@ OPENABLE_ENDINGS = (
     ".fits", ".fit", ".fts",
     ".fits.gz", ".fit.gz", ".fz",
     ".xisf",
-    ".psb",
+    ".psb", ".psd",
+    ".syq",
     ".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2", ".pef",
 )
 
@@ -281,46 +283,30 @@ class DraggableToolBar(QToolBar):
                 self._press_had_mod[obj] = self._mods_ok(QApplication.keyboardModifiers())
                 return False  # allow normal press visuals
 
-            # Move with L held:
+            # Move with L held → start ONE unified drag. No modifier required.
+            #
+            # The drag carries every payload the possible drop targets know how
+            # to read, and the TARGET decides what happens on drop:
+            #   • dropped on a View           → runs the command      (MIME_CMD)
+            #   • dropped on the empty canvas → creates a shortcut     (MIME_ACTION)
+            #   • dropped back on a toolbar   → reorders the button    (TOOLBAR_REORDER_MIME)
+            #
+            # Alt/Ctrl/Shift are no longer needed. The only thing the lock still
+            # changes is whether the reorder payload is offered.
             if ev.type() == QEvent.Type.MouseMove and (ev.buttons() & Qt.MouseButton.LeftButton):
                 start = self._press_pos.get(obj)
                 if start is not None:
                     delta = ev.globalPosition().toPoint() - start
                     if delta.manhattanLength() > QApplication.startDragDistance():
-                        mods_now = QApplication.keyboardModifiers()
-                        had_mod  = self._press_had_mod.get(obj, False)
-                        
-                        # CASE 1: had/has modifiers → create desktop shortcut / function-bundle drag (existing behavior)
-                        if had_mod or self._mods_ok(mods_now):
-                            act = self._find_action_for_button(obj)
-                            if act:
-                                self._start_drag_for_action(act)
-                                self._suppress_release.add(obj)
-                            self._press_pos.pop(obj, None)
-                            self._press_had_mod.pop(obj, None)
-                            return True  # consume
-                        else:
-                            # CASE 2: plain drag (no modifiers) → reorder within this toolbar
-                            # CHECK LOCK STATE FIRST
-                            if self._is_locked():
-                                # Lock is active: DO NOT start drag.
-                                # Should we consume the event? 
-                                # If we consume it, the button won't feel "pressed" anymore if the user keeps dragging?
-                                # Actually, if we just return False, standard QToolButton behavior applies (it might think it's being pressed).
-                                # However, we want to prevent the *reorder* logic.
-                                # So simply doing nothing here is enough to prevent the reorder drag from starting.
-                                
-                                # But we might want to let the user know, or just silently fail distinctively?
-                                # Silently failing distinctively is what the user asked for (prevent involuntary move).
-                                # If we return False, the button keeps tracking the mouse, which is fine (it won't click unless released inside).
-                                return False 
-
-                            self._start_reorder_drag_for_button(obj)
+                        act = self._find_action_for_button(obj)
+                        if act is not None:
+                            self._start_unified_drag_for_button(
+                                obj, act, allow_reorder=not self._is_locked()
+                            )
                             self._suppress_release.add(obj)
-                            self._press_pos.pop(obj, None)
-                            self._press_had_mod.pop(obj, None)
-                            return True  # consume
-
+                        self._press_pos.pop(obj, None)
+                        self._press_had_mod.pop(obj, None)
+                        return True  # consume
                 return False
 
             # Release: if we started any drag, swallow the release so click won't fire
@@ -334,6 +320,40 @@ class DraggableToolBar(QToolBar):
 
         return super().eventFilter(obj, ev)
 
+    def _start_unified_drag_for_button(self, btn: QToolButton, act: QAction,
+                                       allow_reorder: bool = True):
+        act_id = act.property("command_id") or act.objectName()
+        if not act_id:
+            return
+        act_id = str(act_id)
+
+        md = QMimeData()
+
+        # 1) run-on-view payload (carries per-command preset if one is stored)
+        s = QSettings()
+        raw = s.value(f"presets/{act_id}", "", type=str) or ""
+        try:
+            preset = json.loads(raw) if raw else {}
+        except Exception:
+            preset = {}
+        md.setData(MIME_CMD, _pack_cmd_payload(act_id, preset, name=act.text() or None))
+
+        # 2) create-shortcut-on-canvas payload
+        md.setData(MIME_ACTION, act_id.encode("utf-8"))
+
+        # 3) reorder handshake — only when the toolbar is unlocked
+        if allow_reorder:
+            md.setData(TOOLBAR_REORDER_MIME, b"1")
+
+        drag = QDrag(btn)  # source MUST be the button for reorder drops
+        drag.setMimeData(md)
+        pm = act.icon().pixmap(32, 32) if not act.icon().isNull() else QPixmap(32, 32)
+        if pm.isNull():
+            pm = QPixmap(32, 32); pm.fill(Qt.GlobalColor.darkGray)
+        drag.setPixmap(pm)
+        drag.setHotSpot(pm.rect().center())
+        drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction,
+                  Qt.DropAction.CopyAction)
 
     def _start_drag_for_action(self, act: QAction):
         act_id = act.property("command_id") or act.objectName()
@@ -584,14 +604,16 @@ class DraggableToolBar(QToolBar):
 
 _PRESET_UI_IDS = {
     "stat_stretch","star_stretch","crop","curves","ghs","abe","graxpert",
-    "remove_stars","cosmic_clarity","cosmic","cosmicclarity","histogram_transform",
+    "remove_stars","cosmic_clarity","cosmic","cosmicclarity","histogram_transform","levels",
     "convo","convolution","deconvolution","convo_deconvo",
     "linear_fit","wavescale_hdr","wavescale_dark_enhance","wavescale_dark_enhancer",
     "remove_green","star_align","background_neutral","white_balance","clahe",
     "morphology","pixel_math","rgb_align","signature_insert","signature_adder",
     "signature","halo_b_gon","geom_rescale","rescale","debayer","image_combine","geom_resize_canvas",
+    "resize_canvas","canvas_resize","texture_clarity","aberrationai",
     "star_spikes","diffraction_spikes", "multiscale_decomp","geom_rotate_any","syqontools","rcastro",
-    "satchroma","fx","unwarp","pedestal",
+    "satchroma","fx","unwarp","pedestal","cosmetic_correction",
+    "export_fits","plate_solve","create_mask",
 }
 
 def _has_preset_editor_for_command(command_id: str) -> bool:
@@ -605,6 +627,9 @@ def _preset_opener_for_command(command_id: str):
     (which opens a small preset-editing form). Returns None if none exists, in
     which case callers fall back to a plain QAction trigger.
     """
+    if command_id == "crop":
+        from setiastro.saspro.crop_dialog_pro import open_crop_with_preset
+        return open_crop_with_preset    
     if command_id == "abe":
         from setiastro.saspro.abe_preset import open_abe_with_preset
         return open_abe_with_preset
@@ -689,7 +714,24 @@ def _preset_opener_for_command(command_id: str):
     if command_id == "pedestal":
         from setiastro.saspro.pedestal import open_remove_pedestal_with_preset
         return open_remove_pedestal_with_preset 
-    return None                      
+    if command_id == "cosmetic_correction":
+        from setiastro.saspro.cosmetic_correction import open_cosmetic_correction_with_preset
+        return open_cosmetic_correction_with_preset
+    if command_id == "export_fits":
+        from setiastro.saspro.export_fits import open_export_fits_with_preset
+        return open_export_fits_with_preset
+    if command_id == "plate_solve":
+        from setiastro.saspro.plate_solver import open_plate_solver_with_preset
+        return open_plate_solver_with_preset
+    if command_id == "create_mask":
+        # Toolbar id is "create_mask" (toolbar_mixin.reg("create_mask", …)),
+        # not "mask_creation". ShortcutManager.trigger_with_preset looks the
+        # opener up by the id a shortcut carries, so the branch must match
+        # that registration — otherwise double-clicking a mask shortcut
+        # falls back to the bare QAction and ignores the stored preset.
+        from setiastro.saspro.mask_creation import open_mask_creation_with_preset
+        return open_mask_creation_with_preset
+    return None
 
 # ---- Shared preset editor helper for other modules (e.g. Function Bundles) ----
 def _open_preset_editor_for_command(parent, command_id: str, initial: dict | None):
@@ -761,6 +803,22 @@ def _open_preset_editor_for_command(parent, command_id: str, initial: dict | Non
     if command_id == "unwarp":
         from setiastro.saspro.unwarp import _UnwarpPresetDialog
         dlg = _UnwarpPresetDialog(parent, initial=cur or {"expand": True, "order": 3, "fill_nan": False})
+        return dlg.result_dict() if dlg.exec() == QDialog.DialogCode.Accepted else None
+    if command_id == "export_fits":
+        from setiastro.saspro.export_fits import ExportFitsPresetDialog
+        dlg = ExportFitsPresetDialog(parent, initial=cur or {"out_dir": "", "overwrite": True})
+        return dlg.result_dict() if dlg.exec() == QDialog.DialogCode.Accepted else None
+    if command_id == "plate_solve":
+        from setiastro.saspro.plate_solver import PlateSolverPresetDialog
+        dlg = PlateSolverPresetDialog(parent, initial=cur or {})
+        return dlg.result_dict() if dlg.exec() == QDialog.DialogCode.Accepted else None
+    if command_id == "create_mask":
+        # Same note as _preset_opener_for_command: must match the id the
+        # action was registered under (toolbar_mixin: "create_mask"), not
+        # the Python module name. Right-clicking a mask shortcut → Edit
+        # Preset routes through here, so a mismatched id was giving the
+        # user an empty dialog with no fields.
+        dlg = _MaskCreationPresetDialog(parent, initial=cur)
         return dlg.result_dict() if dlg.exec() == QDialog.DialogCode.Accepted else None
     if command_id == "syqontools":
         dlg = _SyQonToolsPresetDialog(parent, initial=cur or {})
@@ -876,6 +934,10 @@ def _open_preset_editor_for_command(parent, command_id: str, initial: dict | Non
 
     if command_id == "pixel_math":
         dlg = _PixelMathPresetDialog(parent, initial=cur)
+        return dlg.result_dict() if dlg.exec() == QDialog.DialogCode.Accepted else None
+
+    if command_id == "cosmetic_correction":
+        dlg = _CosmeticCorrectionPresetDialog(parent, initial=cur)
         return dlg.result_dict() if dlg.exec() == QDialog.DialogCode.Accepted else None
 
     if command_id == "rgb_align":
@@ -1022,8 +1084,9 @@ class ShortcutButton(QToolButton):
         self._press_pos = None
         self._start_geom = None
         self._did_command_drag = False
+        self._moved = False
         self.setToolTip(
-            f"{label}\n• Double-click: open\n• Drag: move\n• Alt/Ctrl+Drag onto a view: headless apply"
+            f"{label}\n• Double-click: open\n• Drag onto a view: headless apply\n• Drag on empty canvas: move"
         )
 
     # --- Preset helpers (QSettings) -------------------------------------
@@ -1115,53 +1178,73 @@ class ShortcutButton(QToolButton):
         self._did_command_drag = True
 
     # --- Mouse handlers --------------------------------------------------
-    def _mods_mean_command_drag(self) -> bool:
-        # Use ALT only for headless drag so Ctrl/Shift can be used for multiselect
-        return bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier)
-
     def mousePressEvent(self, e: QMouseEvent):
         if e.button() == Qt.MouseButton.LeftButton:
             mods = QApplication.keyboardModifiers()
 
             if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
-                self._mgr.toggle_select(self.sid)            # ← was self.shortcut_id
+                self._mgr.toggle_select(self.sid)
                 return
 
-            if self.sid not in self._mgr.selected:           # ← was self.shortcut_id
+            if self.sid not in self._mgr.selected:
                 self._mgr.select_only(self.sid)
 
             self._dragging = True
             self._press_pos = e.globalPosition().toPoint()
-            self._last_drag_pos = self._press_pos
-            self._did_command_drag = False
 
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e: QMouseEvent):
-        if self._dragging and self._press_pos is not None:
-            cur = e.globalPosition().toPoint()
-            step = cur - self._last_drag_pos
-            if step.manhattanLength() < QApplication.startDragDistance():
-                return super().mouseMoveEvent(e)
-
-            # If exactly 1 selected and ALT held → command drag (headless)
-            if len(self._mgr.selected) == 1 and self._mods_mean_command_drag():
-                self._start_command_drag()
-                return
-
-            # Otherwise: move the whole selection by step delta
-            self._mgr.move_selected_by(step.x(), step.y())
-            self._last_drag_pos = cur
+        if (self._dragging
+                and self._press_pos is not None
+                and (e.buttons() & Qt.MouseButton.LeftButton)
+                and (e.globalPosition().toPoint() - self._press_pos).manhattanLength()
+                    >= QApplication.startDragDistance()):
+            self._dragging = False
+            self._press_pos = None
+            self._start_shortcut_drag()          # ONE real QDrag; the target decides
             return
-
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e: QMouseEvent):
-        if self._dragging and e.button() == Qt.MouseButton.LeftButton:
-            self._dragging = False
-            if not self._did_command_drag:
-                self._mgr.save_shortcuts()  # persist positions after move
+        self._dragging = False
+        self._press_pos = None
         super().mouseReleaseEvent(e)
+
+    def _start_shortcut_drag(self):
+        """
+        Start ONE real drag from this canvas shortcut. No modifier required.
+
+        The payload is understood by every existing MIME_CMD drop target:
+          - a View                -> runs the command (ImageSubWindow.dropEvent)
+          - a Function Bundle chip -> appends the step
+          - the Workflow Assistant -> adds the step to a lane
+        Plus MIME_SHORTCUT_MOVE (the sid), so dropping back on the empty canvas
+        MOVES this icon instead of creating a duplicate.
+
+        Multi-selection is a pure group MOVE: we omit MIME_CMD so a stray drop
+        on a view/chip can't fire one command out of many - only the canvas,
+        which reads MIME_SHORTCUT_MOVE, accepts it and shifts the whole group.
+        """
+        md = QMimeData()
+        multi = len(self._mgr.selected) > 1
+
+        if not multi:
+            md.setData(MIME_CMD, _pack_cmd_payload(
+                self.command_id, self._load_preset() or {}, name=self.text()))
+
+        # Canvas reposition handshake (records which icon initiated the drag)
+        md.setData(MIME_SHORTCUT_MOVE, self.sid.encode("utf-8"))
+
+        drag = QDrag(self)
+        drag.setMimeData(md)
+        pm = self.icon().pixmap(32, 32)
+        if pm.isNull():
+            pm = QPixmap(32, 32); pm.fill(Qt.GlobalColor.darkGray)
+        drag.setPixmap(pm)
+        drag.setHotSpot(pm.rect().center())
+        drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction,
+                  Qt.DropAction.CopyAction)
 
     def mouseDoubleClickEvent(self, e: QMouseEvent):
         # Double-click opens the tool. If this shortcut carries a preset, route
@@ -1223,6 +1306,10 @@ class ShortcutCanvas(QWidget):
         # keep sized with viewport
         if obj is self.parent() and ev.type() == ev.Type.Resize:
             self.setGeometry(self.parent().rect())
+            try:
+                self._mgr.reflow_into_view()
+            except Exception:
+                pass
         return super().eventFilter(obj, ev)
 
     # --- rubber-band selection on empty space ---
@@ -1273,7 +1360,8 @@ class ShortcutCanvas(QWidget):
 
     def dragEnterEvent(self, e):
         md = e.mimeData()
-        if md.hasFormat(MIME_ACTION) or md.hasFormat(MIME_CMD) or self._md_has_openable_urls(md):
+        if (md.hasFormat(MIME_ACTION) or md.hasFormat(MIME_CMD)
+                or md.hasFormat(MIME_SHORTCUT_MOVE) or self._md_has_openable_urls(md)):
             self.raise_()
             e.acceptProposedAction()
         else:
@@ -1319,7 +1407,9 @@ class ShortcutCanvas(QWidget):
 
 
     def dragMoveEvent(self, e):
-        if e.mimeData().hasFormat(MIME_ACTION) or e.mimeData().hasFormat(MIME_CMD) or self._md_has_openable_urls(e.mimeData()):
+        md = e.mimeData()
+        if (md.hasFormat(MIME_ACTION) or md.hasFormat(MIME_CMD)
+                or md.hasFormat(MIME_SHORTCUT_MOVE) or self._md_has_openable_urls(md)):
             e.acceptProposedAction()
         else:
             e.ignore()
@@ -1335,6 +1425,21 @@ class ShortcutCanvas(QWidget):
         if self._forward_command_drop(e):
             self.lower()
             return
+
+        # 1.5) an EXISTING canvas shortcut dropped on empty canvas → MOVE it
+        #      (don't fall through to the create-shortcut path, which would
+        #      duplicate it). We only reach here when 1) found no view under
+        #      the cursor, i.e. this really is an empty-canvas drop.
+        if md.hasFormat(MIME_SHORTCUT_MOVE):
+            try:
+                sid = bytes(md.data(MIME_SHORTCUT_MOVE)).decode("utf-8")
+            except Exception:
+                sid = ""
+            if sid:
+                self._mgr.move_shortcut_group_to(sid, e.position().toPoint())
+                e.acceptProposedAction()
+                self.lower()
+                return
 
         # 2) command-only drops (no MIME_ACTION) → create a shortcut with preset
         #    This is used by History Explorer Alt+drag.
@@ -1562,9 +1667,35 @@ class ShortcutManager:
             return self.trigger(command_id)
 
     def _on_widget_destroyed(self, sid: str):
-        # Called from QObject.destroyed — never touch the widget, just clean maps
-        self.widgets.pop(sid, None)
-        self.selected.discard(sid)
+        # Called from QObject.destroyed — never touch the widget, just clean maps.
+        #
+        # Defensive sid-identity guard: pop ONLY if the widget currently
+        # tracked at `sid` is the one actually being destroyed. Qt's
+        # destroyed signal fires from the widget being destroyed, so
+        # self.sender() points at it (even though its C++ side is going
+        # away); comparing by identity to the current dict entry means a
+        # stale deferred-destroy call can never accidentally evict a
+        # newer widget that happens to share the sid.
+        #
+        # The main clear() path disconnects these signals before scheduling
+        # deletion, so this guard is normally redundant. It's here as a
+        # catch-all for any future deferred-delete site that forgets.
+        current = self.widgets.get(sid)
+        try:
+            sender = self.sender()
+        except Exception:
+            sender = None
+        if current is None or sender is None or current is sender:
+            self.widgets.pop(sid, None)
+            self.selected.discard(sid)
+        else:
+            # Stale callback for a sid that's since been reassigned. Leave
+            # the current entry alone.
+            try:
+                self._debug(f"_on_widget_destroyed: stale callback for sid={sid}, "
+                            f"current widget is a different object; ignoring.")
+            except Exception:
+                pass
 
     def _collect_live_items(self) -> list[dict]:
         """
@@ -1583,7 +1714,10 @@ class ShortcutManager:
                 if not w.isVisible():
                     continue
 
-                p = w.pos()
+                # Persist the user's intended position, not a temporarily
+                # clamped one, so saving while the window is shrunk doesn't bake
+                # the squashed layout in.
+                p = getattr(w, "_desired_pos", None) or w.pos()
                 item = {
                     "id": sid,
                     "command_id": getattr(w, "command_id", None),
@@ -1735,22 +1869,56 @@ class ShortcutManager:
             if replace_existing:
                 self.clear()  # clears both UI + settings keys, keeps manager ready
 
-            # Build widgets (shortcuts) as before
-            for it in items:
-                cid = it.get("command_id")
-                if not cid:
-                    continue
-                sid    = it.get("id") or uuid.uuid4().hex
-                x      = int(it.get("x", 10))
-                y      = int(it.get("y", 10))
-                label  = it.get("label") or self._default_label_for(cid)
+            # Suppress intermediate saves while we build the shortcut set.
+            # Without this guard, add_shortcut() calls save_shortcuts() after
+            # every single item, and each of those saves reads w.pos(). If
+            # anything triggers reflow_into_view() between items (a file-
+            # dialog teardown, a transient resize), already-added widgets
+            # end up at clamped positions and get persisted that way. By
+            # flipping _loading we route all persistence to the single
+            # save_shortcuts() call at the end, which now uses _desired_pos.
+            self._loading = True
+            try:
+                for it in items:
+                    cid = it.get("command_id")
+                    if not cid:
+                        continue
+                    sid    = it.get("id") or uuid.uuid4().hex
+                    x      = int(it.get("x", 10))
+                    y      = int(it.get("y", 10))
+                    label  = it.get("label") or self._default_label_for(cid)
 
-                self.add_shortcut(cid, QPoint(x, y), label=label, shortcut_id=sid)
+                    # add_shortcut may hand us a fresh sid if the file's sid
+                    # was already live on the canvas (merge-mode collision);
+                    # use the returned sid for the preset lookup so it lands
+                    # on the shortcut we actually just created.
+                    actual_sid = self.add_shortcut(
+                        cid, QPoint(x, y), label=label, shortcut_id=sid
+                    ) or sid
 
-                # If you also inline per-instance presets for normal shortcuts,
-                # you can restore them here as well (omitted here for brevity).
+                    # Restore the inlined per-instance preset (written by
+                    # _collect_live_items on export) so a .sass round-trip keeps it.
+                    pr = it.get("preset")
+                    if isinstance(pr, dict) and pr:
+                        w = self.widgets.get(actual_sid)
+                        if w and not _is_dead(w):
+                            try:
+                                w._save_preset(pr)
+                            except Exception:
+                                pass
+            finally:
+                self._loading = False
 
-            # Persist shortcuts to QSettings
+            # If the file was exported from a larger canvas than the current
+            # one, some shortcuts were just placed off-screen. Clamp them
+            # into the viewport for display, keeping _desired_pos untouched
+            # so they spring back when the window is enlarged again.
+            try:
+                self.reflow_into_view()
+            except Exception:
+                pass
+
+            # Persist shortcuts to QSettings (single write, using _desired_pos)
             self.save_shortcuts()
 
             # NEW: Restore function bundle definitions + chips
@@ -1809,26 +1977,91 @@ class ShortcutManager:
             return command_id
         return (act.text() or act.toolTip() or command_id).strip() or command_id
 
+    def _find_free_position(self, w: QWidget, pos: QPoint) -> QPoint:
+        """Return a point near `pos` where a widget of w's size will not
+        overlap any existing shortcut. If `pos` is already free the point
+        is returned unchanged; otherwise we cascade outward (diagonally
+        first, then axis-aligned, then anti-diagonal) in widget-sized
+        steps, keeping candidates inside the viewport when it's realized.
+        Falls back to `pos` after a bounded search so we never spin."""
+        size = w.size()
+        others = [o.geometry() for sid, o in self.widgets.items()
+                  if not _is_dead(o) and o is not w]
+
+        def collides(r: QRect) -> bool:
+            return any(r.intersects(g) for g in others)
+
+        if not collides(QRect(pos, size)):
+            return QPoint(pos)
+
+        step = max(24, max(size.width(), size.height()) // 2 + 8)
+        vp = self._viewport_rect()
+        has_vp = vp.width() > 0 and vp.height() > 0
+
+        for i in range(1, 60):
+            for dx, dy in (
+                ( step * i,  step * i),  # down-right (classic cascade)
+                ( step * i,         0),  # right
+                (        0,  step * i),  # down
+                (-step * i,  step * i),  # down-left
+                ( step * i, -step * i),  # up-right
+                (-step * i,         0),  # left
+                (        0, -step * i),  # up
+                (-step * i, -step * i),  # up-left
+            ):
+                cand = QPoint(pos.x() + dx, pos.y() + dy)
+                if has_vp:
+                    if (cand.x() < 0 or cand.y() < 0 or
+                        cand.x() + size.width()  > vp.width() or
+                        cand.y() + size.height() > vp.height()):
+                        continue
+                if not collides(QRect(cand, size)):
+                    return cand
+
+        # Give up gracefully. reflow_into_view() may still clamp this later.
+        return QPoint(pos)
+
     def add_shortcut(self,
                      command_id: str,
                      pos: QPoint,
                      *,
                      label: Optional[str] = None,
-                     shortcut_id: Optional[str] = None):
+                     shortcut_id: Optional[str] = None) -> Optional[str]:
         """
         Always creates a NEW instance (multiple per command_id allowed).
+
+        Returns the sid actually used, or None if the command is unknown.
+        Callers that need to look the new widget back up (to attach a
+        per-instance preset, for example) must use the returned sid, not
+        the one they passed in — see the collision guard below.
         """
         act = self.registry.get(command_id)
         if not act:
-            return
+            return None
 
         sid = shortcut_id or uuid.uuid4().hex
+        # Never let a caller-supplied id silently overwrite a live entry.
+        # Doing so would leave the old QToolButton on the canvas as an
+        # un-tracked child: still visible, still on top of the hit-test
+        # stack, still eating mouse events — but gone from self.widgets,
+        # which also hides it from _find_free_position's overlap check so
+        # the replacement lands exactly on top of it. This is what makes
+        # merged imports "swallow" clicks for the pre-existing shortcuts.
+        while sid in self.widgets:
+            sid = uuid.uuid4().hex
         lbl = (label or self._default_label_for(command_id)).strip() or command_id
 
         ico = self._icon_for_command(command_id, act)
         w = ShortcutButton(self, sid, command_id, ico, lbl, self.canvas)
         w.adjustSize()
-        w.move(pos)
+        # Nudge off any existing shortcut this would land on top of (import
+        # merge, repeated toolbar drops on the same spot, history drag onto
+        # an occupied cell). User-initiated drags go through move_selected_by
+        # and are left alone — if the user drops on top of another chip,
+        # that's their call.
+        free_pos = self._find_free_position(w, pos)
+        w.move(free_pos)
+        w._desired_pos = QPoint(free_pos)   # remember intended spot for reflow/persist
         w.show()
 
         # when the C++ object dies, clean maps using the SID
@@ -1836,16 +2069,29 @@ class ShortcutManager:
 
         self.widgets[sid] = w
         self.save_shortcuts()
+        return sid
 
     def add_shortcut_from_payload(self, payload: dict, pos: QPoint):
         """
-        Create a desktop shortcut from a full command payload
-        (e.g. drag from History Explorer with command_id + preset).
+        Create desktop shortcut(s) from a command payload dropped on the canvas.
+
+        - Normal payload {command_id, preset} → one shortcut.
+        - Bundle payload {command_id:"function_bundle", steps:[...]} (a multi-row
+          drag from History Explorer) → one shortcut PER step, cascaded from the
+          drop point so they don't stack. Order = step order.
         """
         if not isinstance(payload, dict):
             return
 
         cid = payload.get("command_id") or payload.get("cid")
+
+        # Multi: explode a function_bundle into one shortcut per step
+        if cid == "function_bundle":
+            steps = payload.get("steps")
+            if isinstance(steps, list) and steps:
+                self._add_shortcuts_from_steps(steps, pos)
+            return
+
         if not isinstance(cid, str) or not cid:
             return
 
@@ -1856,21 +2102,59 @@ class ShortcutManager:
             except Exception:
                 preset = {}
 
-        # Normal shortcut creation
+        # Normal single-shortcut creation
         sid = uuid.uuid4().hex
         label = self._default_label_for(cid)
-        self.add_shortcut(cid, pos, label=label, shortcut_id=sid)
+        actual_sid = self.add_shortcut(cid, pos, label=label, shortcut_id=sid) or sid
 
-        # Attach preset at instance-level (same mechanism as context menu)
-        w = self.widgets.get(sid)
+        w = self.widgets.get(actual_sid)
         if w and not _is_dead(w):
             try:
                 w._save_preset(preset)
             except Exception:
                 pass
 
-        # Persist layout + presets
         self.save_shortcuts()
+
+    def _add_shortcuts_from_steps(self, steps: list[dict], pos: QPoint):
+        """One shortcut per bundle step, cascaded diagonally from the drop point."""
+        dx = dy = 28  # cascade offset per shortcut, in px
+        made = 0
+        for st in steps:
+            if not isinstance(st, dict):
+                continue
+            scid = st.get("command_id") or st.get("cid")
+            # skip empties and a nested bundle (shouldn't happen, but be safe)
+            if not isinstance(scid, str) or not scid or scid == "function_bundle":
+                continue
+            # only create if the command actually exists in the registry
+            if self.registry.get(scid) is None:
+                continue
+
+            spreset = st.get("preset") or {}
+            if not isinstance(spreset, dict):
+                try:
+                    spreset = dict(spreset)
+                except Exception:
+                    spreset = {}
+
+            sid = uuid.uuid4().hex
+            label = self._default_label_for(scid)
+            step_pos = QPoint(pos.x() + dx * made, pos.y() + dy * made)
+            actual_sid = self.add_shortcut(
+                scid, step_pos, label=label, shortcut_id=sid
+            ) or sid
+
+            w = self.widgets.get(actual_sid)
+            if w and not _is_dead(w):
+                try:
+                    w._save_preset(spreset)
+                except Exception:
+                    pass
+            made += 1
+
+        if made:
+            self.save_shortcuts()
 
 
     def update_label(self, shortcut_id: str, new_label: str):
@@ -1900,13 +2184,21 @@ class ShortcutManager:
                 # Do NOT filter on isVisible(): a freshly created shortcut whose
                 # top-level window hasn't been shown yet reports not-visible and
                 # would be silently dropped, persisting an empty/partial set.
-                p = w.pos()
+                #
+                # Persist the USER'S INTENDED position (_desired_pos), not the
+                # live w.pos(). After a reflow clamp (viewport shrink), w.pos()
+                # is the on-screen clamped position while _desired_pos still
+                # holds the real placement. Saving w.pos() here slowly bakes
+                # clamped positions into QSettings, which then leak into every
+                # subsequent export and show up as "garbled" positions when
+                # the file is re-imported into a differently-sized canvas.
+                desired = getattr(w, "_desired_pos", None) or w.pos()
                 data.append({
                     "id": sid,
                     "command_id": w.command_id,
                     "label": w.text(),
-                    "x": p.x(),
-                    "y": p.y(),
+                    "x": int(desired.x()),
+                    "y": int(desired.y()),
                 })
             except RuntimeError:
                 self.widgets.pop(sid, None)
@@ -2199,8 +2491,36 @@ class ShortcutManager:
             return
         try:
             w.move(self._clamp_point_for_widget(w, x, y))
+            # an explicit (align/distribute) move is a fresh user placement
+            w._desired_pos = QPoint(int(x), int(y))
         except RuntimeError:
             pass
+
+    def reflow_into_view(self):
+        """Keep every shortcut reachable when the viewport shrinks.
+
+        Each chip remembers the position the user placed it at (``_desired_pos``);
+        here we display it clamped to the current canvas bounds. Growing the
+        viewport again restores the original spot, because clamping is a no-op
+        once the desired position fits — so shrinking never permanently loses a
+        chip's placement.
+        """
+        if getattr(self, "_loading", False):
+            return
+        rect = self._viewport_rect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return  # viewport not realized yet; a later resize will reflow
+        for sid, w in list(self.widgets.items()):
+            if _is_dead(w):
+                continue
+            desired = getattr(w, "_desired_pos", None)
+            if desired is None:
+                desired = w.pos()
+                w._desired_pos = QPoint(desired)
+            try:
+                w.move(self._clamp_point_for_widget(w, desired.x(), desired.y()))
+            except RuntimeError:
+                pass
 
     def make_neat_row(self, spacing: int = 16):
         ws = self.selected_widgets()
@@ -2369,10 +2689,38 @@ class ShortcutManager:
 
 
     def clear(self):
-      
         for sid, w in list(self.widgets.items()):
             try:
                 if not _is_dead(w):
+                    # CRITICAL: disconnect destroyed BEFORE scheduling the
+                    # delete. deleteLater() is deferred — the actual Qt
+                    # destruction fires one event-loop tick later and emits
+                    # 'destroyed', which runs _on_widget_destroyed(sid) and
+                    # pops that sid from self.widgets.
+                    #
+                    # If a REPLACE import follows clear() (same transaction,
+                    # before the event loop runs), the import loop re-adds
+                    # widgets AT THE SAME SIDS the .sass file carries — and
+                    # a .sass file that was previously exported from this
+                    # install carries exactly the sids we just scheduled
+                    # for deletion. So the stale destroyed signals fire
+                    # with sids that now point to BRAND-NEW widgets, pop
+                    # them from self.widgets, and leave them as orphan
+                    # QToolButtons: still parented to the canvas, still
+                    # visible, still on top of the hit-test stack — but
+                    # untracked. Hence the "corrupted icons, can't click,
+                    # can't select" bug on import+Replace.
+                    #
+                    # Disconnecting here is the surgical fix: when the
+                    # deferred destruction finally runs, no slot is attached,
+                    # so no dict mutation happens. Individual deletions
+                    # (delete_by_id) and normal widget lifecycle are
+                    # unaffected — they pop by sid BEFORE deleteLater(),
+                    # so a late destroyed call is a harmless no-op.
+                    try:
+                        w.destroyed.disconnect()
+                    except Exception:
+                        pass
                     w.hide()
                     try:
                         w.setParent(None)   # ← detach from canvas immediately
@@ -2385,6 +2733,7 @@ class ShortcutManager:
         self.selected.clear()
         self.settings.setValue(SET_KEY_V2, "[]")
         self.settings.remove(SET_KEY_V1)
+        self.settings.remove("presets/shortcuts")   # whole per-instance subtree
         self.settings.sync()
         try:
             self.canvas.update()  # nudge repaint
@@ -2417,6 +2766,20 @@ class ShortcutManager:
             g = w.geometry()
             g.translate(dx, dy)
             w.setGeometry(g)
+            w._desired_pos = QPoint(g.topLeft())   # user drag = new intended spot
+
+    def move_shortcut_group_to(self, sid: str, pos: QPoint):
+        """Reposition the dragged shortcut (and, if multi-selected, its whole
+        group) so the initiating icon's center lands at `pos` (canvas coords).
+        Called from ShortcutCanvas.dropEvent for an empty-canvas drop."""
+        w = self.widgets.get(sid)
+        if _is_dead(w):
+            return
+        if sid not in self.selected:
+            self.select_only(sid)   # a bare drag of an unselected icon moves just it
+        old_center = w.geometry().center()
+        self.move_selected_by(pos.x() - old_center.x(), pos.y() - old_center.y())
+        self.save_shortcuts()
 
     def delete_by_id(self, sid: str, *, persist: bool = True):
         self.selected.discard(sid)
@@ -2430,6 +2793,11 @@ class ShortcutManager:
                 w.deleteLater()
             except RuntimeError:
                 pass
+        # drop the per-instance preset so it doesn't linger in QSettings forever
+        try:
+            self.settings.remove(f"presets/shortcuts/{sid}")
+        except Exception:
+            pass
         if persist:
             self._allow_empty_save = True
             try:
@@ -2772,6 +3140,292 @@ class _SatChromaPresetDialog(QDialog):
         }
 
 
+class _MaskCreationPresetDialog(QDialog):
+    """
+    Preset editor for command_id="create_mask".
+
+    Mirrors mask_creation.py's _mask_params / seed_from_preset schema.
+    Canvas shapes are NOT part of the preset — the headless replay
+    defaults to a full-image base, which is the behavior that matches
+    the common UX this tool is used for (drop a 'Color: Green' shortcut
+    on an image → whole-frame green mask).
+    """
+
+    _MASK_TYPES = [
+        "Binary", "Range Selection", "Diffuse Structure",
+        "Lightness", "Chrominance", "Star Mask",
+        "Color: Red", "Color: Orange", "Color: Yellow",
+        "Color: Green", "Color: Cyan", "Color: Blue", "Color: Magenta",
+    ]
+    _DIFFUSE_PROFILES = [
+        ("Extended structure", "extended"),
+        ("Brightness weighted", "brightness_weighted"),
+    ]
+    _DIFFUSE_QUALITY = [
+        ("Low",    700),
+        ("Medium", 1400),
+        ("Ultra",  0),
+    ]
+    _APPLY_MODES = [
+        # Order sets the default (first entry). apply_mask_creation_via_preset
+        # routes between these; see its docstring for the full semantics.
+        #   push_only   — create a new mask document only
+        #   attach_only — create a new mask document AND apply it to the
+        #                 dropped-on view, same code path as shift+click+drag
+        #                 of the mask doc onto a view (via
+        #                 main_window._handle_mask_drop in subwindow.py).
+        #                 Requires Block 2 of _handle_command_drop to pass
+        #                 target_sw through to apply_mask_creation_via_preset.
+        #   both        — synonym for attach_only, kept for backward-compat
+        ("Push as new document",             "push_only"),
+        ("Push and apply to the dropped view", "attach_only"),
+        ("Both (same as 'Push and apply')",  "both"),
+    ]
+
+    def __init__(self, parent=None, initial: dict | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Mask Creation — Preset")
+        init = dict(initial or {})
+
+        root = QVBoxLayout(self)
+
+        # ── Core: mask type, blur, name, apply mode ────────────────────────
+        form_core = QFormLayout()
+
+        self.cmb_type = QComboBox()
+        self.cmb_type.addItems(self._MASK_TYPES)
+        want_type = str(init.get("mask_type", "Binary"))
+        i = self.cmb_type.findText(want_type)
+        self.cmb_type.setCurrentIndex(max(0, i))
+        form_core.addRow("Mask type:", self.cmb_type)
+
+        self.sp_blur = QSpinBox()
+        self.sp_blur.setRange(0, 300)
+        self.sp_blur.setValue(int(init.get("blur_amount", 0)))
+        form_core.addRow("Edge blur (px):", self.sp_blur)
+
+        # Default name is derived from the current mask type (e.g. a Color:
+        # Green preset lands as "ColorMaskGreen", a Diffuse Structure preset
+        # as "DiffuseMask"). We also auto-sync when the user flips the type
+        # combo, but only when the current value in the name box is one of
+        # the derived names — anything else means the user typed a custom
+        # name and we leave it alone.
+        try:
+            from setiastro.saspro.mask_creation import (
+                _derive_mask_name as _mc_derive_name,
+                KNOWN_MASK_NAMES as _mc_known_names,
+            )
+        except Exception:
+            # Fallback if mask_creation is unavailable at import time.
+            def _mc_derive_name(t: str) -> str:
+                return "Mask"
+            _mc_known_names = {"Mask"}
+        self._derive_mask_name = _mc_derive_name
+        self._known_mask_names = _mc_known_names
+
+        # Pick the field's initial value: an explicit mask_name in the
+        # preset wins; otherwise derive from the type the preset carries.
+        _init_name = str(init.get("mask_name") or "").strip()
+        if not _init_name or _init_name == "Mask":
+            _init_name = self._derive_mask_name(want_type)
+        self.ed_name = QLineEdit()
+        self.ed_name.setText(_init_name)
+        form_core.addRow("Mask name:", self.ed_name)
+
+        # Auto-sync when the mask type changes, unless the user customized.
+        def _on_type_change_update_name(new_type: str):
+            current = self.ed_name.text().strip()
+            if current in self._known_mask_names or current == "":
+                self.ed_name.blockSignals(True)
+                try:
+                    self.ed_name.setText(self._derive_mask_name(new_type))
+                finally:
+                    self.ed_name.blockSignals(False)
+        self.cmb_type.currentTextChanged.connect(_on_type_change_update_name)
+
+        self.cmb_apply = QComboBox()
+        for label, key in self._APPLY_MODES:
+            self.cmb_apply.addItem(label, userData=key)
+        _am = str(init.get("apply_mode", "push_only"))
+        j = self.cmb_apply.findData(_am)
+        self.cmb_apply.setCurrentIndex(max(0, j))
+        form_core.addRow("On apply:", self.cmb_apply)
+
+        # Apply-only knobs — only meaningful when apply_mode is attach_only
+        # or both. Keys are "apply_invert" / "apply_feather" (NOT plain
+        # "invert" / "feather") because the Range Selection group below
+        # already owns those names in the preset dict for its own mask-
+        # inversion / blur controls. Confusing them was a real bug.
+        self.chk_apply_invert = QCheckBox("Invert mask when applied to view")
+        self.chk_apply_invert.setChecked(bool(init.get("apply_invert", False)))
+        form_core.addRow("", self.chk_apply_invert)
+
+        self.sp_apply_feather = QDoubleSpinBox()
+        self.sp_apply_feather.setRange(0.0, 100.0)
+        self.sp_apply_feather.setDecimals(1)
+        self.sp_apply_feather.setSingleStep(0.5)
+        self.sp_apply_feather.setSuffix(" px")
+        self.sp_apply_feather.setValue(float(init.get("apply_feather", 0.0)))
+        form_core.addRow("Feather on apply:", self.sp_apply_feather)
+
+        root.addLayout(form_core)
+
+        # ── Range Selection group ──────────────────────────────────────────
+        self.grp_range = QGroupBox("Range Selection")
+        fr = QGridLayout(self.grp_range)
+        self.sp_lower = QDoubleSpinBox(); self.sp_lower.setRange(0.0, 1.0)
+        self.sp_lower.setDecimals(3); self.sp_lower.setSingleStep(0.01)
+        self.sp_lower.setValue(float(init.get("lower", 0.0)))
+        self.sp_upper = QDoubleSpinBox(); self.sp_upper.setRange(0.0, 1.0)
+        self.sp_upper.setDecimals(3); self.sp_upper.setSingleStep(0.01)
+        self.sp_upper.setValue(float(init.get("upper", 1.0)))
+        self.sp_fuzz = QDoubleSpinBox(); self.sp_fuzz.setRange(0.0, 1.0)
+        self.sp_fuzz.setDecimals(3); self.sp_fuzz.setSingleStep(0.01)
+        self.sp_fuzz.setValue(float(init.get("fuzz", 0.0)))
+        self.sp_smooth = QDoubleSpinBox(); self.sp_smooth.setRange(0.0, 200.0)
+        self.sp_smooth.setDecimals(2); self.sp_smooth.setSingleStep(0.5)
+        self.sp_smooth.setValue(float(init.get("smooth", 3.0)))
+        self.chk_screen = QCheckBox("Screening"); self.chk_screen.setChecked(bool(init.get("screen", False)))
+        self.chk_light  = QCheckBox("Lightness"); self.chk_light.setChecked(bool(init.get("lightness", False)))
+        self.chk_invert = QCheckBox("Invert");    self.chk_invert.setChecked(bool(init.get("invert", False)))
+        self.chk_link   = QCheckBox("Link limits"); self.chk_link.setChecked(bool(init.get("link", False)))
+        fr.addWidget(QLabel("Lower:"), 0, 0); fr.addWidget(self.sp_lower, 0, 1)
+        fr.addWidget(QLabel("Upper:"), 1, 0); fr.addWidget(self.sp_upper, 1, 1)
+        fr.addWidget(QLabel("Fuzz:"),  2, 0); fr.addWidget(self.sp_fuzz,  2, 1)
+        fr.addWidget(QLabel("Blur σ (px):"), 3, 0); fr.addWidget(self.sp_smooth, 3, 1)
+        fr.addWidget(self.chk_screen, 0, 2); fr.addWidget(self.chk_light, 1, 2)
+        fr.addWidget(self.chk_invert, 2, 2); fr.addWidget(self.chk_link,  3, 2)
+        root.addWidget(self.grp_range)
+
+        # ── Diffuse Structure group ────────────────────────────────────────
+        self.grp_diffuse = QGroupBox("Diffuse Structure")
+        fd = QFormLayout(self.grp_diffuse)
+        self.cmb_profile = QComboBox()
+        for label, key in self._DIFFUSE_PROFILES:
+            self.cmb_profile.addItem(label, userData=key)
+        _dp = str(init.get("diffuse_profile", "extended"))
+        pi = self.cmb_profile.findData(_dp)
+        self.cmb_profile.setCurrentIndex(max(0, pi))
+        fd.addRow("Profile:", self.cmb_profile)
+
+        self.sp_sens = QDoubleSpinBox(); self.sp_sens.setRange(0.5, 20.0)
+        self.sp_sens.setDecimals(2); self.sp_sens.setSingleStep(0.05)
+        self.sp_sens.setValue(float(init.get("diffuse_sensitivity", 1.0)))
+        fd.addRow("Sensitivity:", self.sp_sens)
+
+        self.sp_feather = QDoubleSpinBox(); self.sp_feather.setRange(0.0, 10.0)
+        self.sp_feather.setDecimals(3); self.sp_feather.setSingleStep(0.1)
+        self.sp_feather.setSuffix(" %")
+        self.sp_feather.setValue(float(init.get("diffuse_feather_frac", 0.0075)) * 100.0)
+        fd.addRow("Feather (% of short side):", self.sp_feather)
+
+        self.sp_minarea = QDoubleSpinBox(); self.sp_minarea.setRange(0.0, 5.0)
+        self.sp_minarea.setDecimals(3); self.sp_minarea.setSingleStep(0.05)
+        self.sp_minarea.setSuffix(" %")
+        self.sp_minarea.setValue(float(init.get("diffuse_min_area_frac", 0.001)) * 100.0)
+        fd.addRow("Minimum object area:", self.sp_minarea)
+
+        self.sp_envelope = QDoubleSpinBox(); self.sp_envelope.setRange(0.0, 25.0)
+        self.sp_envelope.setDecimals(3); self.sp_envelope.setSingleStep(0.1)
+        self.sp_envelope.setSuffix(" %")
+        self.sp_envelope.setValue(float(init.get("diffuse_envelope_frac", 0.0)) * 100.0)
+        fd.addRow("Envelope fill:", self.sp_envelope)
+
+        self.chk_reject_stars = QCheckBox("Suppress compact stars")
+        self.chk_reject_stars.setChecked(bool(init.get("diffuse_reject_stars", False)))
+        fd.addRow("", self.chk_reject_stars)
+
+        self.cmb_quality = QComboBox()
+        for label, key in self._DIFFUSE_QUALITY:
+            self.cmb_quality.addItem(label, userData=key)
+        _q = int(init.get("diffuse_quality", 1400))
+        qi = self.cmb_quality.findData(_q)
+        self.cmb_quality.setCurrentIndex(max(0, qi))
+        fd.addRow("Quality:", self.cmb_quality)
+
+        self.chk_diff_invert = QCheckBox("Invert (protect background)")
+        self.chk_diff_invert.setChecked(bool(init.get("diffuse_invert", False)))
+        fd.addRow("", self.chk_diff_invert)
+
+        root.addWidget(self.grp_diffuse)
+
+        # ── Star Mask group ────────────────────────────────────────────────
+        self.grp_star = QGroupBox("Star Mask")
+        fs = QFormLayout(self.grp_star)
+        self.sp_star_thresh = QDoubleSpinBox()
+        self.sp_star_thresh.setRange(0.5, 50.0); self.sp_star_thresh.setDecimals(1)
+        self.sp_star_thresh.setSingleStep(0.5)
+        self.sp_star_thresh.setValue(float(init.get("star_threshold", 3.0)))
+        fs.addRow("Detection threshold (σ):", self.sp_star_thresh)
+
+        self.chk_gaia = QCheckBox("Augment with Gaia Local DB (requires plate-solved WCS)")
+        self.chk_gaia.setChecked(bool(init.get("gaia_augment", False)))
+        fs.addRow("", self.chk_gaia)
+
+        self.sp_gaia_g = QDoubleSpinBox()
+        self.sp_gaia_g.setRange(6.0, 20.0); self.sp_gaia_g.setDecimals(1)
+        self.sp_gaia_g.setSingleStep(0.5)
+        self.sp_gaia_g.setValue(float(init.get("gaia_max_g", 17.0)))
+        fs.addRow("Max Gaia G mag:", self.sp_gaia_g)
+
+        root.addWidget(self.grp_star)
+
+        # ── Visibility: hide the groups that don't apply to the chosen type
+        self.cmb_type.currentTextChanged.connect(self._sync_visibility)
+        self._sync_visibility(self.cmb_type.currentText())
+
+        # ── OK / Cancel ────────────────────────────────────────────────────
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    def _sync_visibility(self, mask_type: str):
+        self.grp_range.setVisible(mask_type == "Range Selection")
+        self.grp_diffuse.setVisible(mask_type == "Diffuse Structure")
+        self.grp_star.setVisible(mask_type == "Star Mask")
+
+    def result_dict(self) -> dict:
+        return {
+            "mask_type":  self.cmb_type.currentText(),
+            "blur_amount": int(self.sp_blur.value()),
+            "mask_name":   self.ed_name.text().strip() or "Mask",
+            "apply_mode":    str(self.cmb_apply.currentData() or "push_only"),
+            # Apply-side knobs — distinct keys so they can't be shadowed
+            # by Range Selection's "invert" / Diffuse Structure's feather.
+            "apply_invert":  bool(self.chk_apply_invert.isChecked()),
+            "apply_feather": float(self.sp_apply_feather.value()),
+
+            # Range Selection
+            "lower":     float(self.sp_lower.value()),
+            "upper":     float(self.sp_upper.value()),
+            "fuzz":      float(self.sp_fuzz.value()),
+            "smooth":    float(self.sp_smooth.value()),
+            "screen":    bool(self.chk_screen.isChecked()),
+            "lightness": bool(self.chk_light.isChecked()),
+            "invert":    bool(self.chk_invert.isChecked()),
+            "link":      bool(self.chk_link.isChecked()),
+
+            # Diffuse Structure (preset stores fractions, UI shows percent)
+            "diffuse_profile":       str(self.cmb_profile.currentData() or "extended"),
+            "diffuse_sensitivity":   float(self.sp_sens.value()),
+            "diffuse_feather_frac":  float(self.sp_feather.value()) / 100.0,
+            "diffuse_min_area_frac": float(self.sp_minarea.value()) / 100.0,
+            "diffuse_envelope_frac": float(self.sp_envelope.value()) / 100.0,
+            "diffuse_reject_stars":  bool(self.chk_reject_stars.isChecked()),
+            "diffuse_quality":       int(self.cmb_quality.currentData() or 0),
+            "diffuse_invert":        bool(self.chk_diff_invert.isChecked()),
+
+            # Star Mask
+            "star_threshold": float(self.sp_star_thresh.value()),
+            "gaia_augment":   bool(self.chk_gaia.isChecked()),
+            "gaia_max_g":     float(self.sp_gaia_g.value()),
+        }
+
+
 class _StatStretchPresetDialog(QDialog):
     """
     Preset editor for headless replay: command_id="stat_stretch"
@@ -2975,6 +3629,84 @@ class _StarStretchPresetDialog(QDialog):
             "scnr_green":     bool(self.chk_scnr.isChecked()),
         }
 
+class _CosmeticCorrectionPresetDialog(QDialog):
+    """
+    Preset editor for headless replay: command_id="cosmetic_correction"
+
+    Keys supported:
+      hot_sigma:     float 0.5..10.0  (default 3.0)
+      cold_sigma:    float 0.5..10.0  (default 3.0)
+      correct_hot:   bool             (default True)
+      correct_cold:  bool             (default True)
+      bayer_pattern: str              ("" = auto-detect, "__none__" = force off,
+                                       or "RGGB"/"BGGR"/"GRBG"/"GBRG")
+    """
+    def __init__(self, parent=None, initial: dict | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Cosmetic Correction — Preset")
+        init = dict(initial or {})
+
+        self.spin_hot = QDoubleSpinBox()
+        self.spin_hot.setRange(0.5, 10.0)
+        self.spin_hot.setDecimals(2)
+        self.spin_hot.setSingleStep(0.1)
+        self.spin_hot.setValue(float(init.get("hot_sigma", 3.0)))
+
+        self.spin_cold = QDoubleSpinBox()
+        self.spin_cold.setRange(0.5, 10.0)
+        self.spin_cold.setDecimals(2)
+        self.spin_cold.setSingleStep(0.1)
+        self.spin_cold.setValue(float(init.get("cold_sigma", 3.0)))
+
+        self.chk_hot = QCheckBox("Correct hot pixels")
+        self.chk_hot.setChecked(bool(init.get("correct_hot", True)))
+        self.spin_hot.setEnabled(self.chk_hot.isChecked())
+        self.chk_hot.toggled.connect(self.spin_hot.setEnabled)
+
+        self.chk_cold = QCheckBox("Correct cold pixels")
+        self.chk_cold.setChecked(bool(init.get("correct_cold", True)))
+        self.spin_cold.setEnabled(self.chk_cold.isChecked())
+        self.chk_cold.toggled.connect(self.spin_cold.setEnabled)
+
+        self.cmb_bayer = QComboBox()
+        self.cmb_bayer.addItem("Auto-detect", userData="")
+        self.cmb_bayer.addItem("None (mono / debayered)", userData="__none__")
+        for pat in ("RGGB", "BGGR", "GRBG", "GBRG"):
+            self.cmb_bayer.addItem(pat, userData=pat)
+        bp = str(init.get("bayer_pattern", "") or "")
+        if bp == "__none__":
+            idx = 1
+        elif bp.upper() in ("RGGB", "BGGR", "GRBG", "GBRG"):
+            idx = self.cmb_bayer.findData(bp.upper())
+            if idx < 0: idx = 0
+        else:
+            idx = 0
+        self.cmb_bayer.setCurrentIndex(idx)
+
+        form = QFormLayout(self)
+        form.addRow("Hot pixels σ (0.5–10):", self.spin_hot)
+        form.addRow("Cold pixels σ (0.5–10):", self.spin_cold)
+        form.addRow("", self.chk_hot)
+        form.addRow("", self.chk_cold)
+        form.addRow("Bayer pattern:", self.cmb_bayer)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def result_dict(self) -> dict:
+        return {
+            "hot_sigma": float(self.spin_hot.value()),
+            "cold_sigma": float(self.spin_cold.value()),
+            "correct_hot": bool(self.chk_hot.isChecked()),
+            "correct_cold": bool(self.chk_cold.isChecked()),
+            "bayer_pattern": str(self.cmb_bayer.currentData() or ""),
+        }
+
 class _TextureClarityPresetDialog(QDialog):
     """Preset editor for Texture & Clarity. Matches parameter set of
     texture_clarity_headless() / TextureClarityDialog sliders."""
@@ -3066,11 +3798,13 @@ class _TextureClarityPresetDialog(QDialog):
 class _SyQonToolsPresetDialog(QDialog):
     """
     Preset editor for command_id="syqontools"
- 
+
     Families:
-      sclass _SyQonToolsPresetDialog(QDialog):tarless   — model kind + temp stretch
-      denoise    — Prism Mini/Deep + all Prism settings
-      sharpening — Parallax: correction, star reduction, sharpen strength
+      studio     — SyQon Studio neural CLI (all models: Prism / Parallax /
+                   Axiom / Deep Gradient) — the consolidated path
+      starless   — (legacy) model kind + temp stretch
+      denoise    — (legacy) Prism Mini/Deep + all Prism settings
+      sharpening — (legacy) Parallax: correction, star reduction, sharpen strength
     """
     def __init__(self, parent=None, initial: dict | None = None):
         super().__init__(parent)
@@ -3082,18 +3816,169 @@ class _SyQonToolsPresetDialog(QDialog):
  
         # ── Family ──
         self.cmb_family = QComboBox(self)
-        self.cmb_family.addItem("Starless",            "starless")
-        self.cmb_family.addItem("Denoise",             "denoise")
-        self.cmb_family.addItem("Sharpening (Parallax)", "sharpening")
+        self.cmb_family.addItem("Studio (all models)",   "studio")
+        self.cmb_family.addItem("Starless (legacy)",     "starless")
+        self.cmb_family.addItem("Denoise (legacy)",      "denoise")
+        self.cmb_family.addItem("Sharpening (legacy)",   "sharpening")
  
-        fam0 = str(init.get("family", "starless") or "starless").strip().lower()
+        fam0 = str(init.get("family", "studio") or "studio").strip().lower()
         idx  = self.cmb_family.findData(fam0)
         if idx < 0: idx = 0
         self.cmb_family.setCurrentIndex(idx)
         form.addRow("Tool family:", self.cmb_family)
  
         lay.addLayout(form)
- 
+
+        # ── Studio group (SyQon Studio neural CLI) ──
+        # Single source of truth for the model list; fall back to a static copy
+        # if the module can't be imported at editor-open time.
+        try:
+            from setiastro.saspro.syqon_studio import STUDIO_MODELS as _SM, studio_family_for as _sff
+            self._studio_fam = {m[0]: m[3] for m in _SM}
+            _studio_choices = [(m[0], m[1]) for m in _SM]
+        except Exception:
+            _studio_choices = [
+                ("prism-essential", "Prism Essential — Denoise"),
+                ("prism-advanced",  "Prism Deep Advanced — Denoise"),
+                ("prism-ultra",     "Prism Deep Ultra — Denoise"),
+                ("prism-max",       "Prism Deep Max — Denoise"),
+                ("prism-legacy-v1", "Prism Legacy V1 — Denoise"),
+                ("prism-legacy-v2", "Prism Legacy V2 — Denoise"),
+                ("parallax",        "Parallax — Correct / Reduce / Deblur"),
+                ("axiom",           "Axiom V3 — Starless"),
+                ("deep-gradient",   "Deep Gradient — Gradient removal"),
+            ]
+            self._studio_fam = {
+                "prism-essential": "prism", "prism-advanced": "prism", "prism-ultra": "prism",
+                "prism-max": "prism", "prism-legacy-v1": "prism", "prism-legacy-v2": "prism",
+                "parallax": "parallax", "axiom": "axiom", "deep-gradient": "deep-gradient",
+            }
+
+        self.grp_studio = QGroupBox("SyQon Studio Preset", self)
+        fst = QFormLayout(self.grp_studio)
+
+        self.cmb_studio_model = QComboBox(self)
+        for _mid, _label in _studio_choices:
+            self.cmb_studio_model.addItem(_label, userData=_mid)
+        _sm0 = str(init.get("studio_model", "prism-essential") or "prism-essential").strip()
+        _smi = self.cmb_studio_model.findData(_sm0)
+        self.cmb_studio_model.setCurrentIndex(max(0, _smi))
+        fst.addRow("Model:", self.cmb_studio_model)
+
+        self.cmb_studio_domain = QComboBox(self)
+        self.cmb_studio_domain.addItem("Auto (read metadata)", userData="auto")
+        self.cmb_studio_domain.addItem("Linear", userData="linear")
+        self.cmb_studio_domain.addItem("Non-linear", userData="nonlinear")
+        _sd = self.cmb_studio_domain.findData(str(init.get("studio_domain", "auto") or "auto").lower())
+        self.cmb_studio_domain.setCurrentIndex(max(0, _sd))
+        fst.addRow("Input domain:", self.cmb_studio_domain)
+
+        self.spin_studio_tile = QSpinBox(self)
+        self.spin_studio_tile.setRange(256, 2048); self.spin_studio_tile.setSingleStep(64)
+        self.spin_studio_tile.setValue(int(init.get("studio_tile", 512)))
+        fst.addRow("Tile size:", self.spin_studio_tile)
+
+        self.spin_studio_overlap = QSpinBox(self)
+        self.spin_studio_overlap.setRange(0, 512)
+        self.spin_studio_overlap.setValue(int(init.get("studio_overlap", 64)))
+        fst.addRow("Overlap:", self.spin_studio_overlap)
+
+        self.spin_studio_app = QDoubleSpinBox(self)
+        self.spin_studio_app.setRange(0.0, 1.0); self.spin_studio_app.setDecimals(2)
+        self.spin_studio_app.setSingleStep(0.05)
+        self.spin_studio_app.setValue(float(init.get("studio_application", 1.0)))
+        self.spin_studio_app.setToolTip("Prism only: blends the inferred result with the original (0..1).")
+        self.lbl_studio_app = QLabel("Application (blend):", self)
+        fst.addRow(self.lbl_studio_app, self.spin_studio_app)
+
+        # Parallax sub-controls
+        self.cmb_studio_px_family = QComboBox(self)
+        self.cmb_studio_px_family.addItem("Aesthetics", userData="aesthetics")
+        self.cmb_studio_px_family.addItem("Classic", userData="classic")
+        _pf = self.cmb_studio_px_family.findData(str(init.get("studio_px_family", "aesthetics") or "aesthetics").lower())
+        self.cmb_studio_px_family.setCurrentIndex(max(0, _pf))
+        self.row_studio_px_family_lbl = QLabel("Parallax family:", self)
+        fst.addRow(self.row_studio_px_family_lbl, self.cmb_studio_px_family)
+
+        self.chk_studio_px_correct = QCheckBox("Stellar correction / defect repair", self)
+        self.chk_studio_px_correct.setChecked(bool(init.get("studio_px_correct", True)))
+        fst.addRow("", self.chk_studio_px_correct)
+
+        _red = QWidget(self); _redl = QHBoxLayout(_red); _redl.setContentsMargins(0, 0, 0, 0)
+        self.chk_studio_px_reduce = QCheckBox("Star reduction", self)
+        self.chk_studio_px_reduce.setChecked(bool(init.get("studio_px_reduce", True)))
+        self.spin_studio_px_reduce = QSpinBox(self); self.spin_studio_px_reduce.setRange(0, 10)
+        self.spin_studio_px_reduce.setValue(int(init.get("studio_px_reduce_level", 5)))
+        self.spin_studio_px_reduce.setFixedWidth(56)
+        _redl.addWidget(self.chk_studio_px_reduce); _redl.addWidget(QLabel("level:", self))
+        _redl.addWidget(self.spin_studio_px_reduce); _redl.addStretch(1)
+        fst.addRow("", _red)
+
+        _deb = QWidget(self); _debl = QHBoxLayout(_deb); _debl.setContentsMargins(0, 0, 0, 0)
+        self.chk_studio_px_deblur = QCheckBox("Deblur (deconvolution)", self)
+        self.chk_studio_px_deblur.setChecked(bool(init.get("studio_px_deblur", True)))
+        self.spin_studio_px_deblur = QDoubleSpinBox(self); self.spin_studio_px_deblur.setRange(0.0, 1.0)
+        self.spin_studio_px_deblur.setDecimals(2); self.spin_studio_px_deblur.setSingleStep(0.05)
+        self.spin_studio_px_deblur.setValue(float(init.get("studio_px_deblur_strength", 0.5)))
+        self.spin_studio_px_deblur.setFixedWidth(64)
+        _debl.addWidget(self.chk_studio_px_deblur); _debl.addWidget(QLabel("strength:", self))
+        _debl.addWidget(self.spin_studio_px_deblur); _debl.addStretch(1)
+        fst.addRow("", _deb)
+
+        # Axiom sub-controls
+        self.cmb_studio_ax_stretch = QComboBox(self)
+        self.cmb_studio_ax_stretch.addItem("Auto", userData="auto")
+        self.cmb_studio_ax_stretch.addItem("Identity (already stretched)", userData="identity")
+        self.cmb_studio_ax_stretch.addItem("Custom", userData="custom")
+        _ax = self.cmb_studio_ax_stretch.findData(str(init.get("studio_ax_stretch", "auto") or "auto").lower())
+        self.cmb_studio_ax_stretch.setCurrentIndex(max(0, _ax))
+        self.row_studio_ax_stretch_lbl = QLabel("Axiom stretch:", self)
+        fst.addRow(self.row_studio_ax_stretch_lbl, self.cmb_studio_ax_stretch)
+
+        _axc = QWidget(self); _axcl = QHBoxLayout(_axc); _axcl.setContentsMargins(0, 0, 0, 0)
+        self.spin_studio_ax_black = QDoubleSpinBox(self); self.spin_studio_ax_black.setRange(0.0, 1.0)
+        self.spin_studio_ax_black.setDecimals(4); self.spin_studio_ax_black.setSingleStep(0.001)
+        self.spin_studio_ax_black.setValue(float(init.get("studio_ax_black", 0.0)))
+        self.spin_studio_ax_mid = QDoubleSpinBox(self); self.spin_studio_ax_mid.setRange(0.0, 1.0)
+        self.spin_studio_ax_mid.setDecimals(4); self.spin_studio_ax_mid.setSingleStep(0.001)
+        self.spin_studio_ax_mid.setValue(float(init.get("studio_ax_mid", 0.25)))
+        self.spin_studio_ax_white = QDoubleSpinBox(self); self.spin_studio_ax_white.setRange(0.0, 1.0)
+        self.spin_studio_ax_white.setDecimals(4); self.spin_studio_ax_white.setSingleStep(0.001)
+        self.spin_studio_ax_white.setValue(float(init.get("studio_ax_white", 1.0)))
+        for _cap, _sp in (("black", self.spin_studio_ax_black), ("mid", self.spin_studio_ax_mid), ("white", self.spin_studio_ax_white)):
+            _axcl.addWidget(QLabel(_cap, self)); _axcl.addWidget(_sp)
+        _axcl.addStretch(1)
+        self.row_studio_ax_custom = _axc
+        self.row_studio_ax_custom_lbl = QLabel("Custom points:", self)
+        fst.addRow(self.row_studio_ax_custom_lbl, _axc)
+
+        self.chk_studio_ax_stars = QCheckBox("Also create a Stars-Only document", self)
+        self.chk_studio_ax_stars.setChecked(bool(init.get("studio_ax_make_stars", True)))
+        fst.addRow("", self.chk_studio_ax_stars)
+
+        # Deep Gradient sub-control
+        self.chk_studio_dg_gradient = QCheckBox("Also create the extracted-gradient document", self)
+        self.chk_studio_dg_gradient.setChecked(bool(init.get("studio_dg_make_gradient", False)))
+        fst.addRow("", self.chk_studio_dg_gradient)
+
+        lay.addWidget(self.grp_studio)
+
+        # keep a list of every studio widget so we can toggle the whole group
+        self._studio_widgets = [
+            self.cmb_studio_model, self.cmb_studio_domain, self.spin_studio_tile,
+            self.spin_studio_overlap, self.spin_studio_app, self.lbl_studio_app,
+            self.cmb_studio_px_family, self.row_studio_px_family_lbl,
+            self.chk_studio_px_correct, self.chk_studio_px_reduce, self.spin_studio_px_reduce,
+            self.chk_studio_px_deblur, self.spin_studio_px_deblur,
+            self.cmb_studio_ax_stretch, self.row_studio_ax_stretch_lbl,
+            self.row_studio_ax_custom, self.row_studio_ax_custom_lbl,
+            self.chk_studio_ax_stars, self.chk_studio_dg_gradient,
+        ]
+        self.cmb_studio_model.currentIndexChanged.connect(self._studio_sync)
+        self.cmb_studio_ax_stretch.currentIndexChanged.connect(self._studio_sync)
+        self.chk_studio_px_reduce.toggled.connect(lambda on: self.spin_studio_px_reduce.setEnabled(on))
+        self.chk_studio_px_deblur.toggled.connect(lambda on: self.spin_studio_px_deblur.setEnabled(on))
+
         # ── Starless group ──
         self.grp_starless = QGroupBox("Starless Preset", self)
         fs = QFormLayout(self.grp_starless)
@@ -3269,16 +4154,73 @@ class _SyQonToolsPresetDialog(QDialog):
         self._sync_visibility()
  
     def _sync_visibility(self):
-        fam = str(self.cmb_family.currentData() or "starless")
+        fam = str(self.cmb_family.currentData() or "studio")
+        self.grp_studio.setVisible(fam == "studio")
         self.grp_starless.setVisible(fam == "starless")
         self.grp_prism.setVisible(fam == "denoise")
         self.grp_parallax.setVisible(fam == "sharpening")
+        if fam == "studio":
+            self._studio_sync()
+
+    def _studio_sync(self):
+        """Enable only the sub-controls relevant to the selected Studio model."""
+        mid = str(self.cmb_studio_model.currentData() or "prism-essential")
+        fam = self._studio_fam.get(mid, "prism")
+
+        is_prism = (fam == "prism")
+        is_parallax = (fam == "parallax")
+        is_axiom = (fam == "axiom")
+        is_gradient = (fam == "deep-gradient")
+
+        # Application: Prism only. Tile/overlap: Prism + Parallax.
+        self.lbl_studio_app.setVisible(is_prism)
+        self.spin_studio_app.setVisible(is_prism)
+        self.spin_studio_tile.setEnabled(is_prism or is_parallax)
+        self.spin_studio_overlap.setEnabled(is_prism or is_parallax)
+
+        for w in (self.cmb_studio_px_family, self.row_studio_px_family_lbl,
+                  self.chk_studio_px_correct, self.chk_studio_px_reduce,
+                  self.spin_studio_px_reduce, self.chk_studio_px_deblur,
+                  self.spin_studio_px_deblur):
+            w.setVisible(is_parallax)
+        # keep the reduction/deblur amount enable-state honest even when shown
+        self.spin_studio_px_reduce.setEnabled(is_parallax and self.chk_studio_px_reduce.isChecked())
+        self.spin_studio_px_deblur.setEnabled(is_parallax and self.chk_studio_px_deblur.isChecked())
+
+        for w in (self.cmb_studio_ax_stretch, self.row_studio_ax_stretch_lbl,
+                  self.row_studio_ax_custom, self.row_studio_ax_custom_lbl,
+                  self.chk_studio_ax_stars):
+            w.setVisible(is_axiom)
+        self.row_studio_ax_custom.setEnabled(
+            is_axiom and self.cmb_studio_ax_stretch.currentData() == "custom"
+        )
+
+        self.chk_studio_dg_gradient.setVisible(is_gradient)
  
     def result_dict(self) -> dict:
         return {
-            "family":   str(self.cmb_family.currentData() or "starless"),
+            "family":   str(self.cmb_family.currentData() or "studio"),
             "auto_run": True,
- 
+
+            # Studio (SyQon neural CLI)
+            "studio_model":             str(self.cmb_studio_model.currentData() or "prism-essential"),
+            "studio_domain":            str(self.cmb_studio_domain.currentData() or "auto"),
+            "studio_tile":              int(self.spin_studio_tile.value()),
+            "studio_overlap":           int(self.spin_studio_overlap.value()),
+            "studio_application":       float(self.spin_studio_app.value()),
+            "studio_px_family":         str(self.cmb_studio_px_family.currentData() or "aesthetics"),
+            "studio_px_correct":        bool(self.chk_studio_px_correct.isChecked()),
+            "studio_px_reduce":         bool(self.chk_studio_px_reduce.isChecked()),
+            "studio_px_reduce_level":   int(self.spin_studio_px_reduce.value()),
+            "studio_px_deblur":         bool(self.chk_studio_px_deblur.isChecked()),
+            "studio_px_deblur_strength": float(self.spin_studio_px_deblur.value()),
+            "studio_ax_stretch":        str(self.cmb_studio_ax_stretch.currentData() or "auto"),
+            "studio_ax_black":          float(self.spin_studio_ax_black.value()),
+            "studio_ax_mid":            float(self.spin_studio_ax_mid.value()),
+            "studio_ax_white":          float(self.spin_studio_ax_white.value()),
+            "studio_ax_make_stars":     bool(self.chk_studio_ax_stars.isChecked()),
+            "studio_dg_make_gradient":  bool(self.chk_studio_dg_gradient.isChecked()),
+
             # Starless
             "starless_model_kind":        str(self.cmb_starless_model.currentData() or "nadir"),
             "starless_use_mtf":           bool(self.chk_starless_mtf.isChecked()),
@@ -4092,13 +5034,36 @@ class _DebayerPresetDialog(QDialog):
 
 #src/setiastro/saspro/shortcuts.py
 
-from setiastro.saspro.curves_preset import list_custom_presets, _norm_mode
+from setiastro.saspro.curves_preset import (
+    list_custom_presets, _norm_mode,
+    _unwrap_preset_dict, _coerce_modes_dict, _is_linear_points_norm,
+    _shape_points_norm, _MODE_KEY_TO_LABEL, _LABEL_TO_MODE_KEY,
+)
 
 class _CurvesPresetDialog(QDialog):
     def __init__(self, parent=None, initial: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("Curves — Preset")
         init = dict(initial or {})
+        init = _unwrap_preset_dict(init)          # peel {"preset": {...}} etc.
+        self._original = dict(init)
+        self._is_multi = (init.get("kind") == "curves_multi"
+                        or isinstance(init.get("modes"), dict))
+        if self._is_multi:
+            self._modes = _coerce_modes_dict(init.get("modes", {}))
+            ak = str(init.get("active") or "K")
+            if ak not in self._modes and self._modes:
+                ak = next(iter(self._modes))
+            self._active_key = ak
+            pts = self._modes.get(ak) or [(0.0, 0.0), (1.0, 1.0)]
+            init = {                              # drive the widgets from the real data
+                "mode":  _MODE_KEY_TO_LABEL.get(ak, "K (Brightness)"),
+                "shape": "linear" if _is_linear_points_norm(pts) else "custom",
+                "amount": 1.0,
+                "points_norm": pts,
+            }
+        else:
+            self._modes, self._active_key = None, None
 
         # --- Mode ---------------------------------------------------------
         self.mode = QComboBox()
@@ -4244,18 +5209,33 @@ class _CurvesPresetDialog(QDialog):
         return out
 
     def result_dict(self) -> dict:
-        mode  = _norm_mode(self.mode.currentText())
+        mode_label = _norm_mode(self.mode.currentText())
         shape = self.shape.currentData() or "linear"
         amt   = float(self.amount.value())
-        d = {"mode": mode, "shape": shape, "amount": amt}
+
+        if self._is_multi:
+            pts = (self._parse_points_text() or [(0.0, 0.0), (1.0, 1.0)]) \
+                if shape == "custom" else _shape_points_norm(shape, amt)
+            modes = dict(self._modes or {})
+            modes[_LABEL_TO_MODE_KEY.get(mode_label, "K")] = \
+                [(float(x), float(y)) for (x, y) in pts]
+            out = dict(self._original)        # keep kind/version/other channels
+            out.update({
+                "kind": "curves_multi", "version": 2,
+                "active": _LABEL_TO_MODE_KEY.get(mode_label, "K"),
+                "modes": {k: [list(p) for p in v] for k, v in modes.items()},
+            })
+            for k in ("mode", "shape", "amount", "points_norm"):
+                out.pop(k, None)
+            return out
+
+        d = {"mode": mode_label, "shape": shape, "amount": amt}
         if shape == "custom":
             pts = self._parse_points_text()
-            if pts:
-                d["points_norm"] = pts
-            else:
-                d["shape"] = "linear"
-                d.pop("points_norm", None)
+            if pts: d["points_norm"] = pts
+            else:   d["shape"] = "linear"; d.pop("points_norm", None)
         return d
+
 class _GHSPresetDialog(QDialog):
     def __init__(self, parent=None, initial: dict | None = None):
         super().__init__(parent)
@@ -4372,8 +5352,12 @@ class _ABEPresetDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("ABE — Preset")
         p = dict(initial or {})
+
         form = QFormLayout(self)
-        self.degree  = QSpinBox(); self.degree.setRange(1, 6);  self.degree.setValue(int(p.get("degree", 2)))
+
+        # ---- core background model ----
+        self.degree  = QSpinBox(); self.degree.setRange(0, 6);  self.degree.setValue(int(p.get("degree", 2)))
+        self.degree.setToolTip("0 = skip polynomial (RBF-only).")
         self.samples = QSpinBox(); self.samples.setRange(20, 100000); self.samples.setSingleStep(20); self.samples.setValue(int(p.get("samples", 120)))
         self.down    = QSpinBox(); self.down.setRange(1, 64); self.down.setValue(int(p.get("downsample", 6)))
         self.patch   = QSpinBox(); self.patch.setRange(5, 151); self.patch.setSingleStep(2); self.patch.setValue(int(p.get("patch", 15)))
@@ -4383,6 +5367,7 @@ class _ABEPresetDialog(QDialog):
         self.seed.setSpecialValueText("Random (no seed)")
         self.seed.setToolTip("-1 = non-deterministic (different each run).\nAny other value = fully reproducible results.")
         self.mk_bg   = QCheckBox("Also create background document"); self.mk_bg.setChecked(bool(p.get("make_background_doc", False)))
+
         form.addRow("Polynomial degree:", self.degree)
         form.addRow("# samples:",         self.samples)
         form.addRow("Downsample:",        self.down)
@@ -4391,9 +5376,119 @@ class _ABEPresetDialog(QDialog):
         form.addRow("RBF smooth:",        self.smooth)
         form.addRow("Random seed:",       self.seed)
         form.addRow(self.mk_bg)
+
+        # ---- correction mode ----
+        _mode = str(p.get("correction_mode", "subtract")).lower()
+        self.cmb_correction = QComboBox()
+        self.cmb_correction.addItems(["Subtract", "Divide"])
+        self.cmb_correction.setCurrentText("Divide" if _mode == "divide" else "Subtract")
+        self.cmb_correction.setToolTip(
+            "Subtract: standard additive background removal.\n"
+            "Divide: for vignetting / multiplicative gradients."
+        )
+        form.addRow("Correction mode:", self.cmb_correction)
+
+        # ---- multiscale multiplicative-gradient refinement ----
+        _ms = p.get("multiscale", None) or {}
+        self.ms_enable = QCheckBox("Enable multiscale refinement")
+        self.ms_enable.setChecked(bool(_ms.get("enabled", False)))
+        self.ms_enable.setToolTip(
+            "Second pass that removes sharp multiplicative defects (dust motes,\n"
+            "reflections, filter-edge shadows) that poly/RBF can't model.\n"
+            "NOTE: headless (dropped-on-image) runs have no exclusion polygon,\n"
+            "so this flattens the whole frame with no galaxy protection."
+        )
+        form.addRow(self.ms_enable)
+
+        self.ms_darkstar = QCheckBox("Remove stars first (DarkStar)")
+        self.ms_darkstar.setChecked(bool(_ms.get("darkstar", True)))
+        self.ms_darkstar.setToolTip(
+            "Estimate the gradient on a starless copy so stars don't pollute it.\n"
+            "Stars are kept in the final output. Strongly recommended."
+        )
+        form.addRow(self.ms_darkstar)
+
+        self.ms_band_lo = QSpinBox(); self.ms_band_lo.setRange(0, 11); self.ms_band_lo.setValue(int(_ms.get("band_lo", 6)))
+        self.ms_band_hi = QSpinBox(); self.ms_band_hi.setRange(0, 11); self.ms_band_hi.setValue(int(_ms.get("band_hi", 8)))
+        self.ms_band_lo.setMaximumWidth(56); self.ms_band_hi.setMaximumWidth(56)
+        self.ms_band_lo.setToolTip("First detail layer treated as gradient (lower = finer).")
+        self.ms_band_hi.setToolTip("Last detail layer (inclusive); higher = coarser.")
+        _band_row = QHBoxLayout(); _band_row.setContentsMargins(0, 0, 0, 0)
+        _band_row.addWidget(self.ms_band_lo)
+        _band_row.addWidget(QLabel("to"))
+        _band_row.addWidget(self.ms_band_hi)
+        _band_row.addStretch(1)
+        _band_wrap = QWidget(); _band_wrap.setLayout(_band_row)
+        form.addRow("Scale band:", _band_wrap)
+
+        self.ms_residual = QCheckBox("Include coarsest residual")
+        self.ms_residual.setChecked(bool(_ms.get("include_residual", False)))
+        self.ms_residual.setToolTip(
+            "Usually OFF — the smooth background is already handled by poly/RBF;\n"
+            "including it here risks double-correcting."
+        )
+        form.addRow(self.ms_residual)
+
+        self.ms_strength = QSpinBox(); self.ms_strength.setRange(0, 100); self.ms_strength.setSuffix(" %")
+        self.ms_strength.setValue(int(round(float(_ms.get("strength", 1.0)) * 100)))
+        self.ms_strength.setToolTip("Blend strength of the correction (100% = full).")
+        form.addRow("Strength:", self.ms_strength)
+
+        self.ms_protect = QDoubleSpinBox(); self.ms_protect.setRange(1.0, 5.0); self.ms_protect.setSingleStep(0.5); self.ms_protect.setDecimals(1)
+        self.ms_protect.setValue(float(_ms.get("protect_k", 3.0)))
+        self.ms_protect.setToolTip(
+            "Signal-protection threshold (median + k·MAD).\n"
+            "k=1-2 protects aggressively, k=3 balanced, k=4-5 protects only bright cores."
+        )
+        form.addRow("Protect k (MAD):", self.ms_protect)
+
+        self.ms_smooth = QSpinBox(); self.ms_smooth.setRange(0, 10); self.ms_smooth.setSuffix(" px")
+        self.ms_smooth.setValue(int(_ms.get("smooth_px", 2)))
+        self.ms_smooth.setToolTip(
+            "Blur the gradient MAP before dividing, to strip per-pixel noise the\n"
+            "band picked up (worst at low band numbers). 0 = off; 2-3 px typical."
+        )
+        form.addRow("Smooth gradient map:", self.ms_smooth)
+
+        # keep the multiscale sub-controls disabled until the feature is on
+        def _sync_ms(on: bool):
+            for w in (self.ms_darkstar, self.ms_band_lo, self.ms_band_hi,
+                      self.ms_residual, self.ms_strength, self.ms_protect, self.ms_smooth):
+                w.setEnabled(bool(on))
+        self.ms_enable.toggled.connect(_sync_ms)
+        _sync_ms(self.ms_enable.isChecked())
+
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=self)
         btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
         form.addRow(btns)
+
+    def values(self) -> dict:
+        """Emit the preset in the exact schema apply_abe_via_preset() reads.
+        Only includes the multiscale block when enabled, keeping legacy presets
+        byte-clean when the feature is off."""
+        out = {
+            "degree":              int(self.degree.value()),
+            "samples":             int(self.samples.value()),
+            "downsample":          int(self.down.value()),
+            "patch":               int(self.patch.value()),
+            "rbf":                 bool(self.rbf.isChecked()),
+            "rbf_smooth":          float(self.smooth.value()),
+            "seed":                int(self.seed.value()),
+            "make_background_doc": bool(self.mk_bg.isChecked()),
+            "correction_mode":     "divide" if self.cmb_correction.currentText() == "Divide" else "subtract",
+        }
+        if self.ms_enable.isChecked():
+            out["multiscale"] = {
+                "enabled":          True,
+                "darkstar":         bool(self.ms_darkstar.isChecked()),
+                "band_lo":          int(self.ms_band_lo.value()),
+                "band_hi":          int(self.ms_band_hi.value()),
+                "include_residual": bool(self.ms_residual.isChecked()),
+                "strength":         float(self.ms_strength.value()) / 100.0,
+                "protect_k":        float(self.ms_protect.value()),
+                "smooth_px":        float(self.ms_smooth.value()),
+            }
+        return out
 
     def result_dict(self) -> dict:
         return {

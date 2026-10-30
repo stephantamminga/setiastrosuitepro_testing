@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtWidgets import QSizePolicy
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.help_support import make_help_button
 
 # ---------------------------------------------------------------------
 # Small helpers
@@ -147,7 +148,7 @@ def _hue_mask(img01: np.ndarray,
 
     # chroma/light gating
     if soft:
-        # Proportional selection: weight by how strongly the pixel is colored
+        #sasproportional selection: weight by how strongly the pixel is colored
         # (chroma) and feather the lightness limits, so the mask fades in/out
         # continuously instead of snapping. Edge pixels of a colored region are
         # naturally less saturated, so this softens hard, blobby boundaries.
@@ -810,6 +811,8 @@ class SelectiveColorCorrection(QDialog):
         zoom_row.addWidget(self.btn_zoom_1)
         zoom_row.addWidget(self.btn_fit)
         zoom_row.addStretch(1)
+        self.btn_doc_help = make_help_button("selective_color", self)
+        zoom_row.addWidget(self.btn_doc_help)
         right.addLayout(zoom_row)
 
         self.lbl_help = QLabel(

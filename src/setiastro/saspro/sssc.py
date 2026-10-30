@@ -169,6 +169,7 @@ from PyQt6.QtCore import QEventLoop
 
 # ── SASpro internals
 from setiastro.saspro.main_helpers import non_blocking_sleep
+from setiastro.saspro.async_task import run_async_blocking
 from setiastro.saspro.backgroundneutral import background_neutralize_rgb, auto_rect_50x50
 # astroquery.gaia is imported lazily — see _get_sssc_gaia_tap() below.
 # Importing it at module level triggers a network connection to the ESA
@@ -176,6 +177,8 @@ from setiastro.saspro.backgroundneutral import background_neutralize_rgb, auto_r
 from setiastro.saspro.gaia_downloader import GaiaDownloader, HAS_GAIAXPY
 from setiastro.saspro.gaia_downloader import GaiaSpectraDB
 from setiastro.saspro.gaia_database import get_library
+from setiastro.saspro.help_support import make_help_button
+from setiastro.saspro import cds_health
 
 # ── Re-use shared utilities from sfcc.py
 from setiastro.saspro.sfcc import (
@@ -229,6 +232,7 @@ _SK_LP1      = "SSSC/LPFilter"
 _SK_LP2      = "SSSC/LPFilter2"
 _SK_SENSOR   = "SSSC/WhiteReference"   # white reference SED only — no QE
 _SK_SEP_THR  = "SSSC/SEPThreshold"
+_SK_AUTO_SIG = "SSSC/AutoSigma"
 _SK_N_CTRL   = "SSSC/NCtrlPoints"
 _SK_BN       = "SSSC/BackgroundNeutralization"
 
@@ -768,7 +772,12 @@ def _solve_system_response(
             Gm_xp_n = Gm_arr[xp_indices] / g_integrals
             Bm_xp_n = Bm_arr[xp_indices] / g_integrals
             n_xp_s3 = n_xp_stage3
-
+            # Measured color ratios (XP subset) — per-star flux/zero-point cancels,
+            # exactly as Stage 1/2. This is the space we optimise AND report in, so
+            # Stage 3 RMS becomes directly comparable to Stage 2 RMS.
+            _Gm_safe_s3 = np.where(Gm_xp_n > eps, Gm_xp_n, eps)
+            meas_RG_s3  = Rm_xp_n / _Gm_safe_s3
+            meas_BG_s3  = Bm_xp_n / _Gm_safe_s3
 
             # N_CTRL: control points per channel. More = finer R(λ) resolution
             # but requires more stars to avoid fitting noise. Rule of thumb:
@@ -837,7 +846,8 @@ def _solve_system_response(
                 for ch_name in ("R", "G", "B")
                 if ch_data[ch_name] is not None
             ]
-
+            _ratio_ok = {"R", "G", "B"}.issubset({c[0] for c in active_channels})
+            _n_terms  = (2 if _ratio_ok else len(active_channels)) * n_xp_s3
             # Stage 1 scalar gains (k_R, k_G=1, k_B) used throughout the solver
             # loss — we minimize the SAME residual that gets reported as RMS,
             # not an internal surrogate. NOTE: pixel correction later uses the
@@ -962,29 +972,41 @@ def _solve_system_response(
                         "starting from Stage 2 operating point"
                     )
 
-            def _rms_loss(x):
-                """
-                Sum of squared fractional residuals using the Stage 1 scalar
-                gains (k_R, k_G=1, k_B). This is exactly what gets reported as RMS.
-                """
+            def _integrals(x):
+                return {cn: cd["W"] @ np.maximum(x[ci*N_CTRL:(ci+1)*N_CTRL], 0.0)
+                        for ci, (cn, cd) in enumerate(active_channels)}
+
+            def _ratio_terms(I):
+                IG  = np.where(I["G"] > eps, I["G"], eps)
+                mRG = (s3_gains["R"] * I["R"]) / IG
+                mBG = (s3_gains["B"] * I["B"]) / IG
+                rRG = meas_RG_s3 / np.where(mRG > eps, mRG, eps) - 1.0
+                rBG = meas_BG_s3 / np.where(mBG > eps, mBG, eps) - 1.0
+                return rRG, rBG
+
+            def _abs_loss(x):   # degenerate fallback: a channel is missing, no G reference
                 total = 0.0
-                for ci, (ch_name, cd) in enumerate(active_channels):
-                    r_vals = np.maximum(x[ci * N_CTRL : (ci + 1) * N_CTRL], 0.0)
-                    I = cd["W"] @ r_vals
-                    I_safe = np.where(I > eps, I, eps)
-                    k_c = s3_gains[ch_name]
-                    resid = cd["meas_n"] / (k_c * I_safe) - 1.0
-                    total += float(np.sum(resid ** 2))
+                for ci, (cn, cd) in enumerate(active_channels):
+                    I  = cd["W"] @ np.maximum(x[ci*N_CTRL:(ci+1)*N_CTRL], 0.0)
+                    Is = np.where(I > eps, I, eps)
+                    total += float(np.sum((cd["meas_n"] / (s3_gains[cn] * Is) - 1.0) ** 2))
                 return total
 
-            def _rms_loss_1d(ci, ch_name, cd, j, I_rest, r_j):
-                """1D loss: only this channel, only this control point varies."""
+            def _rms_loss(x):
+                if not _ratio_ok:
+                    return _abs_loss(x)
+                rRG, rBG = _ratio_terms(_integrals(x))
+                return float(np.sum(rRG**2) + np.sum(rBG**2))
+
+            def _rms_loss_1d(ci, ch_name, cd, j, I_rest, r_j, I_fixed):
                 r_j = max(r_j, 0.0)
-                I = r_j * cd["W"][:, j] + I_rest
-                I_safe = np.where(I > eps, I, eps)
-                k_c = s3_gains[ch_name]
-                resid = cd["meas_n"] / (k_c * I_safe) - 1.0
-                return float(np.sum(resid ** 2))
+                I_c = r_j * cd["W"][:, j] + I_rest
+                if not _ratio_ok:
+                    Is = np.where(I_c > eps, I_c, eps)
+                    return float(np.sum((cd["meas_n"] / (s3_gains[ch_name] * Is) - 1.0) ** 2))
+                I = dict(I_fixed); I[ch_name] = I_c
+                rRG, rBG = _ratio_terms(I)
+                return float(np.sum(rRG**2) + np.sum(rBG**2))
 
             # ── Coordinate descent ────────────────────────────────────────────
             # Coordinate descent — directional search per control point.
@@ -1007,6 +1029,7 @@ def _solve_system_response(
             STEPS_DOWN = [0.9, 0.8]   # try smaller if up didn't help
 
             x_cur = x0.copy()
+            I_cur = _integrals(x_cur)
             loss_prev = _rms_loss(x_cur)
             status_cb(
                 f"[SSSC] Stage 3: coordinate descent "
@@ -1023,36 +1046,27 @@ def _solve_system_response(
             for sweep in range(60):
                 any_improved = False
                 for ci, (ch_name, cd) in enumerate(active_channels):
-                    r_vals = np.maximum(x_cur[ci * N_CTRL : (ci + 1) * N_CTRL], 0.0)
+                    r_vals  = np.maximum(x_cur[ci*N_CTRL:(ci+1)*N_CTRL], 0.0)
+                    I_fixed = {cn: I_cur[cn] for cn in I_cur if cn != ch_name}
                     for j in range(N_CTRL):
-                        r_j       = r_vals[j]
-                        I_rest    = cd["W"] @ r_vals - r_j * cd["W"][:, j]
-                        cur_loss  = _rms_loss_1d(ci, ch_name, cd, j, I_rest, r_j)
+                        r_j      = r_vals[j]
+                        I_rest   = cd["W"] @ r_vals - r_j * cd["W"][:, j]
+                        best_loss = _rms_loss_1d(ci, ch_name, cd, j, I_rest, r_j, I_fixed)
                         best_r    = r_j
-                        best_loss = cur_loss
-
-                        # Try UP first
                         for s in STEPS_UP:
-                            l = _rms_loss_1d(ci, ch_name, cd, j, I_rest, r_j * s)
-                            if l < best_loss:
-                                best_loss = l
-                                best_r    = r_j * s
-
-                        # Only try DOWN if UP didn't improve
+                            l = _rms_loss_1d(ci, ch_name, cd, j, I_rest, r_j*s, I_fixed)
+                            if l < best_loss: best_loss, best_r = l, r_j*s
                         if best_r == r_j:
                             for s in STEPS_DOWN:
-                                l = _rms_loss_1d(ci, ch_name, cd, j, I_rest, r_j * s)
-                                if l < best_loss:
-                                    best_loss = l
-                                    best_r    = r_j * s
-
+                                l = _rms_loss_1d(ci, ch_name, cd, j, I_rest, r_j*s, I_fixed)
+                                if l < best_loss: best_loss, best_r = l, r_j*s
                         if best_r != r_j:
                             r_vals[j] = best_r
                             any_improved = True
-                    x_cur[ci * N_CTRL : (ci + 1) * N_CTRL] = r_vals
-
+                    x_cur[ci*N_CTRL:(ci+1)*N_CTRL] = r_vals
+                    I_cur[ch_name] = cd["W"] @ r_vals     # refresh after this channel
                 loss_new = _rms_loss(x_cur)
-                rms_new  = float(np.sqrt(loss_new / (n_xp_s3 * len(active_channels))))
+                rms_new  = float(np.sqrt(loss_new / max(_n_terms, 1)))
                 delta    = loss_prev - loss_new
                 status_cb(
                     f"[SSSC] Stage 3 sweep {sweep + 1}: "
@@ -1122,18 +1136,42 @@ def _solve_system_response(
             for ch_name, R_full in R_channels.items():
                 ch_response_norm[ch_name] = R_full / global_ch_max
 
-            # Final RMS
-            rms_terms = []
-            for ci, (ch_name, cd) in enumerate(active_channels):
-                r_vals = np.maximum(x_opt[ci * N_CTRL : (ci + 1) * N_CTRL], 0.0)
-                I_c    = cd["W"] @ r_vals
-                I_safe = np.where(I_c > eps, I_c, eps)
-                k_use  = s3_gains[ch_name]
-                resid_c = cd["meas_n"] / (k_use * I_safe) - 1.0
-                rms_terms.append(float(np.mean(resid_c ** 2)))
-            residual_rms = float(np.sqrt(np.mean(rms_terms)))
+            # ── Final RMS — color-ratio space, comparable to Stage 2 ──────────
+            if _ratio_ok:
+                rRG_f, rBG_f = _ratio_terms(_integrals(x_opt))
+                residual_rms = float(
+                    np.sqrt(np.mean(np.concatenate([rRG_f, rBG_f]) ** 2)))
+            else:
+                # Degenerate fallback (a channel missing → no G reference).
+                rms_terms = []
+                for ci, (ch_name, cd) in enumerate(active_channels):
+                    r_vals = np.maximum(x_opt[ci * N_CTRL : (ci + 1) * N_CTRL], 0.0)
+                    I_c    = cd["W"] @ r_vals
+                    I_safe = np.where(I_c > eps, I_c, eps)
+                    k_use  = s3_gains[ch_name]
+                    resid_c = cd["meas_n"] / (k_use * I_safe) - 1.0
+                    rms_terms.append(float(np.mean(resid_c ** 2)))
+                residual_rms = float(np.sqrt(np.mean(rms_terms)))
 
             stage_rms[3] = residual_rms
+
+            # ── Guard: Stage 3 must never report a worse RMS than Stage 2 ─────
+            # Both numbers are now in color-ratio space, so this is apples-to-
+            # apples. Stage 3's piecewise-linear R(λ) is strictly more expressive
+            # than Stage 2's per-band quadratic, so it should match or beat it;
+            # if it doesn't (bad seed, pathological field), fall back to Stage 2
+            # rather than regress.
+            _s2 = stage_rms.get(2)
+            if _s2 is not None and residual_rms > _s2 + 1e-6:
+                status_cb(
+                    f"[SSSC] Stage 3 RMS={residual_rms:.4f} > "
+                    f"Stage 2 RMS={_s2:.4f} — reverting to Stage 2"
+                )
+                stage            = 2
+                residual_rms     = _s2
+                response         = np.ones_like(_WL_GRID, dtype=np.float64)
+                ctrl_points      = None   # don't seed future sessions from a rejected solve
+                ch_response_norm = None
 
             status_cb(
                 f"[SSSC] Stage 3 complete — "
@@ -1962,16 +2000,33 @@ class SSSCDialog(QDialog):
         self.add_curve_btn.clicked.connect(self.add_custom_curve)
         row1.addWidget(self.add_curve_btn)
 
-        self.about_btn = QPushButton("About")
-        self.about_btn.setStyleSheet(
-            "QPushButton { background: #1a2f4a; color: #88bbee; border: 1px solid #2a5080;"
-            " border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
-            " QPushButton:hover { background: #1f3a5f; color: #aaccff; border-color: #3a70aa; }"
+        # ── Docs cluster: About (what it is) + Help (full documentation) ──
+        INFO_STYLE = (
+            "QPushButton { background: #1a2f4a; color: #88bbee;"
+            " border: 1px solid #2a5080; border-radius: 4px;"
+            " padding: 4px 10px; font-size: 11px; }"
+            " QPushButton:hover  { background: #1f3a5f; color: #aaccff;"
+            " border-color: #3a70aa; }"
             " QPushButton:pressed { background: #111f33; }"
         )
+
+        self.about_btn = QPushButton("About")
+        self.about_btn.setStyleSheet(INFO_STYLE)
         self.about_btn.setToolTip("About SSSC — what it is and how it works")
         self.about_btn.clicked.connect(self._show_about)
-        row1.addWidget(self.about_btn)        
+        row1.addWidget(self.about_btn)
+
+        # Help / documentation — matched to About so the pair reads together.
+        # We build it manually (not make_help_button) so we can give it the
+        # same blue styling as About; the click handler is the same one
+        # make_help_button wires up internally.
+        from setiastro.saspro.help_support import show_tool_doc
+        self.btn_help = QPushButton("📄 Docs")
+        self.btn_help.setStyleSheet(INFO_STYLE)
+        self.btn_help.setToolTip("Open the SSSC documentation page")
+        self.btn_help.clicked.connect(lambda: show_tool_doc("sssc", self))
+        row1.addWidget(self.btn_help)
+
         layout.addLayout(row1)
  
         # ── Row 2: RGB Filters ────────────────────────────────────────────────
@@ -2063,6 +2118,25 @@ class SSSCDialog(QDialog):
         self.sep_thr_spin.valueChanged.connect(
             lambda v: QSettings().setValue(_SK_SEP_THR, int(v)))
         row4.addWidget(self.sep_thr_spin)
+
+        # Auto σ (waterfall) — removes the manual guess-and-check.
+        # Starts at σ=100 and steps down [100,50,25,12,8,5,3] until the
+        # detection returns at least SSSC_AUTO_SIGMA_MIN_STARS (1200) sources.
+        # Falls back to the lowest σ in the ladder if nothing hits the bar.
+        self.auto_sigma_chk = QCheckBox("Auto")
+        self.auto_sigma_chk.setStyleSheet(CHK_STYLE)
+        self.auto_sigma_chk.setChecked(True)
+        self.auto_sigma_chk.setToolTip(
+            "Auto σ waterfall:\n"
+            "  Tries σ = 100, 50, 25, 12, 8, 5, 3 in order and stops at the\n"
+            "  first value that yields ≥ 1200 detections. Removes the need to\n"
+            "  guess a threshold for different fields.\n\n"
+            "  Uncheck to use the manual σ value in the spin box."
+        )
+        self.auto_sigma_chk.toggled.connect(self._on_auto_sigma_toggled)
+        row4.addWidget(self.auto_sigma_chk)
+        # Reflect initial state on the spin box
+        self.sep_thr_spin.setEnabled(not self.auto_sigma_chk.isChecked())
  
 
         adv_box = QGroupBox("Advanced")
@@ -2132,13 +2206,11 @@ class SSSCDialog(QDialog):
         self.clear_session_btn.clicked.connect(self._clear_session_history)
         row4.addWidget(self.clear_session_btn)
  
-
- 
         self.close_btn = QPushButton("Close")
         self.close_btn.setStyleSheet(UTIL_STYLE)
         self.close_btn.clicked.connect(self.reject)
         row4.addWidget(self.close_btn)
-        layout.addLayout(row4)
+        layout.addLayout(row4)  
  
         # ── Status label ──────────────────────────────────────────────────────
         self.count_label = QLabel("")
@@ -2313,6 +2385,12 @@ class SSSCDialog(QDialog):
         sep_thr = int(s.value(_SK_SEP_THR, 15))
         self.sep_thr_spin.setValue(sep_thr)
 
+        # Auto-σ waterfall preference (default: ON — removes guess-and-check)
+        auto_sig = s.value(_SK_AUTO_SIG, True, type=bool)
+        if hasattr(self, "auto_sigma_chk"):
+            self.auto_sigma_chk.setChecked(bool(auto_sig))
+            self.sep_thr_spin.setEnabled(not bool(auto_sig))
+
         self.max_stars_spin.setValue(int(s.value("SSSC/MaxStars", 500)))
 
         nctrl = int(s.value(_SK_N_CTRL, 8))
@@ -2328,6 +2406,78 @@ class SSSCDialog(QDialog):
             return self.camera_label_edit.text().strip()
         except Exception:
             return ""
+
+    # ── Auto-σ waterfall config / helpers ─────────────────────────────
+    # Ladder of σ values tried from highest (strictest) to lowest.
+    # Highest σ that still yields ≥ SSSC_AUTO_SIGMA_MIN_STARS wins; if
+    # none clear the bar, the last (most sensitive) rung is used so
+    # genuinely sparse fields still get something to work with.
+    SSSC_AUTO_SIGMA_LADDER = (100.0, 50.0, 25.0, 12.0, 8.0, 5.0, 3.0)
+    SSSC_AUTO_SIGMA_MIN_STARS = 1200
+
+    def _on_auto_sigma_toggled(self, on: bool):
+        try:
+            self.sep_thr_spin.setEnabled(not bool(on))
+        except Exception:
+            pass
+        QSettings().setValue(_SK_AUTO_SIG, bool(on))
+
+    def _auto_sigma_enabled(self) -> bool:
+        try:
+            return bool(self.auto_sigma_chk.isChecked())
+        except Exception:
+            return False
+
+    def _sep_detect_waterfall(self, data_sub, err, *, status_prefix: str = ""):
+        """
+        Run sep.extract with the σ waterfall when Auto is enabled, or with
+        the manual spin value when Auto is off.
+
+        Returns (sources, used_sigma). `sources` may be empty if nothing was
+        detected at any σ in the ladder — callers should handle that case
+        exactly as they handled an empty result before.
+        """
+        if self._auto_sigma_enabled():
+            last_sources = None
+            last_sigma   = None
+            for sig in self.SSSC_AUTO_SIGMA_LADDER:
+                if status_prefix:
+                    _sfcc_status(self, f"{status_prefix} (trying σ={sig:.1f})…")
+                    QApplication.processEvents()
+                try:
+                    srcs = sep.extract(data_sub, float(sig), err=err)
+                except Exception:
+                    # Treat as "no detections at this σ" and keep stepping down
+                    srcs = None
+                last_sources = srcs
+                last_sigma   = sig
+                n = 0 if srcs is None else int(srcs.size)
+                if n >= self.SSSC_AUTO_SIGMA_MIN_STARS:
+                    if status_prefix:
+                        _sfcc_status(
+                            self,
+                            f"{status_prefix} — auto σ={sig:.1f} → {n:,} sources."
+                        )
+                        QApplication.processEvents()
+                    return srcs, float(sig)
+            # Ladder exhausted — return the last (lowest-σ, most sensitive) try
+            n = 0 if last_sources is None else int(last_sources.size)
+            if status_prefix:
+                _sfcc_status(
+                    self,
+                    f"{status_prefix} — auto σ ladder exhausted, using σ="
+                    f"{(last_sigma or 3.0):.1f} ({n:,} sources)."
+                )
+                QApplication.processEvents()
+            return (last_sources if last_sources is not None
+                    else sep.extract(data_sub, 3.0, err=err)), float(last_sigma or 3.0)
+
+        # Manual mode — single shot at the spin value
+        sep_sigma = float(self.sep_thr_spin.value()) if hasattr(self, "sep_thr_spin") else 5.0
+        if status_prefix:
+            _sfcc_status(self, f"{status_prefix} (manual σ={sep_sigma:.1f})…")
+            QApplication.processEvents()
+        return sep.extract(data_sub, sep_sigma, err=err), sep_sigma
 
     # ── View plumbing ─────────────────────────────────────────────────────────
 
@@ -2378,7 +2528,9 @@ class SSSCDialog(QDialog):
             self, missing, dl, batch_size=batch_size)
 
     def initialize_wcs_from_header(self, header):
+        self._wcs_fail_reason = None
         if header is None:
+            self._wcs_fail_reason = "No FITS header available for the active image."
             self.wcs = None
             return
         try:
@@ -2407,9 +2559,15 @@ class SSSCDialog(QDialog):
             # Catch it here and fall through to the existing "no WCS" path instead.
             _wcs_check = self.wcs.celestial if hasattr(self.wcs, "celestial") else self.wcs
             if _wcs_check.naxis < 2:
-                print("[SSSC] WCS has no celestial axes (naxis < 2) — "
-                      "header is missing valid CTYPE1/CTYPE2 RA/DEC. "
-                      "Treating as no WCS.")
+                ct1 = str(hdr.get("CTYPE1", "")).strip() or "(missing)"
+                ct2 = str(hdr.get("CTYPE2", "")).strip() or "(missing)"
+                self._wcs_fail_reason = (
+                    "Header has no celestial axes — it doesn't contain a valid "
+                    "RA/DEC plate solution.\n\n"
+                    f"CTYPE1 = {ct1}\nCTYPE2 = {ct2}\n\n"
+                    "The image is most likely not plate-solved yet."
+                )
+                print("[SSSC] " + self._wcs_fail_reason.replace("\n", " "))
                 self.wcs = None
                 return
 
@@ -2440,6 +2598,10 @@ class SSSCDialog(QDialog):
                 except Exception:
                     self.orientation = None
         except Exception as e:
+            self._wcs_fail_reason = (
+                "astropy could not parse the WCS keywords in this header "
+                f"(likely malformed CD matrix, SIP, or CRVAL/CRPIX):\n\n{e}"
+            )
             print(f"[SSSC] WCS initialization error: {e}")
             self.wcs = None
 
@@ -2515,14 +2677,17 @@ class SSSCDialog(QDialog):
 
         try:
             self.initialize_wcs_from_header(self.current_header)
-        except Exception:
+        except Exception as e:
             QMessageBox.critical(self, "WCS Error",
-                "Could not build a 2D WCS from header.")
+                "Could not build a 2D WCS from header.\n\n"
+                f"{getattr(self, '_wcs_fail_reason', None) or e}")
             return
 
         if not getattr(self, "wcs", None):
             QMessageBox.critical(self, "WCS Error",
-                "Could not build a 2D WCS from header.")
+                "Could not build a 2D WCS from header.\n\n"
+                + (getattr(self, "_wcs_fail_reason", None)
+                   or "The header did not yield a usable 2D celestial WCS."))
             return
 
         wcs2 = self.wcs.celestial if hasattr(self.wcs, "celestial") else self.wcs
@@ -2542,10 +2707,11 @@ class SSSCDialog(QDialog):
         data_sub = gray - bkg.back()
         err      = float(bkg.globalrms)
 
-        sep_sigma = float(self.sep_thr_spin.value()) if hasattr(self, "sep_thr_spin") else 5.0
-        sources   = sep.extract(data_sub, sep_sigma, err=err)
+        sources, sep_sigma = self._sep_detect_waterfall(
+            data_sub, err, status_prefix="Detecting stars with SEP"
+        )
 
-        if sources.size == 0:
+        if sources is None or sources.size == 0:
             QMessageBox.critical(self, "SEP Error", "SEP found no sources.")
             return
 
@@ -2561,7 +2727,7 @@ class SSSCDialog(QDialog):
             return
 
         _sfcc_status(self,
-            f"SEP detected {sources.size:,} stars — converting to sky coords…")
+            f"SEP detected {sources.size:,} stars (σ={sep_sigma:.1f}) — converting to sky coords…")
         QApplication.processEvents()
 
         xs = sources["x"].astype(np.float64)
@@ -2652,35 +2818,31 @@ class SSSCDialog(QDialog):
                                dec=sky_corners[1:,1]*u.deg, frame="icrs")
         radius = center_sky.separation(corners_sky).max() * 1.05
 
-        Simbad.reset_votable_fields()
-        ok = False
-        for _ in range(5):
-            try:
-                Simbad.add_votable_fields("sp", "B", "V", "R", "ra", "dec", "main_id")
-                ok = True; break
-            except Exception:
-                QApplication.processEvents(); non_blocking_sleep(0.8)
-        if not ok:
-            for _ in range(5):
-                try:
-                    Simbad.add_votable_fields("sp", "flux(B)", "flux(V)", "flux(R)",
-                                              "ra(d)", "dec(d)", "main_id")
-                    ok = True; break
-                except Exception:
-                    QApplication.processEvents(); non_blocking_sleep(0.8)
+        # SIMBAD is optional enrichment — Gaia XP is the primary source, so a
+        # CDS outage must cost seconds, not the ~15 unbounded network calls
+        # this block used to make. prepare_simbad() probes with a hard 4 s
+        # deadline, fails over to the Harvard mirror, and bounds the timeout
+        # BEFORE add_votable_fields (which hits the network on astroquery
+        # >= 0.4.8).
+        self._simbad_budget = cds_health.Budget()
+        _simbad = cds_health.prepare_simbad(
+            status_cb=lambda m: _sfcc_status(self, m), timeout=30.0)
 
         simbad_result = None
-        if ok:
-            Simbad.ROW_LIMIT = 10000
-            for attempt in range(1, 6):
-                try:
-                    _sfcc_status(self,
-                        f"Querying SIMBAD for spectral types (attempt {attempt}/5)…")
-                    QApplication.processEvents()
-                    simbad_result = Simbad.query_region(center_sky, radius=radius)
-                    break
-                except Exception:
-                    QApplication.processEvents(); non_blocking_sleep(1.2)
+        if _simbad is not None:
+            _sfcc_status(self, "Querying SIMBAD for spectral types…")
+            QApplication.processEvents()
+            simbad_result = cds_health.call_simbad(
+                _simbad.query_region, center_sky,
+                radius=radius,
+                runner=lambda f, *a, **k: run_async_blocking(
+                    f, *a, parent=self, title="SSSC",
+                    label="Querying SIMBAD…", cancellable=False, **k),
+                status_cb=lambda m: _sfcc_status(self, m),
+                budget=self._simbad_budget,
+                attempts=2,
+                label="SIMBAD region query",
+            )
 
         templates_for_hist = []
 
@@ -3178,12 +3340,10 @@ SSSC is part of SetiAstro Suite Pro &mdash; www.setiastro.com
         data_sub = gray - bkg.back()
         err      = float(bkg.globalrms)
 
-        sep_sigma = float(self.sep_thr_spin.value())
-        _sfcc_status(self, f"Re-detecting stars (SEP σ={sep_sigma:.1f})…")
-        QApplication.processEvents()
-
-        sources = sep.extract(data_sub, sep_sigma, err=err)
-        if sources.size == 0:
+        sources, sep_sigma = self._sep_detect_waterfall(
+            data_sub, err, status_prefix="Re-detecting stars"
+        )
+        if sources is None or sources.size == 0:
             QMessageBox.critical(self, "SEP Error", "No sources detected.")
             return
 
@@ -3198,7 +3358,7 @@ SSSC is part of SetiAstro Suite Pro &mdash; www.setiastro.com
                 "All detections rejected by radius filter.")
             return
 
-        _sfcc_status(self, f"Matching {sources.size:,} SEP sources to star catalog…")
+        _sfcc_status(self, f"Matching {sources.size:,} SEP sources (σ={sep_sigma:.1f}) to star catalog…")
         QApplication.processEvents()
 
         raw_matches = []

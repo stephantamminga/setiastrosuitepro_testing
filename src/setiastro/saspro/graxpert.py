@@ -114,6 +114,7 @@ class GraXpertOperationDialog(QDialog):
         # ── Drag-to-canvas grip (PI-style "new instance") ─────────────────
         # Deferred import avoids a shortcuts.py <-> graxpert import cycle.
         from setiastro.saspro.shortcuts import PresetDragHandle
+        from setiastro.saspro.help_support import make_help_button
         try:
             from setiastro.saspro.resources import graxperticon_path
             _gx_icon = QIcon(graxperticon_path)
@@ -136,6 +137,8 @@ class GraXpertOperationDialog(QDialog):
         )
         drag_row.addWidget(self.preset_drag_handle)
         drag_row.addStretch(1)
+        self.btn_help = make_help_button("graxpert", self)
+        drag_row.addWidget(self.btn_help)
         root.addLayout(drag_row)
 
     def seed_from_preset(self, preset: dict | None):
@@ -570,7 +573,8 @@ class _GraXpertThread(QThread):
 def _run_graxpert_command(parent, command: list[str], output_basename: str,
                           working_dir: str, target_doc,
                           op_label: str | None = None,
-                          meta_extras: dict | None = None):
+                          meta_extras: dict | None = None,
+                          replay_preset: dict | None = None):
     dlg = QDialog(parent)
     dlg.setWindowTitle("GraXpert Progress")
     dlg.setMinimumSize(600, 420)
@@ -592,6 +596,7 @@ def _run_graxpert_command(parent, command: list[str], output_basename: str,
             dlg,
             op_label,
             meta_extras,
+            replay_preset,
         )
     )
     btn_cancel.clicked.connect(thr.terminate)
@@ -630,7 +635,8 @@ def _on_graxpert_finished(parent,
                           target_doc,
                           dlg,
                           op_label: str | None = None,
-                          meta_extras: dict | None = None):
+                          meta_extras: dict | None = None,
+                          replay_preset: dict | None = None):
     try:
         dlg.close()
     except Exception:
@@ -744,6 +750,17 @@ def _on_graxpert_finished(parent,
         # these are non-header fields like graxpert_operation, etc.
         base_meta.update(meta_extras)
 
+    # Replay marker — base_meta was copied from the doc's live metadata
+    # above, so scrub any stale replay keys the PREVIOUS tool left (Hard
+    # Rule #1: a leaked command_id/preset would mislabel this edit), then
+    # stamp graxpert's own explicitly. Both callers (dialog + headless drop)
+    # thread replay_preset.
+    for _k in ("command_id", "cid", "preset", "preset_dict"):
+        base_meta.pop(_k, None)
+    base_meta["command_id"] = "graxpert"
+    if replay_preset:
+        base_meta["preset"] = dict(replay_preset)
+
     # 4) apply to the target doc
     try:
         target_doc.apply_edit(
@@ -808,4 +825,3 @@ def _fallback_read_float01(path: str) -> np.ndarray | None:
         if mx > 5.0:
             arr = arr / mx
     return arr
-

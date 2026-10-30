@@ -1,4 +1,4 @@
-# pro/mfdeconv.py non-sport normal version
+#saspro/mfdeconv.py non-sport normal version
 from __future__ import annotations
 import os, sys
 import math
@@ -1916,7 +1916,7 @@ def _safe_inference_context():
     if cm is None:
         return torch.no_grad
 
-    # Probe inference_mode once; if it explodes on this build, fall back.
+    #sasprobe inference_mode once; if it explodes on this build, fall back.
     try:
         with cm():
             pass
@@ -3237,6 +3237,7 @@ def multiframe_deconv_normal_rebuild(
             iter_dir = _iter_folder(out_path)
             if rejection_strength not in (0.0, 1.0):
                 iter_dir = iter_dir + f"_{run_label}"
+            os.makedirs(iter_dir, exist_ok=True)    
             status_cb(f"MFDeconv: Intermediate outputs ({run_label}) → {iter_dir}")
             try:
                 hdr0_seed = _safe_primary_header(paths[0])

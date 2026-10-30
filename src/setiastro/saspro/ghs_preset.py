@@ -1,4 +1,4 @@
-# pro/ghs_preset.py
+#saspro/ghs_preset.py
 from __future__ import annotations
 from typing import Dict, List, Tuple
 import numpy as np
@@ -216,11 +216,18 @@ def apply_ghs_via_preset(main_window, doc, preset: Dict):
         "mask_blend": "m*out + (1-m)*src",
     }
 
-    doc.apply_edit(
-        out01.astype(np.float32, copy=False),
-        metadata=meta,
-        step_name=step,
-    )
+    step = f"Hyperbolic Stretch ({_short_label(params.get('function', ''), _dlg().GhsDialogPro)})"
+    meta = {
+        "step_name": step,
+        "command_id": "ghs",
+        "preset": dict(params),
+        "ghs": params,
+        "masked": bool(mid),
+        "mask_id": mid,
+        "mask_name": mname,
+        "mask_blend": "m*out + (1-m)*src",
+    }
+    doc.apply_edit(out01.astype(np.float32, copy=False), metadata=meta, step_name=step)
 
 
 # ---------- open dialog seeded from preset ----------

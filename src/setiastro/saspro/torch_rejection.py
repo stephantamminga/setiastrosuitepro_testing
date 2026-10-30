@@ -1,6 +1,7 @@
 # src/setiastro/saspro/torch_rejection.py
 from __future__ import annotations
 import contextlib
+import math
 import os
 import threading
 import numpy as np
@@ -73,6 +74,31 @@ def _warn_dml_reduce_once():
         "to avoid a known torch-directml fallback bug (can return empty tensors).",
         RuntimeWarning
     )
+
+_FALLBACK_WARNED: set = set()
+
+def _warn_reduce_fallback_once(op: str, exc: BaseException):
+    """
+    Announce, once per op per process, that a native nan reducer failed and we
+    are on the sort-based fallback.
+
+    These fallbacks are correct but NOT free and not bit-identical to the native
+    kernels (notably _nanquantile's fallback rounds to the nearest order
+    statistic instead of interpolating). Swallowing the exception silently meant
+    a backend quietly degrading both speed and GPU/CPU parity with nothing in
+    the log to explain it.
+    """
+    if op in _FALLBACK_WARNED:
+        return
+    _FALLBACK_WARNED.add(op)
+    warnings.warn(
+        f"torch.{op} failed on this backend ({type(exc).__name__}: {exc}); "
+        f"using the sort-based fallback for the rest of this session. Results stay "
+        f"correct but are slower, and {op} results may differ from the CPU path by "
+        f"one order statistic.",
+        RuntimeWarning,
+    )
+
 
 def _cpu_reduce_then_back(torch, x, dim: int, op: str, q: float | None = None):
     """
@@ -171,8 +197,9 @@ def _nanmedian(torch, x, dim: int):
         if getattr(y, "numel", lambda: 1)() == 0:
             raise RuntimeError("nanmedian returned empty tensor")
         return y
-    except Exception:
+    except Exception as _exc:
         # Generic safe fallback (sort-based)
+        _warn_reduce_fallback_once("nanmedian", _exc)
         m = torch.isfinite(x)
         x2 = x.clone()
         x2[~m] = float("inf")
@@ -198,8 +225,9 @@ def _nanstd(torch, x, dim: int):
         if getattr(y, "numel", lambda: 1)() == 0:
             raise RuntimeError("nanstd returned empty tensor")
         return y
-    except Exception:
+    except Exception as _exc:
         # Fallback: compute nan-safe variance from sums
+        _warn_reduce_fallback_once("nanstd", _exc)
         m = torch.isfinite(x)
         cnt = m.sum(dim=dim).clamp_min(1)
         s1 = torch.where(m, x, torch.zeros_like(x)).sum(dim=dim)
@@ -224,8 +252,9 @@ def _nanquantile(torch, x, q: float, dim: int):
         if getattr(y, "numel", lambda: 1)() == 0:
             raise RuntimeError("nanquantile returned empty tensor")
         return y
-    except Exception:
+    except Exception as _exc:
         # Fallback: argsort finite values and take kth
+        _warn_reduce_fallback_once("nanquantile", _exc)
         m = torch.isfinite(x)
         x2 = x.clone()
         x2[~m] = float("inf")
@@ -302,29 +331,243 @@ def _force_fp32_policy(torch):
     except Exception:
         pass
 
-def _soft_outlier_weight(torch, z, threshold: float, mode: str = "quartic"):
-    """
-    Convert absolute z-score into a soft weight in [0,1].
+# ---------------------------------------------------------------------------
+# Rosner Generalized ESD critical values.
+# Shared by the GPU reducer here and the numpy reducer in stacking_suite so the
+# two paths cannot drift apart (the _rejection_gpu_ok() self-test compares them
+# element for element).
+# ---------------------------------------------------------------------------
 
-    z:
-      absolute standardized residuals
-    threshold:
-      values >= threshold get weight 0
-    mode:
-      "linear"  -> 1 - z/t
-      "quartic" -> (1 - (z/t)^2)^2
+def _norm_ppf(p: float) -> float:
     """
-    t = max(float(threshold), 1e-12)
-    u = (z / t).clamp_min(0.0)
+    Inverse standard normal CDF: Acklam's rational approximation plus one Halley
+    refinement against erfc, good to ~1e-15 relative. Only used when scipy is
+    unavailable (portable builds ship without it).
+    """
+    if not (0.0 < p < 1.0):
+        return float("-inf") if p <= 0.0 else float("inf")
 
-    if mode == "linear":
-        w = 1.0 - u
+    a = (-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+          1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00)
+    b = (-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+          6.680131188771972e+01, -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00)
+    d = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00)
+
+    p_low = 0.02425
+    if p < p_low:
+        q = math.sqrt(-2.0 * math.log(p))
+        x = ((((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+             / (((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)))
+    elif p <= 1.0 - p_low:
+        q = p - 0.5
+        r = q * q
+        x = ((((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q
+             / ((((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)))
     else:
-        # smoother falloff, less harsh near center
-        w = (1.0 - u * u).clamp_min(0.0)
-        w = w * w
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        x = -((((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+              / (((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)))
 
-    return torch.where(u < 1.0, w, torch.zeros_like(u))
+    try:
+        e = 0.5 * math.erfc(-x / math.sqrt(2.0)) - p
+        u = e * math.sqrt(2.0 * math.pi) * math.exp(0.5 * x * x)
+        x = x - u / (1.0 + 0.5 * x * u)
+    except (OverflowError, ValueError):
+        pass
+    return x
+
+
+def _betacf(a: float, b: float, x: float, itmax: int = 400, eps: float = 3e-16) -> float:
+    """Continued fraction for the incomplete beta function (modified Lentz)."""
+    tiny = 1e-300
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for m in range(1, itmax + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        de = d * c
+        h *= de
+        if abs(de - 1.0) < eps:
+            break
+    return h
+
+
+def _betainc_reg(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta I_x(a, b), double precision."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    lbt = (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+           + a * math.log(x) + b * math.log1p(-x))
+    bt = math.exp(lbt)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _betacf(a, b, x) / a
+    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+
+def _t_sf(t: float, df: float) -> float:
+    """Upper-tail probability P(T_df > t) for t >= 0. Exact to ~1e-14."""
+    if t <= 0.0:
+        return 0.5
+    v = float(df)
+    return 0.5 * _betainc_reg(0.5 * v, 0.5, v / (v + t * t))
+
+
+def _t_ppf(p: float, df: float) -> float:
+    """
+    Student-t quantile, scipy-free. Inverts the exact survival function by
+    bracketing and bisection, seeded from the normal quantile.
+
+    Cornish-Fisher was the obvious cheap choice here and is wrong where it
+    matters most: at df = 1 (a 3-frame stack) it understates the 0.00135 cutoff
+    by 59%, and it errs LOW, so small stacks would reject far more than the
+    nominal threshold. This is exact at every df instead, and the result is
+    memoised per integration run, so the cost is irrelevant.
+    """
+    if not (0.0 < p < 1.0):
+        return float("-inf") if p <= 0.0 else float("inf")
+    if p == 0.5:
+        return 0.0
+    if p < 0.5:
+        return -_t_ppf(1.0 - p, df)
+
+    v = float(df)
+    if v <= 0.0:
+        return float("nan")
+    if v > 1e7:                       # numerically indistinguishable from normal
+        return _norm_ppf(p)
+
+    target = 1.0 - p                  # desired upper-tail probability
+    hi = max(_norm_ppf(p), 1.0)
+    for _ in range(200):              # grow until the tail is thinner than target
+        if _t_sf(hi, v) <= target:
+            break
+        hi *= 2.0
+    else:
+        return hi
+    lo = 0.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if mid <= lo or mid >= hi:    # exhausted double precision
+            break
+        if _t_sf(mid, v) > target:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+_ESD_CRIT_CACHE: dict = {}
+_ESD_CRIT_LOCK = threading.Lock()
+
+
+def esd_critical_values(F: int, threshold: float, *, bonferroni: bool = False) -> np.ndarray:
+    """
+    Critical values lambda_n for Rosner's Generalized ESD, indexed by the number
+    of still-active samples n (0..F). Entries for n < 3 are +inf, which disables
+    the test: a two-point sample has no leave-one-out scale estimate.
+
+    The statistic these are compared against is the EXTERNALLY studentized
+    extreme deviate,
+
+        t = (x_c - mean_loo) / (s_loo * sqrt(1 + 1/(n-1)))   ~  t_{n-2}
+
+    where x_c is the active sample furthest from the active mean and mean_loo /
+    s_loo are computed with x_c held out. Under the null that is an exact
+    Student-t, so the critical value is just a t quantile -- no need for the
+    internally studentized form and its (n-1)/sqrt(n(n-2+t^2)) conversion.
+
+    `threshold` is the UI "sigma" control, converted to a one-sided normal tail
+    probability alpha = P(Z > threshold), so threshold=3 gives alpha ~ 1.35e-3 --
+    what a user reading the control as "3 sigma" expects for one observation.
+
+    bonferroni chooses WHICH error rate that alpha controls, and the two answers
+    are both valid tests of different hypotheses:
+
+      False (default) -- alpha is the PER-FRAME false-rejection rate. A clean
+        frame has ~alpha chance of being clipped, independent of stack depth,
+        which is what the "sigma" label on the control promises.
+
+      True -- Rosner's published GESD. alpha is spread over the n candidates
+        being maximised at this step (p_eff = alpha / n), so it becomes the
+        FAMILY-WISE rate: the chance that ANY frame at that pixel is falsely
+        flagged. Formally the stricter test -- the deviate under test really is
+        the largest of n, not a pre-chosen one.
+
+    The default is False because the power cost of True is severe on exactly the
+    stacks SASpro users build. Measured on synthetic 10-sigma-noise stacks with
+    one injected outlier, detection rate for a 4-sigma outlier:
+
+        F=16   69% -> 14%      F=64   99.6% -> 16%      F=245   100% -> 1.2%
+
+    i.e. with the correction on, marginal cosmic hits and faint trails on a deep
+    stack stop being rejected at all, while the per-frame false-rejection rate
+    collapses to 0.001% -- far stricter than the 0.27% the control advertises.
+    Set stacking/esd_bonferroni = true if you want the literature test.
+
+    Results are memoised: F and the threshold are constant for a whole
+    integration run, so this would otherwise re-run F scipy t.ppf calls for
+    every tile.
+    """
+    F = int(F)
+    thr = float(threshold)
+    _key = (F, thr, bool(bonferroni))
+    with _ESD_CRIT_LOCK:
+        _hit = _ESD_CRIT_CACHE.get(_key)
+    if _hit is not None:
+        return _hit.copy()
+
+    crit = np.full(max(F + 1, 1), float("inf"), dtype=np.float32)
+
+    try:
+        from scipy import stats as _sstats
+        p_one = float(_sstats.norm.sf(thr))
+        _tppf = lambda q, df: float(_sstats.t.ppf(q, df))
+    except Exception:
+        p_one = 0.5 * math.erfc(thr / math.sqrt(2.0))
+        _tppf = _t_ppf
+
+    # keep the tail probability representable; thr beyond ~7 sigma underflows
+    p_one = min(max(p_one, 1e-12), 0.49)
+
+    for nn in range(3, F + 1):
+        p_eff = max((p_one / nn) if bonferroni else p_one, 1e-15)
+        lam = _tppf(1.0 - p_eff, nn - 2)
+        if lam is not None and np.isfinite(lam) and lam > 0.0:
+            crit[nn] = np.float32(lam)
+
+    with _ESD_CRIT_LOCK:
+        if len(_ESD_CRIT_CACHE) > 64:
+            _ESD_CRIT_CACHE.clear()
+        _ESD_CRIT_CACHE[_key] = crit
+    return crit.copy()
 
 # ---------------------------------------------------------------------------
 # GPU Calibration Pipeline — dark sub, flat div, cosmetic correction
@@ -342,6 +585,80 @@ def _upload_calibration_frame(torch, dev, arr: np.ndarray):
     return torch.from_numpy(a).to(dev, dtype=torch.float32, non_blocking=True)
 
 
+# ---------------------------------------------------------------------------
+# Flat-build GPU calibration prep
+# ---------------------------------------------------------------------------
+# The stacking suite's master-flat tile loop used to do three big CPU passes
+# over the (N, th, tw, C) stack right before uploading it to the GPU reducer:
+#   1. dark subtract (in-place)
+#   2. clip at 0
+#   3. per-frame scale multiply (one scalar per frame, or 4 per frame for Bayer)
+#
+# All three run perfectly well on the device while ts is resident. The hook
+# below lets the caller push a group-level dark + per-frame scales ONCE, keyed
+# by `group_key`; subsequent tiles pass the same key and skip the CPU prep.
+# The device-side prep runs inline in _torch_reduce_tile_impl right after the
+# ts upload, so the reducer never sees the "raw" stack — it sees the fully
+# calibrated one.
+# ---------------------------------------------------------------------------
+
+_FLAT_GROUP_CTX: dict = {}   # group_key -> {"dark_t", "scales_t", "bayer_pattern", "p2i"}
+_FLAT_GROUP_LOCK = threading.RLock()
+
+
+def _bayer_p2i(pat: str):
+    """CFA parity → index into the (R, G1, G2, B) scales lane.
+    Matches _apply_bayer_scales_stack_inplace in stacking_suite.py."""
+    pat = (pat or "RGGB").strip().upper()
+    if pat == "RGGB":
+        return [[0, 1], [2, 3]]
+    if pat == "BGGR":
+        return [[3, 1], [2, 0]]
+    if pat == "GRBG":
+        return [[1, 0], [3, 2]]
+    return [[1, 3], [0, 2]]   # GBRG
+
+
+def _build_flat_group_ctx(torch, dev, dark_full_np, scales_np, bayer_pattern):
+    """Upload per-group calibration data once; each tile call then slices
+    the dark on-device and multiplies by the per-frame scale."""
+    ctx = {}
+    if dark_full_np is not None:
+        # Reuse _upload_calibration_frame's layout handling: it always
+        # returns a (C, H_full, W_full) float32 device tensor.
+        ctx["dark_t"] = _upload_calibration_frame(torch, dev, dark_full_np)
+    if scales_np is not None:
+        s = np.ascontiguousarray(np.asarray(scales_np, dtype=np.float32))
+        ctx["scales_t"] = torch.from_numpy(s).to(dev, dtype=torch.float32, non_blocking=False)
+    pat = None
+    if bayer_pattern:
+        pat = (bayer_pattern or "").strip().upper()
+        if pat not in ("RGGB", "BGGR", "GRBG", "GBRG"):
+            pat = "RGGB"
+    ctx["bayer_pattern"] = pat
+    if pat:
+        ctx["p2i"] = _bayer_p2i(pat)
+    return ctx
+
+
+def release_flat_group_ctx(group_key):
+    """Drop a group's cached device tensors. The stacking suite calls this
+    once after a flat group's final tile so the next group's dark can slot
+    in without the previous one holding onto VRAM. A follow-up
+    torch.cuda.empty_cache() is cheap and keeps the small-card headroom
+    the integrator and cosmetic pass both depend on."""
+    if group_key is None:
+        return
+    with _FLAT_GROUP_LOCK:
+        _FLAT_GROUP_CTX.pop(group_key, None)
+    try:
+        torch = _TORCH
+        if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def calibration_pipeline_gpu(
     light_np: np.ndarray,
     dark_t,                          # (C,H,W) tensor on GPU or None
@@ -351,6 +668,7 @@ def calibration_pipeline_gpu(
     cold_sigma: float = 3.0,
     apply_cosmetic: bool = True,
     bayer_pattern: str | None = None,
+    protect_sigma: float = 5.0,
 ) -> np.ndarray:
     """
     Full per-frame calibration pipeline on GPU:
@@ -411,6 +729,7 @@ def calibration_pipeline_gpu(
                 hot_sigma=hot_sigma,
                 cold_sigma=cold_sigma,
                 bayer_pattern=bayer_pattern,
+                protect_sigma=protect_sigma,
             )
 
     # ── back to CPU, restore original layout ─────────────────────────
@@ -425,157 +744,142 @@ def calibration_pipeline_gpu(
 # Module-level buffer cache — keyed by (device_str, H, W)
 _CC_BUFFERS: dict = {}
 
-
-def _get_cc_buffers(torch, dev, H, W):
-    """Allocate per-call cosmetic-correction scratch buffers.
-
-    Intentionally NOT cached module-side. The old persistent cache held
-    ~168 B/px (five/stacked/sorted_s + an int64 sort_idx at 8 B/px, etc.) —
-    ~4.4 GB on a 26 MP frame — resident for the entire calibration run. The
-    satellite trail CNN runs on the same GPU from the save thread and was
-    left with nothing. Returning a fresh dict lets every buffer free by
-    refcount the moment _cosmetic_correction_tensor returns, so the memory
-    is back in the allocator pool before satellite runs.
-    """
-    return {
-        "five":         torch.empty((5, H, W), device=dev, dtype=torch.float32),
-        "stacked":      torch.empty((8, H, W), device=dev, dtype=torch.float32),
-        "sorted_s":     torch.empty((8, H, W), device=dev, dtype=torch.float32),
-        "sort_idx":     torch.empty((8, H, W), device=dev, dtype=torch.int64),
-        "m5":           torch.empty((H, W),    device=dev, dtype=torch.float32),
-        "hot_thresh":   torch.empty((H, W),    device=dev, dtype=torch.float32),
-        "cold_thresh":  torch.empty((H, W),    device=dev, dtype=torch.float32),
-        "avg3x3":       torch.empty((H, W),    device=dev, dtype=torch.float32),
-        "replacement":  torch.empty((H, W),    device=dev, dtype=torch.float32),
-        "ones_k":       torch.ones(1, 1, 3, 3, device=dev, dtype=torch.float32),
-    }
-
-
 def _clear_cc_buffers():
-    """Free all cached cosmetic correction buffers. Call after calibration run."""
-    _CC_BUFFERS.clear()
+    """No-op — retained for callers from the persistent-buffer era.
+    The tiled cosmetic pass allocates scratch locally and frees it by
+    refcount per frame, so there is nothing to clear."""
+    pass
 
-
-def _cosmetic_correction_tensor(torch, dev, t, hot_sigma, cold_sigma, bayer_pattern=None):
+def _cosmetic_correction_tensor(torch, dev, t, hot_sigma, cold_sigma,
+                                bayer_pattern=None, protect_sigma=5.0):
     """
     Two-pass cosmetic correction on a (C,H,W) tensor already on device.
-    Uses pre-allocated persistent buffers to avoid per-frame cudaMalloc overhead.
-    Stride = 2 for Bayer (same-color neighbors), 1 otherwise.
+    Detection is whole-frame; the neighbour-median sort is tiled over row
+    strips so peak VRAM tracks strip size, not frame size (a 61 MP frame
+    otherwise needs ~15-20 GB of transient scratch for the sort alone).
+    Stride = 2 for Bayer (same-colour neighbours), 1 otherwise.
     """
     import torch.nn.functional as F
+    from setiastro.saspro.cosmetic_metal import median5_along_dim0, sort8_along_dim0
 
     s = 2 if bayer_pattern else 1
+    pad_amt = s
     C, H, W = t.shape
-    buf = _get_cc_buffers(torch, dev, H, W)
     result = torch.empty_like(t)
 
-    # strided sample for fast avgDev — full median on 46M pixels is slow
-    # 1% sample is accurate enough for thresholding
-    _stride = max(1, min(H, W) // 100)
+    _stride = max(1, min(H, W) // 100)   # 1% sample for background stats
+
+    # ── pick a row-strip height that bounds the sort scratch ──────────
+    # the strip's neighbour trio dominates: stacked(f32) + sorted(f32) +
+    # a transient int64 sort index = 8*(4+4+8) = 128 B/px; add slack for
+    # the int64 gather temporaries → budget at ~200 B/px.
+    bytes_per_row = W * 200
+    if dev.type == "cuda":
+        free_b, _tot = torch.cuda.mem_get_info()
+        budget = min(int(free_b * 0.4), 2 * 1024**3)
+    else:
+        budget = 768 * 1024**2
+    strip_h = int(max(64, min(H, budget // max(bytes_per_row, 1))))
+
+    # strip-sized neighbour buffers, reused across strips (last strip
+    # slices a [:sh] view). NOTE: no int64 sort_idx buffer — torch.sort's
+    # index is taken functionally and freed immediately each strip.
+    stacked  = torch.empty((8, strip_h, W), device=dev, dtype=torch.float32)
+    sorted_s = torch.empty((8, strip_h, W), device=dev, dtype=torch.float32)
+
+    offsets = [
+        (-s, -s), (-s,  0), (-s, +s),
+        ( 0, -s),           ( 0, +s),
+        (+s, -s), (+s,  0), (+s, +s),
+    ]
 
     for ci in range(C):
-        plane = t[ci]  # (H, W)
+        plane = t[ci]
 
-        # ── fast avgDev via strided sample ────────────────────────────
-        sample  = plane[::_stride, ::_stride]
-        med_val = sample.median()
-        avg_dev = (sample - med_val).abs().mean()
-        avg_dev_f = float(avg_dev)
+        # ── background stats (strided sample) ─────────────────────────
+        sample     = plane[::_stride, ::_stride]
+        # background stats on the strided sample, on the HOST: it's ~1e-4 of
+        # the frame and this avoids torch.median (slow / CPU-fallback on MPS).
+        _s        = sample.reshape(-1).to('cpu', dtype=torch.float32).numpy()
+        med_f     = float(np.median(_s))
+        _absdev   = np.abs(_s - med_f)
+        avg_dev_f = float(_absdev.mean())
+        robust_sig= max(1.4826 * float(np.median(_absdev)), 1e-8)
+        del _s, _absdev
         del sample
 
-        # ── pad plane once — reused for both m5 and neighbor lookups ──
-        pad_amt = s
-        p = F.pad(
-            plane.unsqueeze(0).unsqueeze(0),
-            (pad_amt, pad_amt, pad_amt, pad_amt),
-            mode='reflect'
-        ).squeeze(0).squeeze(0)
-        # p: (H + 2s, W + 2s)
+        # ── reflect-pad the plane once (whole frame) ──────────────────
+        p = F.pad(plane.unsqueeze(0).unsqueeze(0),
+                  (pad_amt, pad_amt, pad_amt, pad_amt),
+                  mode="reflect").squeeze(0).squeeze(0)          # (H+2s, W+2s)
 
-        # ── m5: median of {N, S, E, W, center} ───────────────────────
-        buf["five"][0].copy_(p[0:H,                 pad_amt:W+pad_amt])        # N
-        buf["five"][1].copy_(p[2*pad_amt:H+2*pad_amt, pad_amt:W+pad_amt])      # S
-        buf["five"][2].copy_(p[pad_amt:H+pad_amt,   0:W])                      # W
-        buf["five"][3].copy_(p[pad_amt:H+pad_amt,   2*pad_amt:W+2*pad_amt])    # E
-        buf["five"][4].copy_(plane)                                             # center
-        buf["m5"].copy_(buf["five"].median(dim=0).values)
-        m5 = buf["m5"]
+        # ── m5: cross-median of {N,S,E,W,center} (whole frame) ────────
+        five = torch.stack((
+            p[0:H,                   pad_amt:W+pad_amt],          # N
+            p[2*pad_amt:H+2*pad_amt, pad_amt:W+pad_amt],          # S
+            p[pad_amt:H+pad_amt,     0:W],                        # W
+            p[pad_amt:H+pad_amt,     2*pad_amt:W+2*pad_amt],      # E
+            plane,                                                # center
+        ), dim=0)
+        m5 = median5_along_dim0(five, torch)  # 5-elt median, min/max only
+        del five
 
-        # ── detection thresholds ──────────────────────────────────────
-        scale_f = max(avg_dev_f * float(hot_sigma), avg_dev_f)
-        torch.add(m5, scale_f, out=buf["hot_thresh"])
-        torch.sub(m5, avg_dev_f * float(cold_sigma), out=buf["cold_thresh"])
+        # ── detection + structure gate (whole frame) ──────────────────
+        scale_f     = max(avg_dev_f * float(hot_sigma), avg_dev_f)
+        hot_thresh  = m5 + scale_f
+        cold_thresh = m5 - avg_dev_f * float(cold_sigma)
 
-        hot_candidates = plane > buf["hot_thresh"]
-        cold_map       = plane < buf["cold_thresh"]
+        hot_candidates = plane > hot_thresh
+        cold_map       = plane < cold_thresh
+        #sasprotect resolved signal: a lone hot pixel can't move m5, a star
+        # core can. m5 is stride-s so this stays same-colour for Bayer.
+        protect_thr = med_f + float(protect_sigma) * robust_sig
+        structure   = m5 > protect_thr
+        flagged     = (hot_candidates & (~structure)) | cold_map
+        del hot_candidates, cold_map, structure, hot_thresh, cold_thresh
 
-        # ── star guard: 3x3 neighbor average (stride-1 always) ───────
-        plane_4d  = plane.unsqueeze(0).unsqueeze(0)
-        plane_pad1 = F.pad(plane_4d, (1, 1, 1, 1), mode='reflect')
-        box3x3 = F.conv2d(plane_pad1, buf["ones_k"]).squeeze(0).squeeze(0)
-        torch.sub(box3x3, plane, out=buf["avg3x3"])
-        buf["avg3x3"].div_(8.0)
-        del box3x3, plane_pad1, plane_4d
+        # padded flagged mask for neighbour lookups (whole frame)
+        fp = F.pad(flagged.float().unsqueeze(0).unsqueeze(0),
+                   (pad_amt, pad_amt, pad_amt, pad_amt),
+                   mode="reflect").squeeze(0).squeeze(0)
 
-        star_guard = buf["avg3x3"] < (m5 + avg_dev_f * 0.5)
-        hot_map    = hot_candidates & star_guard
-        flagged    = hot_map | cold_map
+        # ── replacement, tiled over row strips ────────────────────────
+        for y0 in range(0, H, strip_h):
+            y1 = min(H, y0 + strip_h)
+            sh = y1 - y0
+            st = stacked[:, :sh]          # views (contiguous last strip is short)
+            so = sorted_s[:, :sh]
 
-        del hot_candidates, cold_map, star_guard, hot_map
+            p_strip  = p[y0 : y1 + 2 * pad_amt]     # (sh+2s, W+2s)
+            fp_strip = fp[y0 : y1 + 2 * pad_amt]
 
-        # ── pad flagged mask using same pad_amt ───────────────────────
-        fp = F.pad(
-            flagged.float().unsqueeze(0).unsqueeze(0),
-            (pad_amt, pad_amt, pad_amt, pad_amt),
-            mode='reflect'
-        ).squeeze(0).squeeze(0)
+            for i, (dy, dx) in enumerate(offsets):
+                r0, c0 = dy + pad_amt, dx + pad_amt
+                nbr_vals    = p_strip[r0:r0 + sh, c0:c0 + W]
+                nbr_flagged = fp_strip[r0:r0 + sh, c0:c0 + W] > 0.5
+                torch.where(nbr_flagged,
+                            nbr_vals.new_full((), float("inf")),
+                            nbr_vals, out=st[i])
 
-        # ── build 8-neighbor stack directly into pre-allocated buffer ─
-        # flagged neighbors → inf so they sort to the end
-        offsets = [
-            (-s, -s), (-s,  0), (-s, +s),
-            ( 0, -s),           ( 0, +s),
-            (+s, -s), (+s,  0), (+s, +s),
-        ]
+            # flagged neighbours are +inf and sort to the top; index is
+            # transient and freed here (strip-sized, not frame-sized)
+            so.copy_(st)
+            sort8_along_dim0(so, torch)   # 8-elt sort, min/max only (no torch.sort)
 
-        for i, (dy, dx) in enumerate(offsets):
-            ny0, ny1 = dy + pad_amt, dy + pad_amt + H
-            nx0, nx1 = dx + pad_amt, dx + pad_amt + W
-            nbr_vals    = p[ny0:ny1, nx0:nx1]
-            nbr_flagged = fp[ny0:ny1, nx0:nx1] > 0.5
-            torch.where(nbr_flagged, nbr_vals.new_full((), float('inf')),
-                        nbr_vals, out=buf["stacked"][i])
+            raw_count = (st < float("inf")).sum(dim=0)   # clean neighbours
+            vc        = raw_count.clamp(min=1)
+            mid_lo    = ((vc - 1) // 2).unsqueeze(0)
+            mid_hi    = (vc // 2).unsqueeze(0)
+            rep = 0.5 * (so.gather(0, mid_lo).squeeze(0) +
+                         so.gather(0, mid_hi).squeeze(0))
+            # all 8 neighbours flagged → fall back to the cross median
+            rep = torch.where(raw_count == 0, m5[y0:y1], rep)
 
-        del fp, p
+            torch.where(flagged[y0:y1], rep, plane[y0:y1], out=result[ci][y0:y1])
 
-        # ── sort to find median of clean neighbors ────────────────────
-        torch.sort(buf["stacked"], dim=0, out=(buf["sorted_s"], buf["sort_idx"]))
-
-        # count clean (non-inf) neighbors per pixel
-        valid_count = (buf["stacked"] < float('inf')).sum(dim=0).clamp(min=1)
-
-        mid_lo = ((valid_count - 1) // 2).long()
-        mid_hi = (valid_count       // 2).long()
-
-        rep_lo = buf["sorted_s"].gather(0, mid_lo.unsqueeze(0)).squeeze(0)
-        rep_hi = buf["sorted_s"].gather(0, mid_hi.unsqueeze(0)).squeeze(0)
-
-        torch.add(rep_lo, rep_hi, out=buf["replacement"])
-        buf["replacement"].mul_(0.5)
-
-        # fallback to m5 where all 8 neighbors were also flagged
-        all_flagged = valid_count == 0
-        torch.where(all_flagged, m5, buf["replacement"], out=buf["replacement"])
-
-        del valid_count, mid_lo, mid_hi, rep_lo, rep_hi, all_flagged
-
-        # ── apply correction only to flagged pixels ───────────────────
-        torch.where(flagged, buf["replacement"], plane, out=result[ci])
-
-        del flagged
+        del p, fp, m5, flagged
 
     return result
-
 
 def prepare_calibration_frame(
     arr: np.ndarray,
@@ -616,6 +920,7 @@ def cosmetic_correction_gpu(
     hot_sigma: float = 3.0,
     cold_sigma: float = 3.0,
     bayer_pattern: str | None = None,
+    protect_sigma: float = 5.0,
 ) -> np.ndarray:
     """
     Two-pass cosmetic correction on GPU.
@@ -644,6 +949,13 @@ def cosmetic_correction_gpu(
 
             med_val = plane.median()
             avg_dev = (plane - med_val).abs().mean()
+            # robust background sigma for the structure gate (sampled — a
+            # full MAD on 40M+ px is wasteful; 1% is plenty for a threshold)
+            _gs = max(1, min(H, W) // 100)
+            robust_sigma = torch.clamp(
+                1.4826 * (plane[::_gs, ::_gs] - med_val).abs().median(),
+                min=1e-8,
+            )
 
             # pad by stride amount so border pixels are handled cleanly
             p = torch.nn.functional.pad(
@@ -668,63 +980,87 @@ def cosmetic_correction_gpu(
             hot_candidates = plane > hot_thresh
             cold_map       = plane < cold_thresh
 
-            # star guard: 3x3 (or 5x5 for Bayer to cover same stride) neighbor average
-            guard_pad = s * 2 if bayer_pattern else 1
-            ones_k = torch.ones(1, 1, 3, 3, device=dev, dtype=torch.float32)
-            plane_4d  = plane.unsqueeze(0).unsqueeze(0)
-            plane_pad = torch.nn.functional.pad(plane_4d, (1, 1, 1, 1), mode='reflect')
-            box3x3    = torch.nn.functional.conv2d(plane_pad, ones_k).squeeze(0).squeeze(0)
-            avg3x3_neighbors = (box3x3 - plane) / 8.0
-            star_guard = avg3x3_neighbors < (m5 + avg_dev * 0.5)
-            hot_map    = hot_candidates & star_guard
+            # ── structure gate: protect resolved signal (stars / nebula) ──
+            # A hot pixel is a lone spike and cannot move a local median; a
+            # star or nebula core has spatial extent, so its local median is
+            # genuinely elevated. Gate the hot pass on m5 (the 5-px cross
+            # median, already robust to an isolated hot centre) vs a global
+            # robust background: patches whose median clears protect_sigma
+            # sigmas above background are real signal and are left untouched.
+            # NB: m5 uses stride-s neighbours, so this stays same-colour for
+            # Bayer automatically — unlike the old stride-1 3x3 mean, which
+            # averaged across CFA colours.
+            protect_thr = med_val + float(protect_sigma) * robust_sigma
+            structure   = m5 > protect_thr
+            hot_map     = hot_candidates & (~structure)
 
             flagged = hot_map | cold_map
 
-            # 8 neighbors at stride s
-            offsets = [
-                (-s, -s), (-s,  0), (-s, +s),
-                ( 0, -s),           ( 0, +s),
-                (+s, -s), (+s,  0), (+s, +s),
-            ]
+            # --- START OPTIMIZED SPARSE PROCESSING ---
+            # 1. Find the 1D coordinates of the bad pixels
+            fy, fx = torch.where(flagged)
+            
+            # Default state is the original uncorrected plane
+            result[ci] = plane.clone()
 
-            flagged_pad = torch.nn.functional.pad(
-                flagged.float().unsqueeze(0).unsqueeze(0),
-                (s, s, s, s), mode='reflect'
-            ).squeeze().bool()
+            # Only do the heavy math if we actually found bad pixels
+            if len(fy) > 0:
+                # 8 neighbors at stride s
+                offsets = [
+                    (-s, -s), (-s,  0), (-s, +s),
+                    ( 0, -s),           ( 0, +s),
+                    (+s, -s), (+s,  0), (+s, +s),
+                ]
 
-            plane_pad2 = torch.nn.functional.pad(
-                plane.unsqueeze(0).unsqueeze(0),
-                (s, s, s, s), mode='reflect'
-            ).squeeze()
+                flagged_pad = torch.nn.functional.pad(
+                    flagged.float().unsqueeze(0).unsqueeze(0),
+                    (s, s, s, s), mode='reflect'
+                ).squeeze().bool()
 
-            neighbor_stack = []
-            for dy, dx in offsets:
-                ny0, ny1 = dy + s, dy + s + H
-                nx0, nx1 = dx + s, dx + s + W
-                nbr_vals    = plane_pad2[ny0:ny1, nx0:nx1]
-                nbr_flagged = flagged_pad[ny0:ny1, nx0:nx1]
-                nbr_clean   = torch.where(
-                    nbr_flagged,
-                    torch.full_like(nbr_vals, float('nan')),
-                    nbr_vals
-                )
-                neighbor_stack.append(nbr_clean)
+                plane_pad2 = torch.nn.functional.pad(
+                    plane.unsqueeze(0).unsqueeze(0),
+                    (s, s, s, s), mode='reflect'
+                ).squeeze()
 
-            stacked     = torch.stack(neighbor_stack, dim=0)
-            stacked_inf = torch.where(torch.isnan(stacked),
-                                      torch.full_like(stacked, float('inf')), stacked)
-            sorted_s, _ = stacked_inf.sort(dim=0)
+                # Shift coordinates into the padded array space
+                fy_pad = fy + s
+                fx_pad = fx + s
 
-            valid_count = (~torch.isnan(stacked)).sum(dim=0).clamp(min=1)
-            mid_lo = ((valid_count - 1) // 2).long()
-            mid_hi = (valid_count       // 2).long()
+                neighbor_stack = []
+                for dy, dx in offsets:
+                    # Gather ONLY the neighbors for the flagged pixels (returns a 1D tensor of size N)
+                    nbr_vals = plane_pad2[fy_pad + dy, fx_pad + dx]
+                    nbr_flagged = flagged_pad[fy_pad + dy, fx_pad + dx]
+                    
+                    nbr_clean = torch.where(
+                        nbr_flagged,
+                        torch.full_like(nbr_vals, float('nan')),
+                        nbr_vals
+                    )
+                    neighbor_stack.append(nbr_clean)
 
-            rep_lo      = sorted_s.gather(0, mid_lo.unsqueeze(0)).squeeze(0)
-            rep_hi      = sorted_s.gather(0, mid_hi.unsqueeze(0)).squeeze(0)
-            replacement = (rep_lo + rep_hi) * 0.5
-            replacement = torch.where(torch.isinf(replacement), m5, replacement)
+                # Stack is now (8, N) instead of (8, H, W). Massive memory savings.
+                stacked = torch.stack(neighbor_stack, dim=0)
+                
+                stacked_inf = torch.where(torch.isnan(stacked),
+                                          torch.full_like(stacked, float('inf')), stacked)
+                sorted_s, _ = stacked_inf.sort(dim=0)
 
-            result[ci] = torch.where(flagged, replacement, plane)
+                valid_count = (~torch.isnan(stacked)).sum(dim=0).clamp(min=1)
+                mid_lo = ((valid_count - 1) // 2).long()
+                mid_hi = (valid_count       // 2).long()
+
+                rep_lo      = sorted_s.gather(0, mid_lo.unsqueeze(0)).squeeze(0)
+                rep_hi      = sorted_s.gather(0, mid_hi.unsqueeze(0)).squeeze(0)
+                replacement = (rep_lo + rep_hi) * 0.5
+                
+                # If all 8 neighbors were bad (inf), fall back to the local median m5
+                m5_bad = m5[fy, fx]
+                replacement = torch.where(torch.isinf(replacement), m5_bad, replacement)
+
+                # Patch only the bad pixels in the result
+                result[ci][fy, fx] = replacement
+            # --- END OPTIMIZED SPARSE PROCESSING ---
 
     out = result.cpu().numpy().transpose(1, 2, 0)
     if was_gray:
@@ -747,6 +1083,14 @@ def _mad_sigma(torch, x_nan, med, dim: int):
     plane trails / cosmic rays inflating the scale estimate."""
     mad = _nanmedian(torch, (x_nan - med.unsqueeze(dim)).abs(), dim=dim)
     return (1.4826 * mad).clamp_min(1e-10)
+
+
+# Shared convergence policy for the iterative reducers. Exported so the numpy
+# mirrors in stacking_suite use exactly the same rule — if the two paths
+# disagree on when to stop iterating, _rejection_gpu_ok() can see a mismatch on
+# a borderline pixel and silently drop the whole integration to CPU.
+_CONVERGENCE_MIN_ITERS = 5     # below this, the device sync costs more than it saves
+_WINSOR_CONV_TOL = 5e-4        # relative change in sigma, PixInsight's threshold
 
 
 def _winsorized_center_scale(torch, ts, valid, iterations: int = 3, winsor_k: float = 1.5):
@@ -772,7 +1116,17 @@ def _winsorized_center_scale(torch, ts, valid, iterations: int = 3, winsor_k: fl
     med = _nanmedian(torch, x, dim=0)
     sigma = _mad_sigma(torch, x, med, dim=0)
     cnt = valid.sum(dim=0).clamp_min(1).to(ts.dtype)
-    for _ in range(max(1, int(iterations))):
+    n_it = max(1, int(iterations))
+    # Convergence exit (PixInsight's rule: stop once sigma moves by less than
+    # 0.05% relative). Only armed for deep iteration counts: the check needs a
+    # device->host sync, which drains the queue and breaks the overlap between
+    # this tile's compute and the next tile's upload. At the default of 3 that
+    # sync cannot pay for itself, so the loop just runs out; at 8 or 10 it
+    # typically exits after 3 and saves most of the pass. The numpy reducer in
+    # stacking_suite applies this identical rule so the two paths stay in
+    # lockstep for _rejection_gpu_ok().
+    check_conv = n_it >= _CONVERGENCE_MIN_ITERS
+    for it in range(n_it):
         lo = (med - winsor_k * sigma).unsqueeze(0)
         hi = (med + winsor_k * sigma).unsqueeze(0)
         # torch.minimum/maximum propagate NaN, so invalid lanes stay NaN
@@ -780,7 +1134,18 @@ def _winsorized_center_scale(torch, ts, valid, iterations: int = 3, winsor_k: fl
         med = _nanmedian(torch, xw, dim=0)
         mean_w = _masked_sum(torch, xw, valid, dim=0) / cnt
         var = _masked_sum(torch, (xw - mean_w.unsqueeze(0)) ** 2, valid, dim=0) / cnt
-        sigma = (1.134 * var.clamp_min(0.0).sqrt()).clamp_min(1e-10)
+        sigma_new = (1.134 * var.clamp_min(0.0).sqrt()).clamp_min(1e-10)
+
+        if check_conv and it + 1 < n_it:
+            rel = ((sigma_new - sigma).abs() / sigma.clamp_min(1e-10)).max()
+            sigma = sigma_new
+            try:
+                if float(rel) < _WINSOR_CONV_TOL:
+                    break
+            except Exception:
+                pass
+        else:
+            sigma = sigma_new
     return med, sigma
 
 
@@ -796,7 +1161,67 @@ def _weighted_mean_or(torch, ts, keep, w, fallback):
 # ---------------------------------------------------------------------------
 # Public GPU reducer – lazy-loads Torch, never decorates at import time
 # ---------------------------------------------------------------------------
-def torch_reduce_tile(
+def _finalize(torch, out, rej, reduce_rej_maps):
+    """Move a reducer result to the host.
+
+    Default (reduce_rej_maps=False): return (out_np, full_rej_np) exactly as
+    before — the full (F,H,W,C) or (F,H,W) boolean rejection map.
+
+    reduce_rej_maps=True: collapse the rejection map ON THE GPU to the only two
+    things the integrator actually accumulates — a per-pixel "any frame
+    rejected" mask and a per-pixel rejected-frame count — and copy back just
+    those two (H,W) arrays. That turns the per-band device->host transfer from
+    N*H*W*C bytes down to ~2*H*W, and moves the any()/sum() reduction off the
+    CPU's critical path. Use it whenever per-file rejection maps are NOT being
+    collected (the common case)."""
+    out_np = out.to(dtype=torch.float32).contiguous().cpu().numpy()
+    if not reduce_rej_maps:
+        return out_np, rej.cpu().numpy()
+    # collapse channels, then reduce over the frame axis, all on-device
+    rej_fhw = rej.any(dim=-1) if rej.dim() == 4 else rej          # (F,H,W)
+    rej_any = rej_fhw.any(dim=0).cpu().numpy()                    # (H,W) bool
+    rej_cnt = rej_fhw.sum(dim=0).to(torch.int32).cpu().numpy()    # (H,W) int32
+    return out_np, (rej_any, rej_cnt)
+
+
+DEBUG_INTEGRATION_ONLY = False   # <-- set True: reducer returns a ZEROED rejection map (out left untouched)
+
+
+def torch_reduce_tile(*args, **kwargs):
+    """Public entry point for the tile reducer.
+
+    When DEBUG_INTEGRATION_ONLY is True, the integrated tile is returned exactly
+    as computed, but the rejection map is replaced with an all-False array of the
+    same shape. This severs every downstream use of the per-tile rejection data
+    (accumulation, compositing, MEF layers) so we can tell whether the trail
+    contamination rides the rejection array (trails vanish) or is already baked
+    into the integrated result itself (trails persist)."""
+    out, rej = _torch_reduce_tile_impl(*args, **kwargs)
+    if DEBUG_INTEGRATION_ONLY:
+        import numpy as _np
+        # Leave the GPU self-test (_rejection_gpu_ok) alone: it feeds a tiny
+        # 5x1x1x1 probe and asserts the outlier IS rejected. If we zero that
+        # map the self-test 'fails' and integration silently drops to CPU.
+        # Only neuter the rejection map for real integration tiles (spatial
+        # area > 1); the 1x1 probe keeps its true map so GPU stays selected.
+        _ts0 = args[0] if args else kwargs.get("ts_np")
+        _is_selftest = False
+        try:
+            _shp = _np.asarray(_ts0).shape
+            if len(_shp) >= 3 and int(_shp[1]) * int(_shp[2]) <= 1:
+                _is_selftest = True
+        except Exception:
+            _is_selftest = False
+        if not _is_selftest:
+            if isinstance(rej, tuple):
+                _ra, _rc = rej
+                rej = (_np.zeros_like(_ra, dtype=bool), _np.zeros_like(_rc))
+            else:
+                rej = _np.zeros_like(_np.asarray(rej), dtype=bool)
+    return out, rej
+
+
+def _torch_reduce_tile_impl(
     ts_np: np.ndarray,
     weights_np: np.ndarray,
     *,
@@ -807,12 +1232,33 @@ def torch_reduce_tile(
     sigma_high: float = 2.5,
     trim_fraction: float = 0.1,
     esd_threshold: float = 3.0,
+    # False (default): the threshold is the per-frame false-rejection rate, which
+    # is what the UI's "sigma" control advertises. True: Rosner's published
+    # family-wise correction, which is formally stricter but loses most of its
+    # power against marginal outliers on deep stacks. See esd_critical_values.
+    esd_bonferroni: bool = False,
     biweight_constant: float = 6.0,
     modz_threshold: float = 3.5,
     comet_hclip_k: float = 1.30,
     comet_hclip_p: float = 25.0,
     ignore_zero_pixels: bool = True,
     forced_reject_mask_np: np.ndarray | None = None,
+    reduce_rej_maps: bool = False,
+    # ─── Optional GPU calibration pre-steps (master-flat build) ───────────
+    # When these are supplied, the reducer runs:
+    #   ts = ((ts - dark[y0:y0+H, x0:x0+W]) + pedestal).clamp_min(0) * scales
+    # on the DEVICE copy of ts, fusing the three CPU passes the master-flat
+    # tile loop used to do into one device-side pass. All five kwargs are
+    # ignored unless group_key is also set — that key names a per-group
+    # cache, so the dark + scales upload happens exactly once per group.
+    # Callers that don't need calibration (master dark build, image
+    # integration) pass nothing and get the original behaviour.
+    dark_full_np: np.ndarray | None = None,
+    pedestal: float = 0.0,
+    scales_np: np.ndarray | None = None,
+    bayer_pattern: str | None = None,
+    tile_origin: tuple = (0, 0),
+    group_key=None,
 ) -> tuple[np.ndarray, np.ndarray]:
 
     torch = _get_torch(prefer_cuda=True)
@@ -871,6 +1317,60 @@ def torch_reduce_tile(
 
     ts = torch.from_numpy(ts_np).to(dev, dtype=torch.float32, non_blocking=True)
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Optional: on-device calibration prep (dark-sub + clip + per-frame
+    # scale). Caller passes dark_full_np + scales_np + group_key the FIRST
+    # time it hits this group; subsequent tiles can keep passing them (the
+    # cache ignores them if ctx is already built) or pass None — the ctx
+    # keyed by group_key is what matters. release_flat_group_ctx(group_key)
+    # frees the device tensors after the group's final tile.
+    # ─────────────────────────────────────────────────────────────────────
+    if group_key is not None:
+        with _FLAT_GROUP_LOCK:
+            ctx = _FLAT_GROUP_CTX.get(group_key)
+            if ctx is None and (dark_full_np is not None or scales_np is not None):
+                ctx = _build_flat_group_ctx(torch, dev, dark_full_np, scales_np, bayer_pattern)
+                _FLAT_GROUP_CTX[group_key] = ctx
+        if ctx is not None:
+            y0_g = int(tile_origin[0])
+            x0_g = int(tile_origin[1])
+            with _safe_inference_ctx(torch), _no_amp_ctx(torch, dev):
+                dark_t = ctx.get("dark_t")
+                if dark_t is not None:
+                    # dark_t: (Cd, H_full, W_full); slice the tile view, no copy.
+                    d_slice = dark_t[:, y0_g:y0_g + H, x0_g:x0_g + W]
+                    if d_slice.shape[0] == 1 and C == 3:
+                        d_slice = d_slice.expand(3, H, W)
+                    # Reshape to (1, H, W, Cd) so it broadcasts over the F axis of ts.
+                    # In-place subtract keeps peak VRAM at 1× the stack size — a
+                    # non-in-place `ts = ts - d_bcast` would briefly hold two
+                    # copies, which OOMs the small cards the cosmetic pass also
+                    # has to share VRAM with.
+                    d_bcast = d_slice.permute(1, 2, 0).unsqueeze(0)
+                    ts.sub_(d_bcast)
+                    if pedestal != 0.0:
+                        ts.add_(float(pedestal))
+                    ts.clamp_min_(0.0)
+
+                st = ctx.get("scales_t")
+                if st is not None:
+                    if ctx.get("bayer_pattern"):
+                        # Bayer: one scale per CFA plane. Apply as 4 strided
+                        # in-place multiplies on the (F,H,W,1) stack — cheaper
+                        # than building a per-pixel scale tensor (which would
+                        # cost F*H*W*4 bytes of extra VRAM per tile).
+                        p2i = ctx["p2i"]
+                        ry = y0_g & 1
+                        rx = x0_g & 1
+                        # st shape: (F, 4)  ← one lane per [R, G1, G2, B]
+                        for py in (0, 1):
+                            for px in (0, 1):
+                                lane = p2i[(py + ry) & 1][(px + rx) & 1]
+                                ts[:, py::2, px::2, 0].mul_(st[:, lane].view(F, 1, 1))
+                    else:
+                        # non-Bayer: scales shape (F,) — per-frame scalar.
+                        ts.mul_(st.view(F, 1, 1, 1))
+
     weights_np = np.asarray(weights_np, dtype=np.float32)
     if weights_np.ndim == 0:
         weights_np = np.full((F,), float(weights_np), dtype=np.float32)
@@ -920,19 +1420,17 @@ def torch_reduce_tile(
                 raise ValueError(
                     f"forced_reject_mask_np shape {frm.shape} does not match tile (H,W)=({H},{W})"
                 )
-            frm = np.broadcast_to(frm[None, :, :, None], (F, H, W, C))
+            frm = frm[None, :, :, None]
 
         elif frm.ndim == 3:
             if frm.shape != (F, H, W):
                 raise ValueError(
                     f"forced_reject_mask_np shape {frm.shape} does not match (F,H,W)=({F},{H},{W})"
                 )
-            frm = np.broadcast_to(frm[:, :, :, None], (F, H, W, C))
+            frm = frm[:, :, :, None]
 
         elif frm.ndim == 4:
-            if frm.shape == (F, H, W, 1):
-                frm = np.broadcast_to(frm, (F, H, W, C))
-            elif frm.shape != (F, H, W, C):
+            if frm.shape not in ((F, H, W, 1), (F, H, W, C)):
                 raise ValueError(
                     f"forced_reject_mask_np shape {frm.shape} does not match "
                     f"(F,H,W,1) or (F,H,W,C)=({F},{H},{W},{C})"
@@ -942,7 +1440,10 @@ def torch_reduce_tile(
                 f"Unsupported forced_reject_mask_np ndim={frm.ndim} shape={frm.shape}"
             )
 
-        forced_reject = torch.from_numpy(np.array(frm, dtype=bool, order="C")).to(dev, dtype=torch.bool, non_blocking=False)
+        # Upload the mask at its own size: `valid & ~forced_reject` below
+        # broadcasts it on the device. Broadcasting on the host first cost
+        # F*H*W*C bytes per tile (186 MiB at 3766 frames x 16 x 1080 x 3).
+        forced_reject = torch.from_numpy(np.ascontiguousarray(frm)).to(dev, dtype=torch.bool, non_blocking=False)
 
     algo = algo_name
 
@@ -961,13 +1462,13 @@ def torch_reduce_tile(
             x = ts.masked_fill(~valid, float("nan"))
             out = _nanmedian(torch, x, dim=0)
             rej = forced_rej_map
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         if algo == "Comet Percentile (40th)":
             x = ts.masked_fill(~valid, float("nan"))
             out = _nanquantile(torch, x, 0.40, dim=0)
             rej = forced_rej_map
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         if algo_name == "Windsorized Sigma Clipping":
             # True Winsorized sigma clipping (APP/PI-parity):
@@ -984,10 +1485,17 @@ def torch_reduce_tile(
             out = _weighted_mean_or(torch, ts, keep, ones_w, fallback)
 
             rej = ~keep
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
 
         if algo == "Comet Lower-Trim (30%)":
+            # One-sided order-statistic trim: keep the lowest floor(0.7*n).
+            # Note this floors the count KEPT, so the trim rounds UP (n=5 drops
+            # 2, i.e. 40%) -- unlike "Trimmed Mean", which floors the count
+            # trimmed. That is deliberate for this preset: the point is to
+            # suppress stars and background riding over the comet, and erring
+            # toward trimming more is the safer side for that. Left as-is so
+            # existing comet stacks stay reproducible.
             x = ts.masked_fill(~valid, float("inf"))
             vals, idx = x.sort(dim=0, stable=True)
 
@@ -1008,7 +1516,7 @@ def torch_reduce_tile(
             keep_orig = torch.zeros_like(keep_sorted)
             keep_orig.scatter_(0, idx, keep_sorted)
             rej = ~keep_orig
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         if algo == "Comet High-Clip Percentile":
             x = ts.masked_fill(~valid, float("nan"))
@@ -1018,7 +1526,7 @@ def torch_reduce_tile(
             clipped = torch.where(valid, torch.minimum(ts, hi.unsqueeze(0)), torch.full_like(ts, float("nan")))
             out = _nanquantile(torch, clipped, float(comet_hclip_p) / 100.0, dim=0)
             rej = forced_rej_map
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         if algo == "Simple Average (No Rejection)":
             w_eff = torch.where(valid, w, torch.zeros_like(w))
@@ -1031,14 +1539,14 @@ def torch_reduce_tile(
             out = torch.where(den > 0, num / den.clamp_min(1e-20), fallback)
 
             rej = forced_rej_map
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         if algo == "Max Value":
             x = ts.masked_fill(~valid, float("-inf"))
             out = x.max(dim=0).values
             out = torch.where(torch.isfinite(out), out, torch.zeros_like(out))
             rej = forced_rej_map
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
 
         if algo == "Weighted Windsorized Sigma Clipping":
@@ -1046,6 +1554,15 @@ def torch_reduce_tile(
             # See _winsorized_center_scale for why sigma must be measured on
             # the winsorized stack: the old code measured std on raw data, so
             # a satellite trail inflated sigma and was never rejected.
+            #
+            # "Weighted" applies to the AVERAGE only -- the per-frame weights
+            # deliberately do not enter the center/scale estimate. The weights
+            # encode frame quality (SNR, FWHM, transparency), not the likelihood
+            # that a given pixel is an outlier, and letting them tilt the
+            # median/sigma would make the rejection threshold depend on which
+            # frames happened to score well. APP and PixInsight both do it this
+            # way: robust statistics to decide what to reject, weights to decide
+            # how much each survivor contributes.
             med, sigma = _winsorized_center_scale(torch, ts, valid, iterations=int(iterations))
             lo = (med - float(sigma_low) * sigma).unsqueeze(0)
             hi = (med + float(sigma_high) * sigma).unsqueeze(0)
@@ -1055,7 +1572,7 @@ def torch_reduce_tile(
             out = _weighted_mean_or(torch, ts, keep, w, fallback)
 
             rej = ~keep
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         if algo == "Extreme Studentized Deviate (ESD)":
             # Generalized ESD (Rosner) done properly, vectorized per pixel.
@@ -1081,37 +1598,32 @@ def torch_reduce_tile(
             # threshold mean "sigmas above the clean data", which is what
             # users expect the setting to do.
             thr = float(esd_threshold)
-            # Rosner needs an upper bound on the outlier count; test up to
-            # half the stack (and leave at least 2 frames untested).
+            # Rosner needs an upper bound on the outlier count: test up to half
+            # the stack, leaving at least 2 frames so the leave-one-out scale
+            # exists. Runtime is strictly linear in this bound and every step is
+            # a full reduction over the tile, so lowering it is the single
+            # biggest ESD speedup available -- but it was measured to bind on
+            # heavily contaminated pixels (a 0.3*F cap saturates at F=8 and
+            # F=16, i.e. it starts refusing to reject outliers it can see), so
+            # it stays at 0.5 rather than trading rejections for throughput.
             max_out = int(max(1, min(F - 2, round(0.5 * F))))
 
             # Per-step critical values. A FIXED cutoff cascades on clean
             # stacks: each removal shrinks the remaining std, inflating the
             # next R, so later steps pass spuriously. Rosner's remedy is an
-            # n-dependent critical value. The externally studentized deviate
-            # is t-distributed with df = n - 2, so we map the user's z-style
-            # threshold to its two-sided normal tail probability and take the
-            # matching t quantile at each step's df. For large stacks
-            # t -> normal, so 'threshold' keeps its literal 'sigmas' meaning;
-            # for small stacks the cutoff inflates automatically, which is
-            # exactly what controls the false-rejection cascade.
-            crit_by_n = np.full(F + 1, float("inf"), dtype=np.float32)
-            try:
-                from scipy import stats as _sstats
-                p_two = float(_sstats.norm.sf(thr))          # one-sided tail
-                for nn in range(3, F + 1):
-                    crit_by_n[nn] = float(_sstats.t.ppf(1.0 - p_two, nn - 2))
-            except Exception:
-                # scipy-free fallback: inflate by the t-distribution's std,
-                # sqrt(df / (df - 2)), a good first-order approximation.
-                for nn in range(3, F + 1):
-                    df = nn - 2
-                    infl = (df / (df - 2.0)) ** 0.5 if df > 2 else 3.0
-                    crit_by_n[nn] = thr * infl
+            # n-dependent critical value, and because the statistic below is
+            # externally studentized it is exactly a t quantile at df = n - 2
+            # with the multiplicity correction folded into the tail
+            # probability. Shared with the numpy reducer in stacking_suite so
+            # the two paths cannot drift (see _rejection_gpu_ok).
+            crit_by_n = esd_critical_values(F, thr, bonferroni=bool(esd_bonferroni))
             crit_t = torch.from_numpy(crit_by_n).to(dev)
 
             active = valid.clone()
-            removed_step = torch.full((F, H, W, C), -1, dtype=torch.int32, device=dev)
+            # int16: step indices run to max_out-1 <= F/2, so overflow needs a
+            # 65k-frame stack. This array is F*H*W*C, so halving it is real VRAM
+            # on a deep stack -- the one free win in this branch.
+            removed_step = torch.full((F, H, W, C), -1, dtype=torch.int16, device=dev)
             passed = torch.zeros((max_out, H, W, C), dtype=torch.bool, device=dev)
             neg = torch.full_like(ts, float("-inf"))
 
@@ -1125,17 +1637,29 @@ def torch_reduce_tile(
                 # candidate = most extreme remaining value
                 zabs = torch.where(active, dv.abs(), neg)
                 dmax, idx = zabs.max(dim=0)
+                # all-inactive pixels come back -inf; zero them so no inf/NaN
+                # enters the arithmetic below (`can` already gates the test, but
+                # this keeps the numpy mirror statement-for-statement identical)
+                dmax = torch.where(torch.isfinite(dmax), dmax, torch.zeros_like(dmax))
 
-                # leave-one-out mean/std via exact identities (no cancellation):
+                # Leave-one-out mean/std via exact identities (no cancellation):
                 #   ss_loo = ss_all - dev_c^2 * n/(n-1)
-                #   R      = |x_c - mean_loo| / s_loo = dev_c * n/(n-1) / s_loo
+                # The candidate's deviation from the LOO mean is dev_c*n/(n-1),
+                # and its standard error is s_loo*sqrt(1 + 1/(n-1)), so the
+                # externally studentized deviate is
+                #   t = dev_c * sqrt(n/(n-1)) / s_loo   ~  t_{n-2}
+                # The sqrt is what makes this an exact t: the old code used the
+                # raw n/(n-1) ratio, i.e. t inflated by sqrt(n/(n-1)), so every
+                # test ran slightly hot (≈ +22% on 3 frames, +0.2% on 245).
                 n_loo = (n - 1.0).clamp_min(1.0)
                 ss_loo = (ss_all - dmax * dmax * (n / n_loo)).clamp_min(0.0)
                 var_loo = ss_loo / (n_loo - 1.0).clamp_min(1.0)
                 std_loo = var_loo.sqrt().clamp_min(1e-12)
-                R = dmax * (n / n_loo) / std_loo
+                R = dmax * (n / n_loo).sqrt() / std_loo
 
-                lam = crit_t[active.sum(dim=0).clamp(0, F)]
+                # crit_by_n is indexed by the PRE-removal active count, which is
+                # exactly `n` here (active is updated below, after this read).
+                lam = crit_t[n.to(torch.long).clamp(0, F)]
                 passed[j] = can & (R > lam)
 
                 # remove the single most extreme remaining value (where possible)
@@ -1145,11 +1669,11 @@ def torch_reduce_tile(
                 removed_step = torch.where(hit, torch.full_like(removed_step, j), removed_step)
 
             # per pixel: largest step index whose test passed (else -1)
-            steps = torch.arange(max_out, device=dev, dtype=torch.int32).view(max_out, 1, 1, 1)
+            steps = torch.arange(max_out, device=dev, dtype=torch.int16).view(max_out, 1, 1, 1)
             jstar = torch.where(
                 passed,
                 steps.expand(max_out, H, W, C),
-                torch.full((max_out, H, W, C), -1, dtype=torch.int32, device=dev),
+                torch.full((max_out, H, W, C), -1, dtype=torch.int16, device=dev),
             ).max(dim=0).values
 
             # reject exactly the removals up to and including step jstar
@@ -1160,15 +1684,26 @@ def torch_reduce_tile(
             out = _weighted_mean_or(torch, ts, keep, w, fallback)
 
             rej = ~keep
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         if algo == "Kappa-Sigma Clipping":
             # Classic kappa-sigma: median center, std of the KEPT sample,
             # monotone shrink (a rejected pixel stays rejected — the old
             # `keep = valid & bounds` let outliers re-enter after the bounds
             # re-widened). Average of survivors only; no median blending.
+            # NOTE ON CONVENTION: `var` below is measured about the MEDIAN, not
+            # about the mean of the kept sample. That is deliberate and matches
+            # PixInsight's sigma-clipping: it keeps the center and the scale
+            # anchored to the same robust statistic, so one surviving outlier
+            # cannot drag the center and shrink the apparent spread at the same
+            # time. It does mean this is not the textbook sample variance, and
+            # the number it reports will run slightly high on skewed pixels.
+            # Changed here would change every existing kappa-sigma stack, so it
+            # stays.
+            n_it = max(1, int(iterations))
+            check_conv = n_it >= _CONVERGENCE_MIN_ITERS
             keep = valid.clone()
-            for _ in range(max(1, int(iterations))):
+            for it in range(n_it):
                 x_iter = ts.masked_fill(~keep, float("nan"))
                 med = _nanmedian(torch, x_iter, dim=0)
                 n_kept = keep.sum(dim=0).clamp_min(1).to(ts.dtype)
@@ -1176,26 +1711,85 @@ def torch_reduce_tile(
                 std = var.clamp_min(0.0).sqrt().clamp_min(1e-12)
                 lo = (med - float(kappa) * std).unsqueeze(0)
                 hi = (med + float(kappa) * std).unsqueeze(0)
-                keep = keep & (ts >= lo) & (ts <= hi)
+                keep_new = keep & (ts >= lo) & (ts <= hi)
+
+                # Fixed-point exit. If this pass rejected nothing, the kept set
+                # is unchanged, so med/std and therefore the bounds are
+                # unchanged, and every later pass would also reject nothing --
+                # the exit is exact, not an approximation. Gated on the
+                # iteration count for the same reason as the winsorized loop
+                # (the .any() needs a device sync that stalls the tile
+                # pipeline), and mirrored in the numpy reducer.
+                if check_conv and it + 1 < n_it:
+                    changed = (keep_new != keep).any()
+                    keep = keep_new
+                    try:
+                        if not bool(changed):
+                            break
+                    except Exception:
+                        pass
+                else:
+                    keep = keep_new
 
             x_valid = ts.masked_fill(~valid, float("nan"))
             fallback = torch.nan_to_num(_nanmedian(torch, x_valid, dim=0), nan=0.0)
             out = _weighted_mean_or(torch, ts, keep, w, fallback)
 
             rej = ~keep
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         if algo == "Trimmed Mean":
-            x = ts.masked_fill(~valid, float("nan"))
-            qlo = _nanquantile(torch, x, float(trim_fraction), dim=0)
-            qhi = _nanquantile(torch, x, 1.0 - float(trim_fraction), dim=0)
-            keep = valid & (ts >= qlo.unsqueeze(0)) & (ts <= qhi.unsqueeze(0))
+            # True symmetric order-statistic trim: drop exactly floor(f*n) from
+            # each end of the sorted sample, which is the textbook (and
+            # scipy.stats.trim_mean) definition.
+            #
+            # The old implementation thresholded on interpolated quantiles
+            # instead -- keep = (ts >= q_f) & (ts <= q_{1-f}) -- which is not the
+            # same estimator:
+            #   * on small stacks it over-trims. n=5, f=0.1: a true trim drops
+            #     floor(0.5)=0 frames, but q_0.1 interpolates strictly above the
+            #     minimum, so the min AND the max were discarded -- a 40% trim
+            #     dressed up as 10%.
+            #   * with ties at the cut it under-trims, because every tied value
+            #     satisfies the inequality and all of them survive.
+            #   * the count kept drifted with the pixel's value distribution
+            #     rather than being fixed by n, so the effective trim varied
+            #     across the frame.
+            x_sort = ts.masked_fill(~valid, float("inf"))
+            vals, idx = x_sort.sort(dim=0, stable=True)
 
-            fallback = torch.nan_to_num(_nanmedian(torch, x, dim=0), nan=0.0)
+            n = valid.sum(dim=0)                                  # (H,W,C) long
+            f = min(max(float(trim_fraction), 0.0), 0.5)
+            k = torch.floor(n.to(torch.float32) * f).to(torch.long)
+            if f > 0.0:
+                # Minimum one per tail. This is the ONE deliberate departure
+                # from scipy.stats.trim_mean's exact floor: at f=0.1 a strict
+                # floor trims nothing at all for any stack under 10 frames, so
+                # a user who explicitly picked a trimming rejection method would
+                # silently get a plain weighted average. Trimming nothing is
+                # never the intent of choosing this method. For n >= 1/f the
+                # guard never fires and the result is the exact trimmed mean.
+                k = k.clamp_min(1)
+            # never trim away the whole sample: leave at least one survivor
+            k = torch.minimum(k, ((n - 1) // 2).clamp_min(0)).clamp_min(0)
+
+            rank = torch.arange(F, device=dev, dtype=torch.long).view(F, 1, 1, 1)
+            lo_r = k.unsqueeze(0)
+            hi_r = (n - k).unsqueeze(0)                           # exclusive
+            keep_sorted = (rank >= lo_r) & (rank < hi_r) & torch.isfinite(vals)
+
+            # back to original frame order so weights and the rejection map line up
+            keep = torch.zeros_like(keep_sorted)
+            keep.scatter_(0, idx, keep_sorted)
+            keep = keep & valid
+
+            fallback = torch.nan_to_num(
+                _nanmedian(torch, ts.masked_fill(~valid, float("nan")), dim=0), nan=0.0
+            )
             out = _weighted_mean_or(torch, ts, keep, w, fallback)
 
             rej = ~keep
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         if algo == "Biweight Estimator":
             x = ts.masked_fill(~valid, float("nan"))
@@ -1216,7 +1810,7 @@ def torch_reduce_tile(
             out = torch.nan_to_num(out, nan=0.0)
 
             rej = ~mask
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         if algo == "Modified Z-Score Clipping":
             x = ts.masked_fill(~valid, float("nan"))
@@ -1234,6 +1828,6 @@ def torch_reduce_tile(
             out = _weighted_mean_or(torch, ts, keep, w, fallback)
 
             rej = ~keep
-            return out.to(dtype=torch.float32).contiguous().cpu().numpy(), rej.cpu().numpy()
+            return _finalize(torch, out, rej, reduce_rej_maps)
 
         raise NotImplementedError(f"GPU path not implemented for: {algo_name}")

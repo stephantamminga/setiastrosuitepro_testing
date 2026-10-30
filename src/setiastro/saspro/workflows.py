@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QWidget,
     QInputDialog,
 )
-
+from setiastro.saspro.help_support import make_help_button
 WORKFLOW_MIME = "application/x-saspro-workflow-command"
 WORKFLOW_SCHEMA_VERSION = 2
 
@@ -629,6 +629,34 @@ class WorkflowLaneList(QListWidget):
                 payload = _unpack_cmd_payload(bytes(md.data(mc)))
             except Exception:
                 payload = None
+
+            # A multi-row drag from History Explorer arrives as a bundle
+            # payload {command_id:"function_bundle", steps:[...]}. Parse it
+            # out into one step per row — exactly as if each row had been
+            # dropped individually, mirroring how the canvas explodes it
+            # (add_shortcut_from_payload / _add_shortcuts_from_steps).
+            _cid0 = ""
+            if isinstance(payload, dict):
+                _cid0 = str(payload.get("command_id") or payload.get("cid") or "")
+            if _cid0 == "function_bundle":
+                steps = payload.get("steps")
+                if isinstance(steps, list):
+                    for st in steps:
+                        if not isinstance(st, dict):
+                            continue
+                        scid = str(st.get("command_id") or st.get("cid") or "")
+                        # skip empties and a nested bundle (shouldn't happen)
+                        if not scid or scid == "function_bundle":
+                            continue
+                        _sp = st.get("preset")
+                        self._dialog.add_step_by_command_id(
+                            scid, lane_name=self.lane_name,
+                            preset=(_sp if isinstance(_sp, dict) else {}),
+                            name=str(st.get("name") or ""),
+                        )
+                event.acceptProposedAction()
+                return
+
             drop_name = ""
             if isinstance(payload, dict) and payload.get("command_id"):
                 cid = str(payload.get("command_id") or "")
@@ -929,6 +957,7 @@ class WorkflowDialog(QDialog):
         bottom.addSpacing(16)
         bottom.addWidget(self.btn_run_mini)
         bottom.addStretch(1)
+        bottom.addWidget(make_help_button("workflow_assistant", self))
 
         root.addLayout(bottom)
     # ------------------------------------------------------------------
@@ -1922,6 +1951,8 @@ class MiniWorkflowDialog(QDialog):
         nav.addWidget(self.btn_next)
         nav.addStretch(1)
         nav.addWidget(self.btn_reset)
+        nav.addSpacing(8)
+        nav.addWidget(make_help_button("workflow_assistant", self))
         root.addLayout(nav)
 
     # ------------------------------------------------------------------

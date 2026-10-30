@@ -1,4 +1,4 @@
-# pro/blink_comparator_pro.py
+#saspro/blink_comparator_pro.py
 # thread safe version
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from PyQt6.QtGui import (QAction, QIcon, QImage, QPixmap, QBrush, QColor, QPalet
 from PyQt6.QtWidgets import (
     QWidget, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QToolButton,
     QTreeWidget, QTreeWidgetItem, QFileDialog, QMessageBox, QProgressBar, QSizePolicy,
-    QAbstractItemView, QMenu, QSplitter, QStyle, QScrollArea, QSlider, QDoubleSpinBox, QProgressDialog, QComboBox, QLineEdit, QApplication, QGridLayout, QCheckBox, QInputDialog,
+    QAbstractItemView, QMenu, QSplitter, QStyle, QScrollArea, QSlider, QDoubleSpinBox, QSpinBox, QProgressDialog, QComboBox, QLineEdit, QApplication, QGridLayout, QCheckBox, QInputDialog,
     QMdiArea, QDialogButtonBox, QHeaderView, QButtonGroup, QRadioButton
 )
 from bisect import bisect_right
@@ -41,15 +41,14 @@ from setiastro.saspro.bayer_utils import (
 )
 from setiastro.saspro.cosmicclarity_engines.satellite_engine import (
     get_satellite_models,
-    _normalize_for_satellite,
-    _resize_tile_for_detect,
-    _split_chunks,
-    _is_border_tile,
-    stretch_image,
+    satellite_remove_image,
+    satellite_detect_tiles,
+    artifact_group_key,
+    ArtifactMapBuilder,
 )
 from setiastro.saspro.legacy.numba_utils import debayer_raw_fast, debayer_fits_fast
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
-
+from setiastro.saspro.help_support import make_help_button
 
 from setiastro.saspro.star_metrics import measure_stars_sep
 
@@ -71,7 +70,8 @@ _try_raise_fd_limit()
 
 def _blink_thread_safety_mode() -> str:
     """Return 'safe' or 'fast'. QSettings 'blink/thread_safety' may be:
-       'auto' (default) -> safe on macOS, fast elsewhere
+       'auto' (default) -> safe iff numba's resolved threading layer is not
+                           threadsafe (workqueue), fast otherwise
        'safe'           -> force serialized numba + conservative workers
        'fast'           -> force concurrent numba + aggressive workers"""
     try:
@@ -82,7 +82,19 @@ def _blink_thread_safety_mode() -> str:
     if mode not in ("auto", "safe", "fast"):
         mode = "auto"
     if mode == "auto":
-        return "safe" if sys.platform == "darwin" else "fast"
+        # The real hazard is the resolved threading layer, not the OS: any box
+        # whose numba fell back to the non-threadsafe 'workqueue' layer aborts
+        # under the parallel loader (StellarMate/Linux and macOS alike). Key off
+        # that, falling back to the old darwin guess only while the layer is
+        # still unknown (i.e. before warmup has run a parallel region).
+        try:
+            from setiastro.saspro.legacy.numba_utils import numba_threading_layer_unsafe
+            unsafe = numba_threading_layer_unsafe()
+        except Exception:
+            unsafe = None
+        if unsafe is None:
+            return "safe" if sys.platform == "darwin" else "fast"
+        return "safe" if unsafe else "fast"
     return mode
 
 
@@ -98,6 +110,38 @@ def _blink_apply_thread_safety() -> str:
     return mode
 
 
+def _blink_wait_for_numba_layer(timeout: float = 20.0) -> None:
+    """Block (pumping the UI) until numba_warmup has resolved and recorded the
+    threading layer.
+
+    The lazy NUMBA_PARALLEL_LOCK decides serialize-vs-concurrent from numba's
+    *resolved* layer, which numba_warmup records only after its background
+    compile finishes. If a user opens Blink and loads before that completes, the
+    layer is still unknown and the decision falls back to an OS guess
+    (fast/no-op on Linux) — the exact path that aborts on a workqueue box. So we
+    wait here, before fanning out. Idempotent and best-effort: any failure just
+    returns and lets loadImages' pathological-case fallback take over."""
+    try:
+        from setiastro.saspro.numba_warmup import (
+            start_background_warmup, wait_for_warmup, is_warmup_done,
+        )
+    except Exception:
+        return
+    try:
+        if is_warmup_done():
+            return
+        start_background_warmup()  # idempotent; no-op if already running
+        deadline = time.monotonic() + float(timeout)
+        while not is_warmup_done() and time.monotonic() < deadline:
+            wait_for_warmup(timeout=0.1)
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _percentile_scale(arr, lo=0.5, hi=99.5):
     a = np.asarray(arr, dtype=np.float32)
     p1 = np.nanpercentile(a, lo)
@@ -105,6 +149,116 @@ def _percentile_scale(arr, lo=0.5, hi=99.5):
     if not np.isfinite(p1) or not np.isfinite(p2) or p2 <= p1:
         return np.clip(a, 0.0, 1.0)
     return np.clip((a - p1) / (p2 - p1), 0.0, 1.0)
+
+
+# ── Robust FITS header parsing for temperature & exposure ──────────────────
+# Mirrors the Stacking Suite's tolerant reads so Blink / Blink Metrics see the
+# same temps and exposures the stacker does: many keyword spellings, and string
+# values carrying units ("-10 C", "300 s", EXIF "1/125").
+
+# Actual-sensor temps first; the cooler SETPOINT (SET-TEMP) is the last resort,
+# matching the stacker's "prefer CCD-TEMP over SET-TEMP". DET-TEMP and common
+# variants are included so detectors that only write those are read.
+_BLINK_TEMP_KEYS = (
+    "CCD-TEMP", "CCDTEMP", "CCD_TEMP",
+    "DET-TEMP", "DETTEMP", "DET_TEMP",
+    "SENSOR-TEMP", "SENSORTEMP", "SENSOR_TEMP",
+    "CAMTEMP", "CAM-TEMP", "TEMPERAT", "TEMP",
+    "SET-TEMP", "SETTEMP", "SET_TEMP", "SETPOINT",
+)
+
+_BLINK_EXP_KEYS = (
+    "EXPTIME", "EXPOSURE", "XPOSURE",
+    "EXP-TIME", "EXP_TIME", "EXPTIMES",
+    "ITIME", "INTTIME", "EXP",
+)
+
+
+def _blink_hdr_get(hdr, key):
+    """Header .get that works on an astropy Header or a plain dict."""
+    if hdr is None:
+        return None
+    try:
+        if key in hdr:
+            return hdr[key]
+    except Exception:
+        pass
+    try:
+        return hdr.get(key, None)
+    except Exception:
+        return None
+
+
+def _blink_key_float(hdr, key):
+    """Float value for one key, tolerant of unit-carrying strings and simple
+    EXIF fractions. Returns None when absent or unparseable."""
+    v = _blink_hdr_get(hdr, key)
+    if v is None:
+        return None
+    try:
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            f = float(v)
+            return f if np.isfinite(f) else None
+        s = str(v).strip()
+        if not s:
+            return None
+        s = s.replace("\u2212", "-")          # unicode minus -> ASCII
+        s = s.replace("\u00b0", "").replace("\u00ba", "")  # degree marks
+        low = s.lower()
+        for _u in ("seconds", "second", "secs", "sec"):
+            if low.endswith(_u):
+                s = s[: -len(_u)]
+                break
+        s = s.rstrip()
+        # trailing 's'/'c' unit, tolerating a space before it ("300 s", "-10 C"),
+        # but only when a number-like token precedes it (never mangle text values)
+        if s and s[-1] in ("s", "S", "c", "C"):
+            _s2 = s[:-1].rstrip()
+            if _s2 and (_s2[-1].isdigit() or _s2[-1] == "."):
+                s = _s2
+        s = s.strip()
+        if not s:
+            return None
+        if "/" in s:                            # EXIF shutter fraction "1/125"
+            top, bot = s.split("/", 1)
+            f = float(top) / float(bot)
+        else:
+            f = float(s)
+        return f if np.isfinite(f) else None
+    except Exception:
+        return None
+
+
+def _blink_hdr_temp_c(hdr):
+    """Sensor temperature (deg C) from the first present temp keyword, or None."""
+    for _k in _BLINK_TEMP_KEYS:
+        f = _blink_key_float(hdr, _k)
+        if f is not None:
+            return f
+    return None
+
+
+def _blink_hdr_exptime(hdr):
+    """Exposure time (seconds) from the first present exposure keyword, or None."""
+    for _k in _BLINK_EXP_KEYS:
+        f = _blink_key_float(hdr, _k)
+        if f is not None and f > 0:
+            return f
+    return None
+
+
+def _blink_exposure_label(hdr):
+    """Canonical exposure label for tree grouping/display ('300s', '1.5s'), or
+    'Unknown'. Normalizes 300, '300.0' and '300 s' into one bucket."""
+    f = _blink_hdr_exptime(hdr)
+    if f is None:
+        return "Unknown"
+    if abs(f - round(f)) < 1e-6:
+        return f"{int(round(f))}s"
+    return f"{f:.3f}".rstrip("0").rstrip(".") + "s"
+
 
 # ⬇️ your SASv2 classes — paste them unchanged (Qt6 compatible already)
 class MetricsPanel(QWidget):
@@ -120,9 +274,9 @@ class MetricsPanel(QWidget):
 
         # caching slots
         self._orig_images = None       # last list passed
-        self.metrics_data = None       # list of 4 numpy arrays
+        self.metrics_data = None       # list of 7 numpy arrays
         self.flags = None              # list of bools
-        self._threshold_initialized = [False]*5
+        self._threshold_initialized = [False]*7
         self._last_group_id = None
         self._open_previews = []
         self._show_guides = True  # default on (or False if you prefer)
@@ -138,18 +292,22 @@ class MetricsPanel(QWidget):
             self.tr("Background"),
             self.tr("Star Count"),
             self.tr("Weighted Score"),
+            self.tr("Sensor Temp (°C)"),
+            self.tr("Bg Rate (ADU/s)"),
         ]
 
-        # Layout: 3 cols × 2 rows
-        # Col 0: FWHM (row 0), Background (row 1)
-        # Col 1: Eccentricity (row 0), Star Count (row 1)
-        # Col 2: Weighted Score (rows 0-1, rowspan 2)
+        # Layout: 3 cols × 3 rows
+        # Col 0: FWHM (row 0), Background (row 1), Sensor Temp (row 2)
+        # Col 1: Eccentricity (row 0), Star Count (row 1), Bg Rate (row 2)
+        # Col 2: Weighted Score (rows 0-2, rowspan 3)
         grid_positions = [
             (0, 0),   # FWHM
             (0, 1),   # Eccentricity
             (1, 0),   # Background
             (1, 1),   # Star Count
-            (0, 2),   # Weighted Score — will use rowspan=2
+            (0, 2),   # Weighted Score — will use rowspan=3
+            (2, 0),   # Sensor Temp (°C)
+            (2, 1),   # Bg Rate (ADU/s)
         ]
 
         for idx, (title, (grow, gcol)) in enumerate(zip(titles, grid_positions)):
@@ -214,9 +372,9 @@ class MetricsPanel(QWidget):
             self.median_lines.append(median_ln)
 
 
-            # Weighted Score spans both rows in col 2
+            # Weighted Score spans all rows in col 2
             if idx == 4:
-                grid.addWidget(pw, grow, gcol, 2, 1)
+                grid.addWidget(pw, grow, gcol, 3, 1)
             else:
                 grid.addWidget(pw, grow, gcol)
 
@@ -313,10 +471,88 @@ class MetricsPanel(QWidget):
         BAD_FWHM = 30.0
         BAD_ECC  = 1.0
 
+        # QA metrics for the extended MetricsPanel. Sensor temp and
+        # OFFSET-corrected bg rate. Both from header only; nothing
+        # derived from light-frame content itself. Amp glow was
+        # removed in v3 because on light frames it's indistinguishable
+        # from LP gradient, moon glow, nebulosity, and vignette
+        # residual -- corner-vs-corner picks all of them up as one
+        # blended number.
+        _hdr = entry.get("header", {}) or {}
+        _bd  = entry.get("bit_depth", None)
+        _orig_bg = entry.get("orig_background", np.nan)
+
+        def _hget(*keys):
+            for _k in keys:
+                if _k in _hdr:
+                    _v = _hdr[_k]
+                    try:
+                        _f = float(_v)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(_f):
+                        return _f
+            return float("nan")
+
+        _tc = _blink_hdr_temp_c(_hdr)
+        _temp_c  = _tc if _tc is not None else float("nan")
+        _et = _blink_hdr_exptime(_hdr)
+        _exptime = _et if _et is not None else float("nan")
+        _offset  = _hget("OFFSET", "BIAS")
+        # Many acquisition tools (SGP with default templates observed;
+        # some ASCOM drivers) don't write OFFSET or BIAS to the FITS
+        # header. Fall back to 0 rather than reporting NaN: the
+        # missing pedestal is a per-SESSION constant, so within-
+        # session RELATIVE ordering of frames by Bg Rate is preserved
+        # (which is what blink uses for culling). Only the absolute
+        # ADU/s value is inflated by OFFSET_adu / exptime.
+        if not np.isfinite(_offset):
+            _offset = 0.0
+
+        # OFFSET-corrected bg rate (ADU/s). orig_background is
+        # normalized [0,1] on pre-stretch data; scale by
+        # (2**bit_depth - 1) to ADU, subtract the OFFSET pedestal
+        # (0 when not in header -- see fallback above), divide by
+        # exposure. Note the header name is often "BIAS" but on CMOS
+        # there is no true bias frame -- CDS eliminates any sensor
+        # reset pedestal -- so this is really OFFSET subtraction.
+        # bit_depth from load_image can be an int (16), a numpy int,
+        # a float, or a human-readable string like "16-bit" / "16 bit"
+        # depending on which loader path the file went through. Extract
+        # the leading integer so all forms work; the plain int(_bd)
+        # that shipped in v1 raised ValueError on "16-bit" and left
+        # every frame's bg_rate NaN silently (caught by the outer
+        # except).
+        _bd_bits = None
+        if _bd is not None:
+            try:
+                _bd_bits = int(_bd)
+            except (TypeError, ValueError):
+                try:
+                    import re as _re_bd
+                    _m_bd = _re_bd.match(r"\s*(\d+)", str(_bd))
+                    if _m_bd:
+                        _bd_bits = int(_m_bd.group(1))
+                except Exception:
+                    _bd_bits = None
+
+        _bg_rate = float("nan")
+        try:
+            if (_bd_bits is not None and np.isfinite(_orig_bg) and _orig_bg > 0
+                    and np.isfinite(_exptime) and _exptime > 0):
+                _depth_scale = float((1 << _bd_bits) - 1)
+                if _depth_scale > 0:
+                    _bg_adu  = float(_orig_bg) * _depth_scale
+                    _bg_corr = _bg_adu - float(_offset)
+                    if _bg_corr > 0:
+                        _bg_rate = _bg_corr / float(_exptime)
+        except Exception:
+            _bg_rate = float("nan")
+
         try:
             if img is None:
                 orig_back = entry.get("orig_background", np.nan)
-                return idx, BAD_FWHM, BAD_ECC, orig_back, 0, 0.0
+                return idx, BAD_FWHM, BAD_ECC, orig_back, 0, 0.0, _temp_c, _bg_rate
 
             data = np.asarray(img)
             h0, w0 = data.shape[:2]
@@ -374,7 +610,7 @@ class MetricsPanel(QWidget):
 
             if cat is None or len(cat) == 0:
                 orig_back = entry.get("orig_background", np.nan)
-                return idx, BAD_FWHM, BAD_ECC, orig_back, 0, 0.0
+                return idx, BAD_FWHM, BAD_ECC, orig_back, 0, 0.0, _temp_c, _bg_rate
 
             a = np.maximum(cat["a"].astype(np.float32, copy=False), 1e-12)
             b = np.maximum(cat["b"].astype(np.float32, copy=False), 0.0)
@@ -397,11 +633,11 @@ class MetricsPanel(QWidget):
             bg_term     = (2.0 / (math.sqrt(bg_clamped) + 1.0)) - 1.0
             weighted_score = float(star_cnt) * ecc_term * bg_term if star_cnt > 0 else 0.0
 
-            return idx, fwhm, ecc, orig_back, star_cnt, weighted_score
+            return idx, fwhm, ecc, orig_back, star_cnt, weighted_score, _temp_c, _bg_rate
 
         except Exception:
             orig_back = entry.get("orig_background", np.nan)
-            return idx, BAD_FWHM, BAD_ECC, orig_back, 0, 0.0
+            return idx, BAD_FWHM, BAD_ECC, orig_back, 0, 0.0, _temp_c, _bg_rate
 
 
 
@@ -421,9 +657,9 @@ class MetricsPanel(QWidget):
         n = len(loaded_images)
         if n == 0:
             self._orig_images = []
-            self.metrics_data = [np.array([])] * 5
+            self.metrics_data = [np.array([])] * 7
             self.flags = []
-            self._threshold_initialized = [False] * 5
+            self._threshold_initialized = [False] * 7
             return True
 
         # ----------------------------
@@ -434,6 +670,8 @@ class MetricsPanel(QWidget):
         m2 = np.full(n, np.nan, dtype=np.float32)  # Background (cached)
         m3 = np.full(n, np.nan, dtype=np.float32)  # Star count
         m4 = np.full(n, np.nan, dtype=np.float32)  # Weighted score        
+        m5 = np.full(n, np.nan, dtype=np.float32)  # Sensor temp (°C, header)
+        m6 = np.full(n, np.nan, dtype=np.float32)  # Bg rate (ADU/s, OFFSET-corrected)
         flags = [e.get("flagged", False) for e in loaded_images]
 
         # ----------------------------
@@ -451,7 +689,7 @@ class MetricsPanel(QWidget):
         # ----------------------------
         # 3) Worker sizing by contention-aware heuristic
         # ----------------------------
-        # Profiling shows SEP's internal C allocator serializes under heavy
+        #sasprofiling shows SEP's internal C allocator serializes under heavy
         # threading on large images — more workers = more contention = slower
         # wall time. RAM is not the constraint; allocator lock contention is.
         # Empirically 4-6 workers is the sweet spot for bin-2 downsampled frames.
@@ -482,10 +720,11 @@ class MetricsPanel(QWidget):
                         break
 
                     try:
-                        idx, fwhm, ecc, orig_back, star_cnt, weighted_score = fut.result()
+                        idx, fwhm, ecc, orig_back, star_cnt, weighted_score, temp_c, bg_rate = fut.result()
                     except Exception:
                         idx = futures.get(fut, 0)
                         fwhm, ecc, orig_back, star_cnt, weighted_score = np.nan, np.nan, np.nan, 0, 0.0
+                        temp_c, bg_rate = np.nan, np.nan
 
                     if 0 <= idx < n:
                         m0[idx] = fwhm
@@ -493,6 +732,8 @@ class MetricsPanel(QWidget):
                         m2[idx] = orig_back
                         m3[idx] = float(star_cnt)
                         m4[idx] = float(weighted_score)
+                        m5[idx] = float(temp_c)
+                        m6[idx] = float(bg_rate)
 
                     done += 1
                     prog.setValue(done)
@@ -508,9 +749,9 @@ class MetricsPanel(QWidget):
         # 4) Stash results
         # ----------------------------
         self._orig_images = loaded_images
-        self.metrics_data = [m0, m1, m2, m3, m4]
+        self.metrics_data = [m0, m1, m2, m3, m4, m5, m6]
         self.flags = flags
-        self._threshold_initialized = [False] * 5
+        self._threshold_initialized = [False] * 7
         return True
 
     def plot(self, loaded_images, indices=None):
@@ -611,9 +852,27 @@ class MetricsPanel(QWidget):
             # initialize threshold line once
             # initialize threshold line if this is a new group and no saved threshold
             if not self._threshold_initialized[m]:
-                mx, mn = np.nanmax(y), np.nanmin(y)
-                span   = mx-mn if mx!=mn else 1.0
-                line.setPos((mx+0.05*span) if m in (0, 1, 2) else 0)
+                # NaN guard: any of the new metrics (Sensor Temp, Amp
+                # Glow, Bg Rate) can be all-NaN for a group when the
+                # underlying header field is missing on every frame.
+                # np.nanmax on all-NaN returns NaN with a warning and
+                # pyqtgraph then crashes in transformAngle rounding
+                # NaN to int. Force finite; park the line at 0 and let
+                # the user drag it once real data is present.
+                with np.errstate(all="ignore"):
+                    mx = np.nanmax(y) if len(y) else np.nan
+                    mn = np.nanmin(y) if len(y) else np.nan
+                if not (np.isfinite(mx) and np.isfinite(mn)):
+                    line.setPos(0.0)
+                else:
+                    span = (mx - mn) if mx != mn else 1.0
+                    # Higher = worse for FWHM/Ecc/Bg/SensorTemp/BgRate
+                    # (m in 0,1,2,5,6): a warmer sensor means more dark
+                    # current / thermal noise, so treat it like the other
+                    # higher-is-worse metrics. Park the line just above the
+                    # data so nothing flags on open; drag DOWN to flag.
+                    # Lower = worse for Star Count / Weighted Score (m in 3,4).
+                    line.setPos((mx + 0.05 * span) if m in (0, 1, 2, 5, 6) else 0)
                 self._threshold_initialized[m] = True
 
     def _refresh_scatter_colors(self):
@@ -695,7 +954,7 @@ class MetricsWindow(QWidget):
         super().__init__(parent, Qt.WindowType.Window)
         self._thresholds_per_group: dict[str, List[float|None]] = {}
         self.setWindowTitle(self.tr("Frame Metrics"))
-        self.resize(800, 600)
+        self.resize(900, 780)
 
         vbox = QVBoxLayout(self)
 
@@ -761,7 +1020,7 @@ class MetricsWindow(QWidget):
             ]
 
         # Reset so plot() will auto-init lines for this group's data range
-        self.metrics_panel._threshold_initialized = [False] * 5
+        self.metrics_panel._threshold_initialized = [False] * 7
 
         # Restore saved thresholds for this group (overrides auto-init if saved)
         self._apply_thresholds(gid)
@@ -812,10 +1071,10 @@ class MetricsWindow(QWidget):
 
         # ─── reset & seed per-group thresholds ────────────────────
         self._thresholds_per_group.clear()
-        self._thresholds_per_group["__ALL__"] = [None]*5
+        self._thresholds_per_group["__ALL__"] = [None]*7
         for entry in loaded_images:
             filt = (entry.get('header', {}) or {}).get('FILTER', 'Unknown')
-            self._thresholds_per_group.setdefault(filt, [None]*5)
+            self._thresholds_per_group.setdefault(filt, [None]*7)
 
 
         # ─── compute & cache all metrics once ────────────────────
@@ -940,13 +1199,13 @@ class MetricsWindow(QWidget):
 
     def _on_panel_threshold_change(self, metric_idx: int, new_val: float):
         grp = self._current_group_id()
-        thr_list = self._thresholds_per_group.setdefault(grp, [None] * 5)
-        while len(thr_list) < 5:
+        thr_list = self._thresholds_per_group.setdefault(grp, [None] * 7)
+        while len(thr_list) < 7:
             thr_list.append(None)
         thr_list[metric_idx] = new_val
 
     def _apply_thresholds(self, group_id: str):
-        saved = self._thresholds_per_group.get(group_id, [None] * 5)
+        saved = self._thresholds_per_group.get(group_id, [None] * 7)
         for idx, line in enumerate(self.metrics_panel.lines):
             if idx < len(saved) and saved[idx] is not None:
                 line.setPos(saved[idx])
@@ -1006,7 +1265,10 @@ class BlinkComparatorPro(QDialog):
     def _restore_window_geometry(self):
         try:
             s = QSettings()
-            g = s.value("blink/window_geometry", None)   # unique key
+            # Dedicated key so this (unused in current wiring, but kept
+            # for legacy callers) doesn't collide with BlinkTab's
+            # top-level geometry save.
+            g = s.value("blink/dialog_window_geometry", None)
             if g is not None:
                 self.restoreGeometry(g)
         except Exception:
@@ -1015,7 +1277,7 @@ class BlinkComparatorPro(QDialog):
     def _save_window_geometry(self):
         try:
             s = QSettings()
-            s.setValue("blink/window_geometry", self.saveGeometry())
+            s.setValue("blink/dialog_window_geometry", self.saveGeometry())
         except Exception:
             pass
 
@@ -1197,11 +1459,62 @@ class _BlinkZoomPanel(QWidget):
         if hasattr(self, "_update_zoom_panel_to_viewport_center"):
             QTimer.singleShot(0, self._update_zoom_panel_to_viewport_center)
 
+# ---------------------------------------------------------------------------
+# Numeric-aware tree item so clicking a metric header (Star Count, FWHM,
+# Ecc, BG, Score, Temp, BG/s) sorts the tree numerically instead of
+# lexicographically. This is a purely VISUAL reorder — self.image_paths
+# and self.loaded_images stay in their canonical order; metrics are
+# resolved via UserRole on column 0, not tree row index.
+# ---------------------------------------------------------------------------
+class _BlinkSortItem(QTreeWidgetItem):
+    @staticmethod
+    def _natkey(s):
+        return [int(t) if t.isdigit() else t.lower()
+                for t in re.split(r"(\d+)", s or "")]
+
+    def _is_group(self):
+        # Non-leaf rows are the Object:/Filter:/Exposure: headers.
+        return self.childCount() > 0
+
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        col = tree.sortColumn() if tree is not None else 0
+
+        # Group rows always sort by their column-0 label regardless of
+        # which column the user clicked. Keeps Object/Filter/Exposure
+        # headers in stable natural order while leaves sort by metric.
+        if self._is_group() or getattr(other, "_is_group", lambda: False)():
+            return self._natkey(self.text(0)) < self._natkey(other.text(0))
+
+        a = (self.text(col) or "").strip().lstrip("⚠️ ").strip()
+        b = (other.text(col) or "").strip().lstrip("⚠️ ").strip()
+
+        # Empty metric cells always sort to the bottom in ascending so
+        # un-measured frames don't push good ones off the top.
+        if a == "" and b == "":
+            return self._natkey(self.text(0)) < self._natkey(other.text(0))
+        if a == "":
+            return False
+        if b == "":
+            return True
+
+        # Filename (0) and the Sat flag (1) sort naturally as text.
+        if col in (0, 1):
+            return self._natkey(a) < self._natkey(b)
+
+        # Metric columns (2..8) parse as float; fall back to text
+        # natural sort if parsing fails (defensive).
+        try:
+            return float(a) < float(b)
+        except (TypeError, ValueError):
+            return self._natkey(a) < self._natkey(b)
+
+
 class BlinkTab(QWidget):
     imagesChanged = pyqtSignal(int)
     sendToStacking = pyqtSignal(list, str)
     def __init__(self, image_manager=None, doc_manager=None, parent=None):
-        super().__init__(parent)  
+        super().__init__(parent)
 
         self.image_paths = []  # Store the file paths of loaded images
         self.loaded_images = []  # Store the image objects (as numpy arrays)
@@ -1213,7 +1526,27 @@ class BlinkTab(QWidget):
         self.dragging = False  # Track whether the mouse is dragging
         self.last_mouse_pos = None  # Store the last mouse position
 
-        self.aggressive_stretch_enabled = False
+        # Restore persisted UI settings BEFORE initUI() so widgets seed
+        # from the right values.
+        _s = QSettings()
+        try:
+            self.aggressive_stretch_enabled = bool(
+                _s.value("blink/aggressive_stretch", False, type=bool)
+            )
+        except Exception:
+            self.aggressive_stretch_enabled = False
+
+        try:
+            _fps = float(_s.value("blink/play_fps", 1.0, type=float))
+        except Exception:
+            _fps = 1.0
+        self.play_fps = max(0.1, min(10.0, _fps))
+
+        try:
+            self._auto_fit = bool(_s.value("blink/auto_fit", False, type=bool))
+        except Exception:
+            self._auto_fit = False
+
         self.current_sigma = 3.7
         self.current_pixmap = None
         self._last_preview_name = None
@@ -1222,28 +1555,69 @@ class BlinkTab(QWidget):
         self._pending_preview_timer.setInterval(40)  # 40–80ms is plenty
         self._pending_preview_item = None
         self._pending_preview_timer.timeout.connect(self._do_preview_update)
-        self.play_fps = 1  # default fps (200 ms/frame)
         self._view_center_norm = None
-        self._zoom_pinned_norm = None  # (norm_cx, norm_cy) set by right-click        
+        self._zoom_pinned_norm = None  # (norm_cx, norm_cy) set by right-click
         self.initUI()
         self.init_shortcuts()
+
+        # Sync the aggressive-stretch button to the restored flag so the
+        # UI matches what we'll actually render.
+        try:
+            self.aggressive_button.blockSignals(True)
+            self.aggressive_button.setChecked(self.aggressive_stretch_enabled)
+            self.aggressive_button.blockSignals(False)
+        except Exception:
+            pass
 
         self._geom_restored = False  # <- NEW
 
     # --- NEW ---
+    def _top_level_window(self):
+        """Return the top-level window hosting this widget (dialog, MDI
+        subwindow or main window). Falls back to self when embedded weirdly.
+        Geometry save/restore must target this, not the embedded widget."""
+        try:
+            w = self.window()
+            return w if w is not None else self
+        except Exception:
+            return self
+
     def _restore_window_geometry(self):
         try:
             s = QSettings()
-            g = s.value("blink/window_geometry", None)   # unique key
+            g = s.value("blink/tab_window_geometry", None)   # widget-specific
             if g is not None:
-                self.restoreGeometry(g)
+                self._top_level_window().restoreGeometry(g)
         except Exception:
             pass
 
     def _save_window_geometry(self):
         try:
             s = QSettings()
-            s.setValue("blink/window_geometry", self.saveGeometry())
+            s.setValue("blink/tab_window_geometry",
+                       self._top_level_window().saveGeometry())
+        except Exception:
+            pass
+
+    def _save_main_splitter_state(self, *_):
+        try:
+            if hasattr(self, "main_splitter") and self.main_splitter is not None:
+                QSettings().setValue("blink/main_splitter_state",
+                                     self.main_splitter.saveState())
+        except Exception:
+            pass
+
+    def _restore_main_splitter_state(self):
+        try:
+            if not hasattr(self, "main_splitter") or self.main_splitter is None:
+                return
+            state = QSettings().value("blink/main_splitter_state", None)
+            if state is not None:
+                self.main_splitter.restoreState(state)
+                sizes = self.main_splitter.sizes()
+                # sanity fallback: don't let a bad save collapse a pane
+                if len(sizes) >= 2 and (sizes[0] < 120 or sizes[1] < 200):
+                    self.main_splitter.setSizes([300, 900])
         except Exception:
             pass
 
@@ -1270,6 +1644,7 @@ class BlinkTab(QWidget):
 
             def _after_restore():
                 self._restore_window_geometry()
+                self._restore_main_splitter_state()
 
             QTimer.singleShot(0, _after_restore)
 
@@ -1284,8 +1659,20 @@ class BlinkTab(QWidget):
         except Exception:
             pass
 
+    def hideEvent(self, ev):
+        # Persist on hide too — some hosts (MDI subwindow, custom close
+        # paths) swallow closeEvent, so leaning only on close loses state.
+        try:
+            self._save_window_geometry()
+            self._save_main_splitter_state()
+            self._save_tree_header_state()
+        except Exception:
+            pass
+        super().hideEvent(ev)
+
     def closeEvent(self, e):
         self._save_window_geometry()
+        self._save_main_splitter_state()
         self._save_tree_header_state()
 
         try:
@@ -1303,6 +1690,7 @@ class BlinkTab(QWidget):
 
         # Create a QSplitter to allow resizing between left and right panels
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.main_splitter = splitter  # keep a reference so we can persist its state
 
         # Left Column for the file loading and TreeView
         left_widget = QWidget(self)
@@ -1381,6 +1769,7 @@ class BlinkTab(QWidget):
         self.metrics_button = QPushButton(self.tr("Interactive Metrics && Culling"), self)
         self.metrics_button.clicked.connect(self.show_metrics)
         left_layout.addWidget(self.metrics_button)
+        sat_row = QHBoxLayout()
         self.sat_detect_btn = QPushButton(self.tr("Detect Satellite Trails"), self)
         self.sat_detect_btn.setToolTip(self.tr(
             "Runs the Cosmic Clarity satellite detection model on all loaded images.\n"
@@ -1389,7 +1778,45 @@ class BlinkTab(QWidget):
             "but can help identify problematic frames before stacking."
         ))
         self.sat_detect_btn.clicked.connect(self._detect_satellite_trails)
-        left_layout.addWidget(self.sat_detect_btn)
+        sat_row.addWidget(self.sat_detect_btn, stretch=1)
+
+        sat_mode_lbl = QLabel(self.tr("Mode:"), self)
+        sat_mode_lbl.setStyleSheet("font-size: 11px;")
+        sat_row.addWidget(sat_mode_lbl)
+
+        self.sat_mode_combo = QComboBox(self)
+        self.sat_mode_combo.addItem(self.tr("Fast"), "fast")
+        self.sat_mode_combo.addItem(self.tr("Highlight trails (slower)"), "full")
+        self.sat_mode_combo.setToolTip(self.tr(
+            "Fast: runs only the detection models — quickly marks images with trails in the Sat column.\n"
+            "Highlight trails: runs the full satellite-removal pipeline and paints the trail bright green\n"
+            "in the preview so you can see exactly where it is. Significantly slower, especially on frames\n"
+            "that actually contain trails."
+        ))
+        try:
+            saved_mode = QSettings().value("blink/sat_detect_mode", "fast", type=str) or "fast"
+        except Exception:
+            saved_mode = "fast"
+        _mi = self.sat_mode_combo.findData(saved_mode)
+        if _mi < 0:
+            _mi = 0
+        self.sat_mode_combo.setCurrentIndex(_mi)
+        self.sat_mode_combo.currentIndexChanged.connect(self._on_sat_mode_changed)
+        sat_row.addWidget(self.sat_mode_combo)
+
+        # Small wrench button for advanced satellite-detection settings
+        # (edge-exclusion pixels, max worker threads).
+        self.sat_settings_btn = QToolButton(self)
+        self.sat_settings_btn.setText("🔧")
+        self.sat_settings_btn.setToolTip(self.tr(
+            "Advanced satellite detection settings — amp-glow edge filter\n"
+            "and concurrent worker count."
+        ))
+        self.sat_settings_btn.setAutoRaise(True)
+        self.sat_settings_btn.clicked.connect(self._open_sat_settings_dialog)
+        sat_row.addWidget(self.sat_settings_btn)
+
+        left_layout.addLayout(sat_row)
         push_row = QHBoxLayout()
         self.send_lights_btn = QPushButton(self.tr("→ Stacking: Lights"), self)
         self.send_lights_btn.setToolTip(self.tr("Send selected (or all) blink files to the Stacking Suite → Light tab"))
@@ -1490,14 +1917,25 @@ class BlinkTab(QWidget):
         self.tree_filter_combo.addItem(self.tr("Flagged Only"),  "flagged")
         self.tree_filter_combo.addItem(self.tr("Clean Only"),    "clean")
         self.tree_filter_combo.setFixedWidth(140)
+        # Restore previous filter selection (silently, before wiring the
+        # change handler so we don't trigger a redundant filter pass).
+        try:
+            saved_filter = QSettings().value("blink/tree_filter", "all", type=str)
+            _fi = self.tree_filter_combo.findData(saved_filter)
+            if _fi >= 0:
+                self.tree_filter_combo.blockSignals(True)
+                self.tree_filter_combo.setCurrentIndex(_fi)
+                self.tree_filter_combo.blockSignals(False)
+        except Exception:
+            pass
         self.tree_filter_combo.currentIndexChanged.connect(self._apply_tree_filter)
         filter_row.addWidget(self.tree_filter_combo)
         filter_row.addStretch(1)
         left_layout.addLayout(filter_row)
         # Tree view for file names
         self.fileTree = QTreeWidget(self)
-        self.fileTree.setColumnCount(6)
-        self.fileTree.setColumnCount(6)
+        self.fileTree.setColumnCount(9)
+        self.fileTree.setColumnCount(9)
         self.fileTree.setHeaderLabels([
             self.tr("Image Files"),
             self.tr("Sat"),
@@ -1505,9 +1943,12 @@ class BlinkTab(QWidget):
             self.tr("FWHM"),
             self.tr("Ecc"),
             self.tr("BG"),
+            self.tr("Score"),
+            self.tr("Temp"),
+            self.tr("BG/s"),
         ])
 
-        for c in (1, 2, 3, 4, 5):
+        for c in (1, 2, 3, 4, 5, 6, 7, 8):
             self.fileTree.headerItem().setTextAlignment(c, Qt.AlignmentFlag.AlignCenter)
 
         self.fileTree.setColumnWidth(0, 450)
@@ -1516,6 +1957,9 @@ class BlinkTab(QWidget):
         self.fileTree.setColumnWidth(3, 55)
         self.fileTree.setColumnWidth(4, 55)
         self.fileTree.setColumnWidth(5, 55)
+        self.fileTree.setColumnWidth(6, 60)   # Score (Weighted Score)
+        self.fileTree.setColumnWidth(7, 50)   # Temp (°C from header)
+        self.fileTree.setColumnWidth(8, 65)   # BG/s (ADU/s, OFFSET-corrected)
         self.fileTree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)  # Allow multiple selections
         #self.fileTree.itemClicked.connect(self.on_item_clicked)
         self.fileTree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1536,7 +1980,22 @@ class BlinkTab(QWidget):
 
         # save whenever user resizes/moves columns
         hdr.sectionResized.connect(lambda *_: self._save_tree_header_state())
-        hdr.sectionMoved.connect(lambda *_: self._save_tree_header_state())        
+        hdr.sectionMoved.connect(lambda *_: self._save_tree_header_state())
+
+        # --- Clickable column sorting ---------------------------------
+        # Leaves are _BlinkSortItem; its __lt__ parses metric columns
+        # as floats so clicking Stars/FWHM/BG/etc. sorts numerically.
+        # Purely visual — master lists stay in canonical order.
+        self.fileTree.setSortingEnabled(True)
+        hdr.setSectionsClickable(True)
+        hdr.setSortIndicatorShown(True)
+        # Default to column 0 ascending (filename natural order). If the
+        # user restored a saved state with a different indicator, that
+        # wins — restoreState sets it before this line is reached.
+        if hdr.sortIndicatorSection() < 0:
+            hdr.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        hdr.sortIndicatorChanged.connect(self._on_tree_sort_changed)
+
         left_layout.addWidget(self.fileTree)
 
         # "Clear Flags" Button
@@ -1610,7 +2069,8 @@ class BlinkTab(QWidget):
         self.zoom_panel_btn.setFixedWidth(110)
         self.zoom_panel_btn.clicked.connect(self._toggle_zoom_panel)
         zoom_controls_layout.addWidget(self.zoom_panel_btn)
-
+        self.btn_doc_help = make_help_button("blink", self)
+        zoom_controls_layout.addWidget(self.btn_doc_help)
         self.scroll_area = QScrollArea(self)
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -1650,7 +2110,8 @@ class BlinkTab(QWidget):
 
         splitter.addWidget(left_widget)
         splitter.addWidget(right_splitter)
-        splitter.setSizes([300, 900])
+        splitter.setSizes([300, 900])  # fallback default; _restore_main_splitter_state wins
+        splitter.splitterMoved.connect(self._save_main_splitter_state)
 
         # Add the splitter to the main layout
         main_layout.addWidget(splitter)
@@ -1821,6 +2282,21 @@ class BlinkTab(QWidget):
         """Show/hide leaf items based on the filter combo without touching list order."""
         mode = self.tree_filter_combo.currentData()
 
+        # Persist filter choice so it's remembered across sessions.
+        try:
+            QSettings().setValue("blink/tree_filter", mode)
+        except Exception:
+            pass
+
+        # sat_detected is tri-state: True (trail), False (checked, clean),
+        # None (never checked, or the check failed). Before any detection run
+        # everything is None, so "Clean Only" has to accept None or it would
+        # be empty. Once a run has happened, a None frame is one we could NOT
+        # check — it must not be presented as clean.
+        any_sat_run = any(
+            e.get("sat_detected") is not None for e in self.loaded_images
+        )
+
         for item in self.get_all_leaf_items():
             idx = self._leaf_index(item)
             if idx is None:
@@ -1837,7 +2313,10 @@ class BlinkTab(QWidget):
                 elif mode == "flagged":
                     show = flagged
                 elif mode == "clean":
-                    show = (not flagged and sat is not True)
+                    if any_sat_run:
+                        show = (not flagged) and (sat is False)
+                    else:
+                        show = (not flagged)
                 else:
                     show = True
 
@@ -1959,7 +2438,7 @@ class BlinkTab(QWidget):
         try:
             s = QSettings()
             hdr = self.fileTree.header()
-            state = s.value("blink/tree_header_state", None)
+            state = s.value("blink/tree_header_state_v2", None)
             if state is not None:
                 hdr.restoreState(state)
         except Exception:
@@ -1969,9 +2448,51 @@ class BlinkTab(QWidget):
         try:
             s = QSettings()
             hdr = self.fileTree.header()
-            s.setValue("blink/tree_header_state", hdr.saveState())
+            s.setValue("blink/tree_header_state_v2", hdr.saveState())
         except Exception:
             pass
+
+    def _on_tree_sort_changed(self, *_):
+        """User clicked a column header. The tree reorders itself via
+        _BlinkSortItem.__lt__; we just need to keep the Metrics window's
+        dot order aligned with the new visual order.
+
+        Deferred to the next event-loop tick: sortIndicatorChanged can
+        fire *before* Qt's internal sort slot runs, depending on slot
+        connection order, so reading _tree_order_indices() synchronously
+        would hand the metrics panel the pre-click order. singleShot(0)
+        waits until the sort has definitely completed."""
+        try:
+            self._save_tree_header_state()
+        except Exception:
+            pass
+        QTimer.singleShot(0, self._push_tree_order_to_metrics)
+
+    def _push_tree_order_to_metrics(self):
+        if self.metrics_window and self.metrics_window.isVisible():
+            try:
+                self.metrics_window.update_metrics(
+                    self.loaded_images, order=self._tree_order_indices()
+                )
+            except Exception:
+                pass
+
+    class _TreeBulkUpdate:
+        """Context manager: pauses sorting during bulk tree mutations so
+        every setText/addChild doesn't trigger a resort. Nestable."""
+        def __init__(self, tree):
+            self._tree = tree
+            self._was = False
+        def __enter__(self):
+            self._was = self._tree.isSortingEnabled()
+            self._tree.setSortingEnabled(False)
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            self._tree.setSortingEnabled(self._was)
+            return False
+
+    def _tree_bulk_update(self):
+        return BlinkTab._TreeBulkUpdate(self.fileTree)
 
     def _aggressive_display_boost(self, x01: np.ndarray, strength: float = 3.7) -> np.ndarray:
         """
@@ -2113,7 +2634,7 @@ class BlinkTab(QWidget):
             )
             return
 
-        # Progress UI
+        #sasprogress UI
         prog = QProgressDialog(self.tr("Rendering video…"), self.tr("Cancel"), 0, len(order), self)
         prog.setWindowTitle(self.tr("Export Blink Video"))
         prog.setAutoClose(True)
@@ -2226,13 +2747,14 @@ class BlinkTab(QWidget):
 
         if not use_aggr:
             if stored.dtype == np.uint8:
-                return stored
+                frame = stored
             elif stored.dtype == np.uint16:
-                return (stored >> 8).astype(np.uint8)
+                frame = (stored >> 8).astype(np.uint8)
             else:
                 # ✅ display-only normalization for float / weird ranges
                 f01 = self._ensure_float01(stored)
-                return (f01 * 255.0).astype(np.uint8)
+                frame = (f01 * 255.0).astype(np.uint8)
+            return self._paint_sat_overlay(frame, entry)
 
         base01 = self._as_float01(stored)
 
@@ -2244,7 +2766,50 @@ class BlinkTab(QWidget):
             gain = lum_boost / (lum + 1e-6)
             disp01 = np.clip(base01 * gain[..., None], 0.0, 1.0)
 
-        return (disp01 * 255.0).astype(np.uint8)
+        frame = (disp01 * 255.0).astype(np.uint8)
+        return self._paint_sat_overlay(frame, entry)
+
+    def _paint_sat_overlay(self, frame_u8: np.ndarray, entry: dict) -> np.ndarray:
+        """
+        If the entry has a satellite-trail overlay mask (2D bool, same HxW as
+        stored image_data), paint those pixels bright green (0,255,0) on the
+        display frame. Mono frames are promoted to RGB so the overlay reads
+        as actual green rather than a luminance change.
+        """
+        mask = entry.get("sat_overlay_mask", None)
+        if mask is None:
+            return frame_u8
+
+        try:
+            m = np.asarray(mask, dtype=bool)
+        except Exception:
+            return frame_u8
+
+        if m.size == 0 or not m.any():
+            return frame_u8
+
+        # Shape sanity vs the display frame
+        fh, fw = frame_u8.shape[:2]
+        if m.shape[:2] != (fh, fw):
+            # Mismatch — don't risk painting the wrong pixels
+            return frame_u8
+
+        #saspromote mono to RGB so we can draw green
+        if frame_u8.ndim == 2:
+            frame_rgb = np.stack([frame_u8, frame_u8, frame_u8], axis=-1)
+        elif frame_u8.ndim == 3 and frame_u8.shape[2] == 1:
+            frame_rgb = np.repeat(frame_u8, 3, axis=2)
+        else:
+            frame_rgb = frame_u8.copy()
+
+        if frame_rgb.dtype != np.uint8:
+            frame_rgb = frame_rgb.astype(np.uint8)
+
+        # Bright green overlay
+        frame_rgb[m, 0] = 0
+        frame_rgb[m, 1] = 255
+        frame_rgb[m, 2] = 0
+        return frame_rgb
 
 
 
@@ -2349,6 +2914,12 @@ class BlinkTab(QWidget):
         if hasattr(self, "playback_timer") and self.playback_timer is not None:
             self.playback_timer.setInterval(int(round(1000.0 / fps)))  # 0.1 fps -> 10000 ms
 
+        # Persist so the choice survives across sessions.
+        try:
+            QSettings().setValue("blink/play_fps", float(fps))
+        except Exception:
+            pass
+
 
     def _on_current_item_changed_safe(self, current, previous):
         if not current:
@@ -2440,7 +3011,11 @@ class BlinkTab(QWidget):
 
         metrics = panel.metrics_data
         m0, m1, m2, m3 = metrics[0], metrics[1], metrics[2], metrics[3]
-        n = min(len(self.loaded_images), len(m0), len(m1), len(m2), len(m3))
+        m4 = metrics[4]  # Weighted Score
+        m5 = metrics[5]  # Sensor Temp (°C from header)
+        m6 = metrics[6]  # Bg Rate (ADU/s, OFFSET-corrected)
+        n = min(len(self.loaded_images), len(m0), len(m1), len(m2), len(m3),
+                len(m4), len(m5), len(m6))
 
         def fmt_f(x):
             return "" if (x is None or not np.isfinite(x)) else f"{float(x):.2f}"
@@ -2452,31 +3027,47 @@ class BlinkTab(QWidget):
             except Exception:
                 return ""
 
-        for item in self.get_all_leaf_items():
-            idx = self._leaf_index(item)
-            if idx is None or idx < 0 or idx >= n:
-                continue
+        with self._tree_bulk_update():
+            for item in self.get_all_leaf_items():
+                idx = self._leaf_index(item)
+                if idx is None or idx < 0 or idx >= n:
+                    continue
 
-            # Sat column (1) — from sat_detected
-            if idx < len(self.loaded_images):
-                detected = self.loaded_images[idx].get("sat_detected", None)
-                if detected is True:
-                    item.setText(1, "⚠")
-                    item.setForeground(1, QBrush(QColor(255, 160, 0)))
-                    item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
-                elif detected is False:
-                    item.setText(1, "✓")
-                    item.setForeground(1, QBrush(QColor(100, 200, 100)))
-                    item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+                # Sat column (1) — from sat_detected
+                if idx < len(self.loaded_images):
+                    detected = self.loaded_images[idx].get("sat_detected", None)
+                    if detected is True:
+                        item.setText(1, "⚠")
+                        item.setForeground(1, QBrush(QColor(255, 160, 0)))
+                        item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+                    elif detected is False:
+                        item.setText(1, "✓")
+                        item.setForeground(1, QBrush(QColor(100, 200, 100)))
+                        item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
 
-            # Stars (2), FWHM (3), Ecc (4), BG (5)
-            item.setText(2, fmt_i(m3[idx]))
-            item.setText(3, fmt_f(m0[idx]))
-            item.setText(4, fmt_f(m1[idx]))
-            item.setText(5, fmt_f(m2[idx]))
+                # Stars (2), FWHM (3), Ecc (4), BG (5), Score (6), Temp (7), BG/s (8)
+                item.setText(2, fmt_i(m3[idx]))
+                item.setText(3, fmt_f(m0[idx]))
+                item.setText(4, fmt_f(m1[idx]))
+                item.setText(5, fmt_f(m2[idx]))
+                item.setText(6, fmt_f(m4[idx]))
+                item.setText(7, fmt_f(m5[idx]))
+                item.setText(8, fmt_f(m6[idx]))
 
-            for c in (2, 3, 4, 5):
-                item.setTextAlignment(c, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                for c in (2, 3, 4, 5, 6, 7, 8):
+                    item.setTextAlignment(c, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        # After metrics are populated, re-apply the current sort indicator
+        # so a column the user had sorted stays sorted with the new values.
+        try:
+            hdr = self.fileTree.header()
+            self.fileTree.sortItems(hdr.sortIndicatorSection(),
+                                    hdr.sortIndicatorOrder())
+        except Exception:
+            pass
+        # Defer the metrics-window order sync for the same reason as the
+        # header click: let Qt's sort pass settle before reading order.
+        QTimer.singleShot(0, self._push_tree_order_to_metrics)
     # inside BlinkTab
     def _sync_metrics_flags(self):
         if self.metrics_window:
@@ -2486,23 +3077,461 @@ class BlinkTab(QWidget):
             # after a move/delete, current_indices might be stale → refresh text safely
             self.metrics_window._update_status()
 
+    def _on_sat_mode_changed(self, _idx: int):
+        """Persist the Sat-detect mode selection to QSettings."""
+        try:
+            mode = self.sat_mode_combo.currentData() or "fast"
+            QSettings().setValue("blink/sat_detect_mode", str(mode))
+        except Exception:
+            pass
+
+    def _sat_detect_mode(self) -> str:
+        try:
+            m = self.sat_mode_combo.currentData()
+            return str(m) if m in ("fast", "full") else "fast"
+        except Exception:
+            return "fast"
+
+    def _sat_detect_workers(self) -> int:
+        """Current max concurrent satellite-detection workers."""
+        try:
+            v = int(QSettings().value(
+                "blink/sat_detect_workers",
+                int(getattr(self, "SAT_DETECT_MAX_WORKERS", 2)),
+                type=int,
+            ))
+            return max(1, min(8, v))
+        except Exception:
+            return int(getattr(self, "SAT_DETECT_MAX_WORKERS", 2))
+
+    def _open_sat_settings_dialog(self):
+        """Small popover dialog for the advanced satellite-detection knobs."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(self.tr("Satellite Detection Settings"))
+        dlg.setModal(True)
+
+        layout = QGridLayout(dlg)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(10)
+
+        # ── Edge exclusion ───────────────────────────────────────────────
+        edge_lbl = QLabel(self.tr("Ignore edges within:"), dlg)
+        edge_spin = QSpinBox(dlg)
+        edge_spin.setRange(0, 2048)
+        edge_spin.setSingleStep(16)
+        edge_spin.setSuffix(" px")
+        edge_spin.setValue(self._sat_edge_exclusion_px())
+        edge_spin.setToolTip(self.tr(
+            "Pixels from each image edge to ignore for satellite trail detection.\n"
+            "Amp glow near the sensor border reads as a bright streak that the\n"
+            "detection models often flag as a trail — widen this to suppress\n"
+            "those false positives. Default 128 px. Set to 0 to disable the\n"
+            "edge filter. Applies to both Fast and Highlight modes."
+        ))
+
+        edge_help = QLabel(self.tr(
+            "Hides amp-glow / sensor-edge false positives."
+        ), dlg)
+        edge_help.setStyleSheet("font-size: 10px; color: palette(mid);")
+        edge_help.setWordWrap(True)
+
+        layout.addWidget(edge_lbl, 0, 0)
+        layout.addWidget(edge_spin, 0, 1)
+        layout.addWidget(edge_help, 1, 0, 1, 2)
+
+        # ── Worker threads ───────────────────────────────────────────────
+        workers_lbl = QLabel(self.tr("Concurrent workers:"), dlg)
+        workers_spin = QSpinBox(dlg)
+        workers_spin.setRange(1, 8)
+        workers_spin.setValue(self._sat_detect_workers())
+        workers_spin.setToolTip(self.tr(
+            "Number of images LOADED AND PREPARED in parallel.\n"
+            "\n"
+            "GPU inference itself is always serialized — one image at a time,\n"
+            "regardless of this value. Interleaving GPU work from several\n"
+            "threads onto one device is what causes DirectML adapter resets,\n"
+            "so this knob deliberately does not parallelize it.\n"
+            "\n"
+            "Raising it overlaps file reads, stretching and tiling with the\n"
+            "inference that is already running. Each worker holds a full-res\n"
+            "frame in RAM. Default 2. Drop to 1 if you are short on memory."
+        ))
+
+        workers_help = QLabel(self.tr(
+            "Overlaps file loading with inference. GPU work is always serialized."
+        ), dlg)
+        workers_help.setStyleSheet("font-size: 10px; color: palette(mid);")
+        workers_help.setWordWrap(True)
+
+        layout.addWidget(workers_lbl, 2, 0)
+        layout.addWidget(workers_spin, 2, 1)
+        layout.addWidget(workers_help, 3, 0, 1, 2)
+
+        # ── OK / Cancel ──────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        ok_btn = QPushButton(self.tr("OK"), dlg)
+        cancel_btn = QPushButton(self.tr("Cancel"), dlg)
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(dlg.accept)
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row, 4, 0, 1, 2)
+
+        dlg.setMinimumWidth(340)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            try:
+                QSettings().setValue(
+                    "blink/sat_edge_exclusion_px", int(edge_spin.value())
+                )
+                QSettings().setValue(
+                    "blink/sat_detect_workers", int(workers_spin.value())
+                )
+            except Exception as e:
+                print(f"[Sat settings] Save failed: {e}")
+
     def _detect_satellite_trails(self):
         """
-        Run the Cosmic Clarity ResNet detection pass on all loaded images.
-        Uses a prefetch pipeline so CPU tile prep overlaps with GPU inference.
+        Dispatcher: pick fast detection-only or full pipeline based on the
+        Mode combo next to the button. "Full" mode shows a one-time warning
+        the first time it is used, with a 'don't show again' option.
         """
         if not self.loaded_images:
             QMessageBox.information(self, self.tr("No Images"),
                                     self.tr("Load images before running satellite detection."))
             return
 
+        mode = self._sat_detect_mode()
+
+        if mode == "full":
+            # Show one-time warning about slower runtime unless user has
+            # already acknowledged it.
+            try:
+                skip_warn = bool(QSettings().value(
+                    "blink/sat_full_warning_dismissed", False, type=bool))
+            except Exception:
+                skip_warn = False
+
+            if not skip_warn:
+                mb = QMessageBox(self)
+                mb.setIcon(QMessageBox.Icon.Warning)
+                mb.setWindowTitle(self.tr("Highlight Trails — Slower"))
+                mb.setText(self.tr(
+                    "'Highlight trails' runs the full satellite-removal pipeline on every "
+                    "image. On frames with detected trails it also runs the NAFNet removal "
+                    "model, which is significantly slower than the Fast detection-only pass "
+                    "— expect several seconds to a minute per flagged frame depending on "
+                    "your GPU."
+                ))
+                mb.setInformativeText(self.tr(
+                    "Continue? The trail pixels will be painted bright green in the preview."))
+
+                cb = QCheckBox(self.tr("Don't show this warning again"), mb)
+                mb.setCheckBox(cb)
+
+                mb.setStandardButtons(
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                mb.setDefaultButton(QMessageBox.StandardButton.Yes)
+
+                resp = mb.exec()
+
+                if cb.isChecked():
+                    try:
+                        QSettings().setValue(
+                            "blink/sat_full_warning_dismissed", True)
+                    except Exception:
+                        pass
+
+                if resp != QMessageBox.StandardButton.Yes:
+                    return
+
+            self._run_sat_detect_full()
+        else:
+            self._run_sat_detect_fast()
+
+    # Max concurrent GPU inference workers for satellite detection. Each
+    # worker holds one full-res raw image in RAM and its own activation
+    # tensors on the GPU, so 2 is a safe balance between throughput and
+    # VRAM/RAM pressure. Bump to 3 if your GPU and RAM can take it.
+    SAT_DETECT_MAX_WORKERS = 2
+
+    # Pixels from each image edge to IGNORE for satellite trail detection.
+    # Amp glow typically lives in the outermost ring of the sensor and reads
+    # as a bright streak that both detection models love to flag. Set to 0
+    # to disable the edge filter entirely. Tunable at runtime via QSettings
+    # key "blink/sat_edge_exclusion_px" per sensor.
+    SAT_EDGE_EXCLUSION_PX = 128
+
+    def _sat_edge_exclusion_px(self) -> int:
+        """How many pixels from each image edge to ignore for satellite detection."""
+        try:
+            v = int(QSettings().value(
+                "blink/sat_edge_exclusion_px",
+                int(self.SAT_EDGE_EXCLUSION_PX),
+                type=int,
+            ))
+            return max(0, v)
+        except Exception:
+            return int(self.SAT_EDGE_EXCLUSION_PX)
+
+    @staticmethod
+    def _apply_edge_exclusion_to_mask(mask_full: np.ndarray, edge_px: int) -> np.ndarray:
+        """
+        Zero out mask pixels within edge_px of any image edge, in-place-safe.
+        Returns the (possibly modified) mask. Used in Highlight mode so amp
+        glow near the sensor edge doesn't get painted green.
+        """
+        if edge_px <= 0 or mask_full is None:
+            return mask_full
+        m = np.asarray(mask_full, dtype=bool)
+        if m.ndim != 2 or m.size == 0:
+            return m
+        H, W = m.shape
+        # Make a writable copy to avoid mutating caller's array
+        out = m.copy()
+        # Only apply if the image is large enough to leave an interior
+        if H > 2 * edge_px:
+            out[:edge_px, :] = False
+            out[-edge_px:, :] = False
+        else:
+            # Image is thinner than 2× exclusion — zero the whole thing
+            out[:, :] = False
+            return out
+        if W > 2 * edge_px:
+            out[:, :edge_px] = False
+            out[:, -edge_px:] = False
+        else:
+            out[:, :] = False
+        return out
+
+    def _sat_mask_to_display_size(self, mask_full: np.ndarray, target_hw: tuple) -> np.ndarray:
+        """
+        Downsample a full-resolution 2D bool trail mask to the stored
+        display image dimensions. OR-reduction over each block so a
+        single hot pixel still appears green at any load_scale.
+        """
+        try:
+            m = np.asarray(mask_full, dtype=bool)
+            th, tw = int(target_hw[0]), int(target_hw[1])
+            if m.ndim != 2 or th <= 0 or tw <= 0:
+                return np.zeros((th, tw), dtype=bool)
+            if m.shape == (th, tw):
+                return m
+
+            # cv2.resize on uint8 (0/255) with INTER_AREA averages blocks;
+            # any block containing a True pixel produces a non-zero result,
+            # so > 0 recovers OR-reduction.
+            src = m.astype(np.uint8) * 255
+            resized = cv2.resize(src, (tw, th), interpolation=cv2.INTER_AREA)
+            return (resized > 0)
+        except Exception as e:
+            print(f"[Sat detect] Mask downsample failed: {e}")
+            try:
+                return np.zeros((int(target_hw[0]), int(target_hw[1])), dtype=bool)
+            except Exception:
+                return None
+
+    def _sat_group_key(self, idx: int, shape_hw) -> tuple:
+        """Which frames may be pooled for the fixed-pattern statistic.
+
+        Amp glow and diffraction spikes belong to ONE rig in ONE configuration.
+        Delegates to the engine so Blink, the Cosmic Clarity batch and
+        Calibrate_Lights all use a single definition.
+        """
+        return artifact_group_key(
+            self.loaded_images[idx].get("header", {}) or {}, shape_hw
+        )
+
+    def _sat_scan_frames(self, models, *, border_size, compat, prog,
+                         abort_evt, device_err, max_workers, label):
+        """
+        THE satellite detection scan. There is exactly one of these.
+
+        Fast mode IS this and nothing else. Highlight mode runs this as its
+        pass 1 and then removes only what survives. Keeping it in one place is
+        the point: when this existed twice the two copies drifted by a single
+        parameter and Highlight silently stopped rejecting fixed-pattern tiles
+        while Fast kept working.
+
+        Does three things:
+          1. detect every interior tile of every loaded frame (GPU work is
+             serialized inside the engine; the threads overlap I/O and prep),
+          2. build the per-group fixed-pattern map and reject tiles that keep
+             appearing in the same sensor position,
+          3. write the final sat_detected state for every frame.
+
+        Writes nothing to disk, so cancelling is free.
+
+        Returns a dict with:
+          scanned    {idx: all passing tiles}
+          survivors  {idx: REAL trail tiles, fixed-pattern already removed}
+          n_art_tiles, n_cleared, n_unknown, canceled
+        """
+        import concurrent.futures as cf
+        from setiastro.saspro.cosmicclarity_engines._backend_guard import (
+            DeviceLostError,
+            safe_exception_str as _safe_exc,
+        )
+
+        n_images = len(self.loaded_images)
+        per_frame: dict = {}
+        n_unknown = 0
+        completed = 0
+        canceled = False
+
+        def _worker(idx: int, file_path: str):
+            """Returns (idx, tiles, shape_hw). tiles is the list of passing
+            (y0,x0,h,w) rects — possibly empty — or None for UNKNOWN."""
+            if abort_evt.is_set():
+                return (idx, None, None)
+            try:
+                from setiastro.saspro.legacy.image_manager import load_image
+                raw_image, _h, _b, _m = load_image(file_path)
+                if raw_image is None:
+                    return (idx, None, None)
+            except Exception as e:
+                print(f"[Sat detect] Load failed for {file_path}: {e}")
+                return (idx, None, None)
+
+            if abort_evt.is_set():
+                return (idx, None, None)
+
+            shape_hw = tuple(int(v) for v in np.asarray(raw_image).shape[:2])
+            try:
+                tiles = satellite_detect_tiles(
+                    raw_image, models,
+                    chunk_size=256,
+                    # MUST be 0. The map is tested back against whole tiles, so
+                    # the grid has to be fixed and non-overlapping: a fixed
+                    # artifact then lands in the SAME tile every frame and the
+                    # mask comes out as that whole tile. On an overlapping grid
+                    # it lands in a different subset each frame and the mask
+                    # shrinks to the sliver where those subsets intersect —
+                    # too small to veto anything.
+                    overlap=0,
+                    border_size=border_size,
+                    temp_stretch=True, target_median=0.25,
+                    compatibility_mode=compat,
+                    # No early exit: the map needs every tile, or the counts
+                    # skew toward whichever tiles get scanned first.
+                    stop_after=None,
+                    status_cb=lambda _m: None,
+                )
+                return (idx, list(tiles), shape_hw)
+            except DeviceLostError as e:
+                if not device_err:
+                    device_err.append(_safe_exc(e))
+                abort_evt.set()
+                return (idx, None, None)
+            except Exception as e:
+                print(f"[Sat detect] Inference failed on {file_path}: {e}")
+                return (idx, None, None)
+
+        # Built explicitly rather than with `with`: ThreadPoolExecutor.__exit__
+        # calls shutdown(wait=True), which blocks the GUI thread with no event
+        # loop. If a worker is wedged in a driver call that is a permanent
+        # freeze — the "hang with no further console output".
+        ex = cf.ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            futures = {
+                ex.submit(_worker, i, self.loaded_images[i]["file_path"]): i
+                for i in range(n_images)
+            }
+            pending = set(futures)
+            while pending:
+                if prog.wasCanceled():
+                    canceled = True
+                    abort_evt.set()
+                    for f in pending:
+                        f.cancel()
+                    break
+                if abort_evt.is_set():
+                    for f in pending:
+                        f.cancel()
+
+                done, pending = cf.wait(pending, timeout=0.1,
+                                        return_when=cf.FIRST_COMPLETED)
+                for fut in done:
+                    if fut.cancelled():
+                        completed += 1
+                        n_unknown += 1
+                        continue
+                    try:
+                        idx, tiles, shape_hw = fut.result()
+                    except Exception as e:
+                        print(f"[Sat detect] Worker exception: {e}")
+                        idx = futures.get(fut, -1)
+                        tiles, shape_hw = None, None
+
+                    if 0 <= idx < n_images:
+                        if tiles is None or shape_hw is None:
+                            self.loaded_images[idx]["sat_detected"] = None
+                            n_unknown += 1
+                        else:
+                            per_frame[idx] = (tiles, shape_hw)
+                    completed += 1
+
+                prog.setValue(completed)
+                prog.setLabelText(self.tr(
+                    "{0}: {1} of {2} ({3} with hits so far)"
+                ).format(label, completed, n_images,
+                         sum(1 for t in per_frame.values() if t[0])))
+                QApplication.processEvents()
+        finally:
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                ex.shutdown(wait=False)
+
+        # ── Fixed-pattern rejection (no GPU, pure counting) ─────────────────
+        # Counting / thresholding / clean-vs-real splitting lives in the
+        # engine so Blink, the CC batch and Calibrate_Lights share ONE copy.
+        survivors: dict = {}
+        n_art_tiles = 0
+        n_cleared = 0
+        if per_frame and not canceled and not device_err:
+            builder = ArtifactMapBuilder()
+            for idx, (tiles, hw) in per_frame.items():
+                builder.add(idx, self.loaded_images[idx].get("header", {}) or {},
+                            hw, tiles)
+            clean, survivors, n_art_tiles = builder.finalize(
+                status_cb=lambda m: print(f"[Sat detect] {m}"))
+            n_cleared = sum(1 for i in clean if per_frame[i][0])
+        else:
+            # Scan did not complete: trust the raw hits, veto nothing.
+            survivors = {i: t for i, (t, _hw) in per_frame.items() if t}
+
+        for idx in per_frame:
+            self.loaded_images[idx]["sat_detected"] = bool(idx in survivors)
+
+        print(f"[Sat detect] Scan done: {len(per_frame)} checked, "
+              f"{sum(1 for t in per_frame.values() if t[0])} with hits, "
+              f"{n_art_tiles} fixed-pattern tile(s) ignored, "
+              f"{n_cleared} frame(s) cleared, {len(survivors)} with real trails.")
+
+        return {
+            "scanned": {i: t for i, (t, _hw) in per_frame.items()},
+            "survivors": survivors,
+            "n_art_tiles": n_art_tiles,
+            "n_cleared": n_cleared,
+            "n_unknown": n_unknown,
+            "canceled": canceled,
+        }
+
+    def _sat_begin(self, title: str):
+        """Shared setup for both modes: progress dialog, models, snapshotted
+        settings. Returns None when the models could not be loaded."""
+        import threading as _th
+
+        n_images = len(self.loaded_images)
         prog = QProgressDialog(
             self.tr("Loading satellite detection model…"),
-            self.tr("Cancel"),
-            0, len(self.loaded_images),
-            self,
+            self.tr("Cancel"), 0, max(1, n_images), self,
         )
-        prog.setWindowTitle(self.tr("Satellite Trail Detection"))
+        prog.setWindowTitle(title)
         prog.setWindowModality(Qt.WindowModality.WindowModal)
         prog.setMinimumDuration(0)
         prog.setMinimumWidth(420)
@@ -2511,216 +3540,321 @@ class BlinkTab(QWidget):
         QApplication.processEvents()
 
         try:
-            models = get_satellite_models(use_gpu=True,
-                                        status_cb=lambda m: print(f"[Sat] {m}"))
+            models = get_satellite_models(
+                use_gpu=True, status_cb=lambda m: print(f"[Sat] {m}"))
         except Exception as e:
             prog.close()
-            QMessageBox.critical(self, self.tr("Model Load Error"),
-                                self.tr("Could not load satellite detection model:\n{0}").format(e))
-            return
+            QMessageBox.critical(
+                self, self.tr("Model Load Error"),
+                self.tr("Could not load satellite detection model:\n{0}").format(e))
+            return None
 
-        is_onnx = bool(models.get("is_onnx", False))
-        chunk_size = 256
-        overlap = 0
-        border_size = 16
-        detect_bs = 32
-
-        # ── Tile prep function (runs on CPU in background thread) ────────────
-        def _prepare_tiles(entry):
-            try:
-                # Load original file fresh — linear, un-debayered, un-stretched
-                # This is what the satellite model expects
-                from setiastro.saspro.legacy.image_manager import load_image
-                raw_image, header, bit_depth, is_mono = load_image(entry["file_path"])
-                if raw_image is None:
-                    return None
-
-                rgb01, _was_mono, _orig_min, _scale = _normalize_for_satellite(raw_image)
-                H, W = rgb01.shape[:2]
-
-                arr = rgb01.astype(np.float32)
-                if np.median(arr - np.min(arr)) < 0.05:
-                    arr, _smin, _smeds = stretch_image(arr, target_median=0.25)
-
-                all_tiles = list(_split_chunks(arr, chunk_size, overlap))
-                interior = [
-                    (tile, y0, x0)
-                    for (tile, y0, x0) in all_tiles
-                    if not _is_border_tile(
-                        y0, x0,
-                        y0 + tile.shape[0], x0 + tile.shape[1],
-                        H, W, border_size
-                    )
-                ]
-
-                if not interior:
-                    return None
-
-                tiles_only = [t.astype(np.float32) for (t, _, _) in interior]
-                coords = [(y0, x0) for (_, y0, x0) in interior]   # ← keep coords
-
-                if is_onnx:
-                    return tiles_only, coords
-                else:
-                    return [_resize_tile_for_detect(t) for t in tiles_only], coords
-
-            except Exception as e:
-                print(f"[Sat detect] Tile prep failed for {entry.get('file_path','?')}: {e}")
-                return None
-
-            # ── Inference function (runs on GPU, called from main thread) ────────
-        def _run_inference(resized_tiles, interior_tiles_coords):
-            """
-            Returns True if at least 2 spatially adjacent interior tiles both pass det1 + det2.
-            interior_tiles_coords: list of (y0, x0) for each tile in resized_tiles.
-            """
-            passing_coords = []
-
-            if is_onnx:
-                det1_sess = models["detection_model1"]
-                det2_sess = models["detection_model2"]
-                for i, tile in enumerate(resized_tiles):
-                    from setiastro.saspro.cosmicclarity_engines.satellite_engine import _onnx_detect
-                    if _onnx_detect(tile, det1_sess) and _onnx_detect(tile, det2_sess):
-                        passing_coords.append(interior_tiles_coords[i])
-            else:
-                torch = models["torch"]
-                device = models["device"]
-                det1 = models["detection_model1"]
-                det2 = models["detection_model2"]
-
-                for i in range(0, len(resized_tiles), detect_bs):
-                    batch_np = np.stack(resized_tiles[i:i + detect_bs], axis=0)
-                    batch_np = np.transpose(batch_np, (0, 3, 1, 2)).astype(np.float32)
-
-                    x = torch.from_numpy(batch_np)
-                    if hasattr(device, "type") and device.type == "cuda":
-                        x = x.pin_memory().to(device, dtype=torch.float32, non_blocking=True)
-                    else:
-                        x = x.to(device=device, dtype=torch.float32)
-
-                    with torch.no_grad():
-                        o1 = det1(x).flatten()
-                    keep1 = (o1 > 0.5)
-
-                    if keep1.any():
-                        idxs = keep1.nonzero(as_tuple=False).flatten()
-                        with torch.no_grad():
-                            o2 = det2(x[idxs]).flatten()
-                        passing_mask = (o2 > 0.25)
-                        for j, global_i in enumerate(idxs.tolist()):
-                            if passing_mask[j]:
-                                passing_coords.append(interior_tiles_coords[i + global_i])
-
-            # Need at least 2 passing tiles that are spatially adjacent (8-connected)
-            # tile coords are (y0, x0) in pixel space; tiles are chunk_size apart minus overlap
-            # Two tiles are adjacent if their origins differ by at most (chunk_size - overlap) in each axis
-            if len(passing_coords) < 2:
-                return False
-
-            step = chunk_size  # pixel distance between adjacent tile origins
-            tolerance = step * 1.5       # slightly loose to handle edge tiles
-
-            for i in range(len(passing_coords)):
-                y0_a, x0_a = passing_coords[i]
-                for j in range(i + 1, len(passing_coords)):
-                    y0_b, x0_b = passing_coords[j]
-                    if abs(y0_a - y0_b) <= tolerance and abs(x0_a - x0_b) <= tolerance:
-                        return True
-
-            return False
-
-        # ── Prefetch pipeline ─────────────────────────────────────────────────
-        # We keep exactly ONE image prepping in the background while the GPU
-        # runs inference on the current image. This fully hides CPU prep latency
-        # without buffering large amounts of tile data in RAM.
-        import concurrent.futures
-        from collections import deque
-
-        n_images = len(self.loaded_images)
-        n_detected = 0
-        PREFETCH_DEPTH = 4  # keep this many images prepped ahead of GPU
-
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=PREFETCH_DEPTH)
-        pending = deque()  # deque of (img_idx, future)
+        # Stale overlays from a previous run must not outlive it.
+        for entry in self.loaded_images:
+            entry.pop("sat_overlay_mask", None)
 
         try:
-            # Seed the pipeline — submit first PREFETCH_DEPTH images immediately
-            for seed_idx in range(min(PREFETCH_DEPTH, n_images)):
-                fut = executor.submit(_prepare_tiles, self.loaded_images[seed_idx])
-                pending.append((seed_idx, fut))
+            compat = bool(QSettings().value("cc/gpu_compat_mode", False, type=bool))
+        except Exception:
+            compat = False
 
-            next_to_submit = PREFETCH_DEPTH  # index of next image to submit
+        # Guard against processEvents() re-entrancy starting a second run.
+        try:
+            self.sat_detect_btn.setEnabled(False)
+        except Exception:
+            pass
 
-            for img_idx in range(n_images):
-                if prog.wasCanceled():
-                    break
+        return {
+            "models": models,
+            "prog": prog,
+            "border_size": max(16, self._sat_edge_exclusion_px()),
+            "compat": compat,
+            "abort_evt": _th.Event(),
+            "device_err": [],
+            "max_workers": self._sat_detect_workers(),
+            "n_images": n_images,
+        }
 
-                prog.setLabelText(
-                    self.tr("Checking image {0} of {1}: {2}").format(
-                        img_idx + 1, n_images,
-                        os.path.basename(self.loaded_images[img_idx]["file_path"])
-                    )
-                )
-                QApplication.processEvents()
-
-                # Pop the next ready result from the front of the queue
-                current_idx, current_future = pending.popleft()
-                assert current_idx == img_idx  # should always match
-
-                try:
-                    tiles = current_future.result()
-                except Exception as e:
-                    print(f"[Sat detect] Prep failed for image {img_idx}: {e}")
-                    tiles = None
-
-                # Immediately submit the next image to keep pipeline full
-                if next_to_submit < n_images and not prog.wasCanceled():
-                    fut = executor.submit(_prepare_tiles, self.loaded_images[next_to_submit])
-                    pending.append((next_to_submit, fut))
-                    next_to_submit += 1
-
-                # Run GPU inference while next images are prepping
-                entry = self.loaded_images[img_idx]
-                if tiles is None:
-                    entry["sat_detected"] = False
-                else:
-                    try:
-                        resized_tiles, coords = tiles
-                        trail_found = _run_inference(resized_tiles, coords)
-                        entry["sat_detected"] = trail_found
-                        if trail_found:
-                            n_detected += 1
-                    except Exception as e:
-                        print(f"[Sat detect] Inference failed on {entry['file_path']}: {e}")
-                        entry["sat_detected"] = False
-
-                prog.setValue(img_idx + 1)
-                QApplication.processEvents()
-
-        finally:
-            executor.shutdown(wait=False)
-
-        prog.close()
+    def _sat_finish(self, ctx):
+        """Close the dialog, re-enable the button, refresh the tree/preview."""
+        try:
+            ctx["prog"].close()
+        except Exception:
+            pass
+        try:
+            self.sat_detect_btn.setEnabled(True)
+        except Exception:
+            pass
 
         self._update_tree_sat_column()
+        try:
+            cur = self.fileTree.currentItem()
+            if cur is not None and cur.childCount() == 0:
+                self._last_preview_name = None
+                self.on_item_clicked(cur, 0)
+        except Exception:
+            pass
 
-        if not prog.wasCanceled():
-            QMessageBox.information(
-                self,
-                self.tr("Satellite Detection Complete"),
-                self.tr(
-                    "Checked {0} image{1}.\n"
-                    "{2} potential satellite trail{3} detected.\n\n"
-                    "Images with trails are marked ⚠ in the Sat column.\n"
-                    "Use 'F' or click a dot in Metrics to flag for culling."
-                ).format(
-                    n_images,
-                    "s" if n_images != 1 else "",
-                    n_detected,
-                    "s" if n_detected != 1 else "",
-                )
+    def _sat_report_device_loss(self, device_err, *, modified: bool):
+        """Poison DirectML process-wide and tell the user plainly."""
+        from setiastro.saspro.cosmicclarity_engines._backend_guard import (
+            disable_dml as _disable_dml,
+        )
+        try:
+            _disable_dml("Adapter was removed or hung during satellite detection.",
+                         status_cb=lambda m: print(f"[Sat] {m}"))
+        except Exception:
+            pass
+        _what = (self.tr("Frames that were not checked are left blank in the Sat "
+                         "column — they have NOT been marked clean.")
+                 if modified else
+                 self.tr("No images were modified."))
+        QMessageBox.critical(
+            self, self.tr("GPU Device Lost"),
+            self.tr(
+                "The graphics adapter was reset or removed during satellite "
+                "detection:\n\n{0}\n\n{1}\n\n"
+                "GPU acceleration has been disabled for the rest of this session. "
+                "Re-run to continue on the CPU, or restart SASpro to try the GPU "
+                "again."
+            ).format(device_err[0], _what)
+        )
+
+    def _run_sat_detect_fast(self):
+        """
+        Fast mode: run the scan, report what it found. Nothing else.
+
+        A lost adapter ABORTS the run; frames with no answer are left UNKNOWN
+        (blank Sat cell) rather than recorded as clean.
+        """
+        ctx = self._sat_begin(self.tr("Satellite Trail Detection (Fast)"))
+        if ctx is None:
+            return
+
+        res = self._sat_scan_frames(
+            ctx["models"], border_size=ctx["border_size"], compat=ctx["compat"],
+            prog=ctx["prog"], abort_evt=ctx["abort_evt"],
+            device_err=ctx["device_err"], max_workers=ctx["max_workers"],
+            label=self.tr("Scanning"),
+        )
+        self._sat_finish(ctx)
+
+        if ctx["device_err"]:
+            self._sat_report_device_loss(ctx["device_err"], modified=False)
+            return
+        if res["canceled"]:
+            return
+
+        n_detected = len(res["survivors"])
+        _art = ""
+        if res["n_art_tiles"]:
+            _art = self.tr(
+                "\nFixed-pattern filter: {0} tile(s) ignored as diffraction spikes "
+                "or amp glow; {1} frame(s) cleared because that was their only "
+                "evidence.\n"
+            ).format(res["n_art_tiles"], res["n_cleared"])
+
+        QMessageBox.information(
+            self, self.tr("Satellite Detection Complete"),
+            self.tr(
+                "Checked {0} image{1}.\n"
+                "{2} potential satellite trail{3} detected.\n"
+                "{4} could not be checked.\n"
+            ).format(ctx["n_images"], "s" if ctx["n_images"] != 1 else "",
+                     n_detected, "s" if n_detected != 1 else "",
+                     res["n_unknown"])
+            + _art
+            + self.tr(
+                "\nImages with trails are marked ⚠ in the Sat column.\n"
+                "Use 'F' or click a dot in Metrics to flag for culling.\n\n"
+                "Tip: switch Mode to 'Highlight trails' to see the trail "
+                "pixels painted green in the preview."
             )
+        )
+
+    def _run_sat_detect_full(self):
+        """
+        Highlight mode = the Fast scan, then removal on what survived it.
+
+        Pass 1 is literally _sat_scan_frames — the same code Fast runs, so the
+        two modes cannot disagree about which frames or tiles hold real trails.
+        Pass 2 then loads ONLY the surviving frames and hands the engine their
+        surviving tiles as detect_tiles, so it runs no detection of its own and
+        pushes only those tiles through NAFNet.
+        """
+        import concurrent.futures as cf
+
+        ctx = self._sat_begin(self.tr("Satellite Trail Detection (Highlight)"))
+        if ctx is None:
+            return
+        models = ctx["models"]
+        prog = ctx["prog"]
+        abort_evt = ctx["abort_evt"]
+        device_err = ctx["device_err"]
+        n_images = ctx["n_images"]
+
+        # ── PASS 1 — the Fast scan, verbatim ────────────────────────────────
+        res = self._sat_scan_frames(
+            models, border_size=ctx["border_size"], compat=ctx["compat"],
+            prog=prog, abort_evt=abort_evt, device_err=device_err,
+            max_workers=ctx["max_workers"],
+            label=self.tr("Pass 1 of 2 — scanning"),
+        )
+
+        if device_err or res["canceled"]:
+            # Pass 1 wrote nothing, so there is nothing to unwind.
+            self._sat_finish(ctx)
+            if device_err:
+                self._sat_report_device_loss(device_err, modified=False)
+            return
+
+        survivors = res["survivors"]
+        n_pass2 = len(survivors)
+
+        # ── PASS 2 — removal, only the surviving frames and tiles ───────────
+        SAT_MODE = "full"
+        SAT_CLIP_TRAIL = True
+        SAT_SENSITIVITY = 0.10
+        SAT_TEMP_STRETCH = True
+        SAT_TARGET_MEDIAN = 0.25
+        edge_excl_px = ctx["border_size"]
+
+        prog.setValue(0)
+        try:
+            prog.setMaximum(max(1, n_pass2))
+        except Exception:
+            pass
+
+        job_specs = []
+        for idx in sorted(survivors):
+            stored = self.loaded_images[idx].get("image_data", None)
+            if stored is None:
+                continue
+            job_specs.append((idx, self.loaded_images[idx]["file_path"],
+                              tuple(stored.shape[:2])))
+
+        def _worker(idx: int, file_path, stored_hw):
+            """Removal for one surviving frame. Returns (idx, mask_display)."""
+            if abort_evt.is_set():
+                return (idx, None)
+            try:
+                from setiastro.saspro.legacy.image_manager import load_image
+                raw_image, _h, _b, _m = load_image(file_path)
+                if raw_image is None:
+                    return (idx, None)
+            except Exception as e:
+                print(f"[Sat detect] Load failed for {file_path}: {e}")
+                return (idx, None)
+
+            if abort_evt.is_set():
+                return (idx, None)
+
+            try:
+                _out, _detected, trail_mask_full = satellite_remove_image(
+                    raw_image,
+                    models=models,
+                    mode=SAT_MODE,
+                    clip_trail=SAT_CLIP_TRAIL,
+                    sensitivity=SAT_SENSITIVITY,
+                    temp_stretch=SAT_TEMP_STRETCH,
+                    target_median=SAT_TARGET_MEDIAN,
+                    return_mask=True,
+                    progress_cb=None,
+                    # Pass 1's surviving tiles. The engine runs NO detection.
+                    detect_tiles=survivors.get(idx),
+                    status_cb=lambda _m: None,
+                )
+            except Exception as e:
+                from setiastro.saspro.cosmicclarity_engines._backend_guard import (
+                    is_device_lost_error as _is_lost,
+                    safe_exception_str as _exc,
+                )
+                if _is_lost(e):
+                    if not device_err:
+                        device_err.append(_exc(e))
+                    abort_evt.set()
+                    return (idx, None)
+                print(f"[Sat detect] Pipeline failed on {file_path}: {e}")
+                return (idx, None)
+
+            trail_mask_full = self._apply_edge_exclusion_to_mask(
+                trail_mask_full, edge_excl_px)
+            if trail_mask_full is None or not trail_mask_full.any():
+                return (idx, None)
+            mask_display = self._sat_mask_to_display_size(trail_mask_full, stored_hw)
+            if mask_display is None or not mask_display.any():
+                return (idx, None)
+            return (idx, mask_display)
+
+        completed = 0
+        ex = cf.ThreadPoolExecutor(max_workers=ctx["max_workers"])
+        try:
+            futures = {ex.submit(_worker, i, fp, hw): i for (i, fp, hw) in job_specs}
+            pending = set(futures)
+            while pending:
+                if prog.wasCanceled():
+                    abort_evt.set()
+                    for f in pending:
+                        f.cancel()
+                    break
+                if abort_evt.is_set():
+                    for f in pending:
+                        f.cancel()
+
+                done, pending = cf.wait(pending, timeout=0.1,
+                                        return_when=cf.FIRST_COMPLETED)
+                for fut in done:
+                    if not fut.cancelled():
+                        try:
+                            idx, mask = fut.result()
+                            if mask is not None and 0 <= idx < n_images:
+                                self.loaded_images[idx]["sat_overlay_mask"] = mask
+                        except Exception as e:
+                            print(f"[Sat detect] Worker exception: {e}")
+                    completed += 1
+
+                prog.setValue(completed)
+                prog.setLabelText(self.tr(
+                    "Pass 2 of 2 — removing trails: {0} of {1}"
+                ).format(completed, n_pass2))
+                QApplication.processEvents()
+        finally:
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                ex.shutdown(wait=False)
+
+        self._sat_finish(ctx)
+
+        if device_err:
+            self._sat_report_device_loss(device_err, modified=True)
+            return
+
+        _art = ""
+        if res["n_art_tiles"]:
+            _art = self.tr(
+                "\nFixed-pattern filter: {0} tile(s) ignored as diffraction spikes "
+                "or amp glow; {1} frame(s) cleared because that was their only "
+                "evidence, so pass 2 only had to process {2}.\n"
+            ).format(res["n_art_tiles"], res["n_cleared"], n_pass2)
+
+        QMessageBox.information(
+            self, self.tr("Satellite Detection Complete"),
+            self.tr(
+                "Checked {0} image{1}.\n"
+                "{2} potential satellite trail{3} detected.\n"
+                "{4} could not be checked.\n"
+            ).format(n_images, "s" if n_images != 1 else "",
+                     n_pass2, "s" if n_pass2 != 1 else "",
+                     res["n_unknown"])
+            + _art
+            + self.tr(
+                "\nImages with trails are marked ⚠ in the Sat column and\n"
+                "the trail pixels are highlighted in bright green in the preview.\n"
+                "Use 'F' or click a dot in Metrics to flag for culling."
+            )
+        )
+
     def _update_tree_sat_column(self):
         for item in self.get_all_leaf_items():
             idx = self._leaf_index(item)
@@ -2811,7 +3945,13 @@ class BlinkTab(QWidget):
         if self.metrics_window and self.metrics_window.isVisible():
             self.metrics_window.update_metrics(self.loaded_images, order=self._tree_order_indices())
         self._update_tree_metrics_columns()
-        self.imagesChanged.emit(len(self.loaded_images)) 
+        self.imagesChanged.emit(len(self.loaded_images))
+
+        # Honor persisted Fit preference: auto-select the first leaf
+        # (which triggers a deferred fit) so the user sees their saved
+        # view mode without having to click a frame first.
+        if getattr(self, "_auto_fit", False):
+            QTimer.singleShot(0, self._auto_select_first_leaf_after_load)
 
     def show_metrics(self):
         if self.metrics_window is None:
@@ -2882,8 +4022,8 @@ class BlinkTab(QWidget):
         group_id = self.metrics_window._current_group_id()
 
         # Save into MetricsWindow's dict — single source of truth
-        thr_list = self.metrics_window._thresholds_per_group.setdefault(group_id, [None] * 5)
-        while len(thr_list) < 5:
+        thr_list = self.metrics_window._thresholds_per_group.setdefault(group_id, [None] * 7)
+        while len(thr_list) < 7:
             thr_list.append(None)
         thr_list[metric_idx] = threshold
 
@@ -2913,7 +4053,7 @@ class BlinkTab(QWidget):
                     val = panel.metrics_data[m][i]
                     if np.isnan(val):
                         continue
-                    if (m in (0, 1, 2) and val > thr) or (m in (3, 4) and val < thr):
+                    if (m in (0, 1, 2, 5, 6) and val > thr) or (m in (3, 4) and val < thr):
                         self.loaded_images[i]['flagged'] = True
                         break
 
@@ -2942,59 +4082,70 @@ class BlinkTab(QWidget):
             self.tree_filter_combo.blockSignals(True)
             self.tree_filter_combo.setCurrentIndex(0)
             self.tree_filter_combo.blockSignals(False)
-        self.fileTree.clear()
         from collections import defaultdict
 
-        grouped = defaultdict(list)
-        for entry in self.loaded_images:
-            hdr = entry.get('header', {}) or {}
-            obj = hdr.get('OBJECT', 'Unknown')
-            fil = hdr.get('FILTER', 'Unknown')
-            exp = hdr.get('EXPOSURE', 'Unknown')
-            grouped[(obj, fil, exp)].append(entry['file_path'])
+        with self._tree_bulk_update():
+            self.fileTree.clear()
 
-        for key, paths in grouped.items():
-            paths.sort(key=lambda p: self._natural_key(os.path.basename(p)))
+            grouped = defaultdict(list)
+            for entry in self.loaded_images:
+                hdr = entry.get('header', {}) or {}
+                obj = hdr.get('OBJECT', 'Unknown')
+                fil = hdr.get('FILTER', 'Unknown')
+                exp = _blink_exposure_label(hdr)
+                grouped[(obj, fil, exp)].append(entry['file_path'])
 
-        by_object = defaultdict(lambda: defaultdict(dict))
-        for (obj, fil, exp), paths in grouped.items():
-            by_object[obj][fil][exp] = paths
+            for key, paths in grouped.items():
+                paths.sort(key=lambda p: self._natural_key(os.path.basename(p)))
 
-        for obj in sorted(by_object, key=lambda o: o.lower()):
-            obj_item = QTreeWidgetItem([self.tr("Object: {0}").format(obj)])
-            self.fileTree.addTopLevelItem(obj_item)
-            obj_item.setExpanded(True)
+            by_object = defaultdict(lambda: defaultdict(dict))
+            for (obj, fil, exp), paths in grouped.items():
+                by_object[obj][fil][exp] = paths
 
-            for fil in sorted(by_object[obj], key=lambda f: f.lower()):
-                filt_item = QTreeWidgetItem([self.tr("Filter: {0}").format(fil)])
-                obj_item.addChild(filt_item)
-                filt_item.setExpanded(True)
+            for obj in sorted(by_object, key=lambda o: o.lower()):
+                obj_item = _BlinkSortItem([self.tr("Object: {0}").format(obj)])
+                self.fileTree.addTopLevelItem(obj_item)
+                obj_item.setExpanded(True)
 
-                for exp in sorted(by_object[obj][fil], key=lambda e: str(e).lower()):
-                    exp_item = QTreeWidgetItem([self.tr("Exposure: {0}").format(exp)])
-                    filt_item.addChild(exp_item)
-                    exp_item.setExpanded(True)
+                for fil in sorted(by_object[obj], key=lambda f: f.lower()):
+                    filt_item = _BlinkSortItem([self.tr("Filter: {0}").format(fil)])
+                    obj_item.addChild(filt_item)
+                    filt_item.setExpanded(True)
 
-                    for p in by_object[obj][fil][exp]:
-                        leaf = QTreeWidgetItem([os.path.basename(p), "", "", "", "", ""])
-                        leaf.setData(0, Qt.ItemDataRole.UserRole, p)
-                        exp_item.addChild(leaf)
+                    for exp in sorted(by_object[obj][fil], key=lambda e: str(e).lower()):
+                        exp_item = _BlinkSortItem([self.tr("Exposure: {0}").format(exp)])
+                        filt_item.addChild(exp_item)
+                        exp_item.setExpanded(True)
 
-        # Re-apply flagged styling
-        RED = Qt.GlobalColor.red
-        normal = self.fileTree.palette().color(QPalette.ColorRole.WindowText)
+                        for p in by_object[obj][fil][exp]:
+                            leaf = _BlinkSortItem([os.path.basename(p), "", "", "", "", ""])
+                            leaf.setData(0, Qt.ItemDataRole.UserRole, p)
+                            exp_item.addChild(leaf)
 
-        for idx, entry in enumerate(self.loaded_images):
-            item = self.get_tree_item_for_index(idx)
-            if not item:
-                continue
-            base = os.path.basename(self.image_paths[idx])
-            if entry.get("flagged", False):
-                item.setText(0, f"⚠️ {base}")
-                item.setForeground(0, QBrush(RED))
-            else:
-                item.setText(0, base)
-                item.setForeground(0, QBrush(normal))
+            # Re-apply flagged styling
+            RED = Qt.GlobalColor.red
+            normal = self.fileTree.palette().color(QPalette.ColorRole.WindowText)
+
+            for idx, entry in enumerate(self.loaded_images):
+                item = self.get_tree_item_for_index(idx)
+                if not item:
+                    continue
+                base = os.path.basename(self.image_paths[idx])
+                if entry.get("flagged", False):
+                    item.setText(0, f"⚠️ {base}")
+                    item.setForeground(0, QBrush(RED))
+                else:
+                    item.setText(0, base)
+                    item.setForeground(0, QBrush(normal))
+
+        # After re-enabling sort, metric columns may need the current
+        # sort indicator applied against freshly-rebuilt rows.
+        try:
+            hdr = self.fileTree.header()
+            self.fileTree.sortItems(hdr.sortIndicatorSection(),
+                                    hdr.sortIndicatorOrder())
+        except Exception:
+            pass
 
 
     def _after_list_changed(self, removed_indices: List[int] | None = None):
@@ -3133,7 +4284,7 @@ class BlinkTab(QWidget):
                 mp = self.metrics_window.metrics_panel
                 # clear out old data & reset flags / thresholds
                 mp.metrics_data = None
-                mp._threshold_initialized = [False]*4
+                mp._threshold_initialized = [False]*7
                 for scat in mp.scats:
                     scat.clear()
                 for line in mp.lines:
@@ -3289,8 +4440,26 @@ class BlinkTab(QWidget):
         attempt = 0
         last_pct = -1
 
+        # Make sure numba's threading layer is resolved & recorded before we
+        # fan out — otherwise the lock's decision falls back to an OS guess
+        # (fast/no-op on Linux), which is the concurrent-access abort path.
+        _blink_wait_for_numba_layer()
+
         # Apply platform / QSettings thread-safety mode once, before the pool.
         _mode = _blink_apply_thread_safety()
+
+        # Pathological fallback: if warmup still hasn't resolved the layer
+        # (e.g. it timed out on a very slow machine), don't gamble on a possible
+        # workqueue box — serialize this load. Better slow than aborted.
+        try:
+            from setiastro.saspro.legacy.numba_utils import (
+                numba_threading_layer_unsafe, set_numba_parallel_serialize,
+            )
+            if numba_threading_layer_unsafe() is None:
+                set_numba_parallel_serialize(True)
+                _mode = "safe"
+        except Exception:
+            pass
 
         while remaining and attempt <= MAX_RETRIES:
 
@@ -3363,7 +4532,7 @@ class BlinkTab(QWidget):
             hdr = entry['header']
             obj = hdr.get('OBJECT', 'Unknown')
             filt = hdr.get('FILTER', 'Unknown')
-            exp = hdr.get('EXPOSURE', 'Unknown')
+            exp = _blink_exposure_label(hdr)
             grouped[(obj, filt, exp)].append(entry['file_path'])
 
         for key, paths in grouped.items():
@@ -3372,31 +4541,45 @@ class BlinkTab(QWidget):
         for (obj, filt, exp), paths in grouped.items():
             by_object[obj][filt][exp] = paths
 
-        for obj in sorted(by_object, key=lambda o: o.lower()):
-            obj_item = QTreeWidgetItem([f"Object: {obj}"])
-            self.fileTree.addTopLevelItem(obj_item)
-            obj_item.setExpanded(True)
+        with self._tree_bulk_update():
+            for obj in sorted(by_object, key=lambda o: o.lower()):
+                obj_item = _BlinkSortItem([f"Object: {obj}"])
+                self.fileTree.addTopLevelItem(obj_item)
+                obj_item.setExpanded(True)
 
-            for filt in sorted(by_object[obj], key=lambda f: f.lower()):
-                filt_item = QTreeWidgetItem([f"Filter: {filt}"])
-                obj_item.addChild(filt_item)
-                filt_item.setExpanded(True)
+                for filt in sorted(by_object[obj], key=lambda f: f.lower()):
+                    filt_item = _BlinkSortItem([f"Filter: {filt}"])
+                    obj_item.addChild(filt_item)
+                    filt_item.setExpanded(True)
 
-                for exp in sorted(by_object[obj][filt], key=lambda e: str(e).lower()):
-                    exp_item = QTreeWidgetItem([f"Exposure: {exp}"])
-                    filt_item.addChild(exp_item)
-                    exp_item.setExpanded(True)
+                    for exp in sorted(by_object[obj][filt], key=lambda e: str(e).lower()):
+                        exp_item = _BlinkSortItem([f"Exposure: {exp}"])
+                        filt_item.addChild(exp_item)
+                        exp_item.setExpanded(True)
 
-                    for p in by_object[obj][filt][exp]:
-                        leaf = QTreeWidgetItem([os.path.basename(p), "", "", "", "", ""])
-                        leaf.setData(0, Qt.ItemDataRole.UserRole, p)
-                        exp_item.addChild(leaf)
+                        for p in by_object[obj][filt][exp]:
+                            leaf = _BlinkSortItem([os.path.basename(p), "", "", "", "", ""])
+                            leaf.setData(0, Qt.ItemDataRole.UserRole, p)
+                            exp_item.addChild(leaf)
+
+        try:
+            hdr = self.fileTree.header()
+            self.fileTree.sortItems(hdr.sortIndicatorSection(),
+                                    hdr.sortIndicatorOrder())
+        except Exception:
+            pass
 
         self.loading_label.setText(self.tr("Loaded {0} images.").format(len(self.loaded_images)))
         self.progress_bar.setValue(100)
         self.imagesChanged.emit(len(self.loaded_images))
         if self.metrics_window and self.metrics_window.isVisible():
             self.metrics_window.update_metrics(self.loaded_images, order=self._tree_order_indices())
+
+        # Honor persisted Fit preference: auto-select the first leaf
+        # (which triggers a deferred fit) so the user sees their saved
+        # view mode without having to click a frame first.
+        if getattr(self, "_auto_fit", False):
+            QTimer.singleShot(0, self._auto_select_first_leaf_after_load)
 
 
     def findTopLevelItemByName(self, name):
@@ -3634,37 +4817,38 @@ class BlinkTab(QWidget):
         header = image_entry['header']
         object_name = header.get('OBJECT', 'Unknown') if header else 'Unknown'
         filter_name = header.get('FILTER', 'Unknown') if header else 'Unknown'
-        exposure_time = header.get('EXPOSURE', 'Unknown') if header else 'Unknown'
+        exposure_time = _blink_exposure_label(header) if header else 'Unknown'
 
         # Group images by filter and exposure time
         group_key = (object_name, filter_name, exposure_time)
 
-        # Find or create the object item
-        object_item = self.findTopLevelItemByName(f"Object: {object_name}")
-        if not object_item:
-            object_item = QTreeWidgetItem([f"Object: {object_name}"])
-            self.fileTree.addTopLevelItem(object_item)
-            object_item.setExpanded(True)
+        with self._tree_bulk_update():
+            # Find or create the object item
+            object_item = self.findTopLevelItemByName(f"Object: {object_name}")
+            if not object_item:
+                object_item = _BlinkSortItem([f"Object: {object_name}"])
+                self.fileTree.addTopLevelItem(object_item)
+                object_item.setExpanded(True)
 
-        # Find or create the filter item
-        filter_item = self.findChildItemByName(object_item, f"Filter: {filter_name}")
-        if not filter_item:
-            filter_item = QTreeWidgetItem([f"Filter: {filter_name}"])
-            object_item.addChild(filter_item)
-            filter_item.setExpanded(True)
+            # Find or create the filter item
+            filter_item = self.findChildItemByName(object_item, f"Filter: {filter_name}")
+            if not filter_item:
+                filter_item = _BlinkSortItem([f"Filter: {filter_name}"])
+                object_item.addChild(filter_item)
+                filter_item.setExpanded(True)
 
-        # Find or create the exposure item
-        exposure_item = self.findChildItemByName(filter_item, f"Exposure: {exposure_time}")
-        if not exposure_item:
-            exposure_item = QTreeWidgetItem([f"Exposure: {exposure_time}"])
-            filter_item.addChild(exposure_item)
-            exposure_item.setExpanded(True)
+            # Find or create the exposure item
+            exposure_item = self.findChildItemByName(filter_item, f"Exposure: {exposure_time}")
+            if not exposure_item:
+                exposure_item = _BlinkSortItem([f"Exposure: {exposure_time}"])
+                filter_item.addChild(exposure_item)
+                exposure_item.setExpanded(True)
 
-        # Add the file item
-        file_name = os.path.basename(file_path)
-        item = QTreeWidgetItem([file_name, "", "", "", "", ""])
-        item.setData(0, Qt.ItemDataRole.UserRole, file_path)
-        exposure_item.addChild(item)
+            # Add the file item
+            file_name = os.path.basename(file_path)
+            item = _BlinkSortItem([file_name, "", "", "", "", ""])
+            item.setData(0, Qt.ItemDataRole.UserRole, file_path)
+            exposure_item.addChild(item)
 
     def _tree_order_indices(self) -> list[int]:
         """Return the indices of loaded_images in the exact order the Tree shows."""
@@ -3749,7 +4933,25 @@ class BlinkTab(QWidget):
 
         qimage = self.convert_to_qimage(disp8)
         self.current_pixmap = QPixmap.fromImage(qimage)
-        self.apply_zoom()
+        # If the user asked for Fit (persisted) we recompute fit for this
+        # image — zoom levels don't carry sensibly between images of
+        # different pixel sizes, so fit-on-switch is what people usually
+        # want when they've clicked Fit once.
+        #
+        # On the FIRST image after Blink reopens with a persisted Fit
+        # preference, the scroll area viewport may not have reached its
+        # final restored-geometry size yet, so an inline fit would snap
+        # to the wrong ratio. We fit immediately (right ratio in the
+        # steady state) AND again on the next event-loop tick (fixes
+        # the first-open case where the viewport only settles after
+        # this call returns). The second fit is a no-op when the
+        # viewport didn't change.
+        if getattr(self, "_auto_fit", False):
+            self.fit_to_preview(_from_auto=True)
+            QTimer.singleShot(0, lambda: self.fit_to_preview(_from_auto=True)
+                              if self.current_pixmap else None)
+        else:
+            self.apply_zoom()
 
 
     def _capture_view_center_norm(self):
@@ -3838,20 +5040,59 @@ class BlinkTab(QWidget):
             event.ignore()
 
 
+    def _set_auto_fit(self, on: bool):
+        """Set the auto-fit-on-switch preference and persist it."""
+        self._auto_fit = bool(on)
+        try:
+            QSettings().setValue("blink/auto_fit", self._auto_fit)
+        except Exception:
+            pass
+
+    def _auto_select_first_leaf_after_load(self):
+        """After images finish loading, auto-select the first leaf if nothing
+        is current. Needed because Blink doesn't preview anything until the
+        user clicks a leaf, so a persisted Fit preference has no image to
+        apply to. Calling on_item_clicked (via setCurrentItem's signal path)
+        gives us the first pixmap, and that method's deferred fit then
+        settles into the correct ratio against the final viewport size."""
+        try:
+            cur = self.fileTree.currentItem()
+            if cur is not None and cur.childCount() == 0:
+                return  # user already has something selected
+            leaves = self.get_all_leaf_items()
+            if not leaves:
+                return
+            first = leaves[0]
+            self.fileTree.setCurrentItem(first)
+            # setCurrentItem routes through _on_current_item_changed_safe
+            # which uses a tiny timer, so defer our own click too to let
+            # it land, and defer the whole chain so the viewport has its
+            # final size when fit_to_preview runs.
+            QTimer.singleShot(0, lambda: self.on_item_clicked(first, 0))
+        except Exception:
+            pass
+
     def zoom_in(self):
         """Increase the zoom level and refresh the image."""
         self.zoom_level = min(self.zoom_level * 1.2, 3.0)  # Cap at 3x
+        # User took manual control — stop auto-fitting on image switch.
+        self._set_auto_fit(False)
         self.apply_zoom()
 
 
     def zoom_out(self):
         """Decrease the zoom level and refresh the image."""
         self.zoom_level = max(self.zoom_level / 1.2, 0.05)  # Cap at 0.2x
+        # User took manual control — stop auto-fitting on image switch.
+        self._set_auto_fit(False)
         self.apply_zoom()
 
 
-    def fit_to_preview(self):
-        """Adjust the zoom level so the image fits within the QScrollArea viewport."""
+    def fit_to_preview(self, _from_auto: bool = False):
+        """Adjust the zoom level so the image fits within the QScrollArea viewport.
+        When the user clicks the Fit button we also turn on auto-fit so new
+        images stay fit-sized on switch. Internal auto-fit callers pass
+        _from_auto=True so we don't flip the pref on ourselves."""
         if self.current_pixmap:
             # Get the size of the QScrollArea's viewport
             viewport_size = self.scroll_area.viewport().size()
@@ -3864,6 +5105,10 @@ class BlinkTab(QWidget):
 
             # Apply the zoom level
             self.apply_zoom()
+            # User click on Fit means "keep fitting new images too" —
+            # persist it so it sticks across sessions.
+            if not _from_auto:
+                self._set_auto_fit(True)
         else:
             print("No image loaded. Cannot fit to preview.")
             QMessageBox.warning(self, self.tr("Warning"), self.tr("No image loaded. Cannot fit to preview."))
@@ -4547,6 +5792,52 @@ class BlinkTab(QWidget):
         else:
             QMessageBox.information(self, self.tr("Move Selected Items"), self.tr("Moved and removed {0} item(s).").format(len(removed_indices)))
 
+    def _pick_focus_after_removal(self, removed_paths):
+        """Pick a leaf path to focus after `removed_paths` are deleted.
+
+        Looks at the CURRENT tree order (before rebuild), finds the first
+        surviving leaf after the last removed one, and falls back to the
+        last surviving leaf before the first removed one. Returns None if
+        the entire tree would be empty.
+        """
+        try:
+            all_leaves = self.get_all_leaf_items()
+            removed_set = set(removed_paths)
+            # Build an ordered list of (path, is_removed) in tree order.
+            ordered = []
+            for leaf in all_leaves:
+                p = leaf.data(0, Qt.ItemDataRole.UserRole)
+                if not p:
+                    # fall back to _leaf_path if UserRole isn't set
+                    p = self._leaf_path(leaf)
+                if p:
+                    ordered.append((p, p in removed_set))
+            if not ordered:
+                return None
+            # Index of the last removed one in tree order.
+            last_removed_pos = -1
+            first_removed_pos = -1
+            for i, (_, rm) in enumerate(ordered):
+                if rm:
+                    if first_removed_pos < 0:
+                        first_removed_pos = i
+                    last_removed_pos = i
+            if last_removed_pos < 0:
+                return None  # nothing to remove, caller shouldn't have called us
+            # Look for first surviving leaf AFTER the last removed one.
+            for i in range(last_removed_pos + 1, len(ordered)):
+                p, rm = ordered[i]
+                if not rm:
+                    return p
+            # Fall back: last surviving leaf BEFORE the first removed one.
+            for i in range(first_removed_pos - 1, -1, -1):
+                p, rm = ordered[i]
+                if not rm:
+                    return p
+            return None
+        except Exception:
+            return None
+
     def delete_items(self):
         """Delete selected leaf images from disk and remove them from the blink list."""
         selected_items = [it for it in self.fileTree.selectedItems() if it and it.childCount() == 0]
@@ -4579,6 +5870,19 @@ class BlinkTab(QWidget):
                 continue
             triplets.append((idx, p, it))
 
+        # Snapshot the paths we're about to remove and the scroll state,
+        # BEFORE the tree is cleared and rebuilt. _after_list_changed()
+        # calls fileTree.clear() which otherwise snaps the view to the
+        # top and loses the current item.
+        selected_paths = [p for (_, p, _) in triplets]
+        focus_target_path = self._pick_focus_after_removal(selected_paths)
+        try:
+            saved_vscroll = self.fileTree.verticalScrollBar().value()
+            saved_hscroll = self.fileTree.horizontalScrollBar().value()
+        except Exception:
+            saved_vscroll = 0
+            saved_hscroll = 0
+
         for idx, path, it in triplets:
             try:
                 os.remove(path)
@@ -4600,13 +5904,42 @@ class BlinkTab(QWidget):
             if 0 <= idx < len(self.loaded_images):
                 del self.loaded_images[idx]
 
-        # Clear preview safely
+        # Clear preview safely (we may replace it below with the new current)
         self.preview_label.clear()
         self.preview_label.setText(self.tr("No image selected."))
         self.current_pixmap = None
 
         if removed_indices:
             self._after_list_changed(removed_indices)
+
+        # Restore the view: select the next surviving neighbor (which
+        # also updates the preview), and scroll it into view. If no
+        # survivors, just restore the raw scroll position. Deferred so
+        # the rebuild's deferred metrics push and sort pass have landed.
+        def _restore_view():
+            try:
+                new_item = None
+                if focus_target_path:
+                    for leaf in self.get_all_leaf_items():
+                        p = leaf.data(0, Qt.ItemDataRole.UserRole) \
+                            or self._leaf_path(leaf)
+                        if p == focus_target_path:
+                            new_item = leaf
+                            break
+                if new_item is not None:
+                    self.fileTree.setCurrentItem(new_item)
+                    self.on_item_clicked(new_item, 0)
+                    self.fileTree.scrollToItem(
+                        new_item,
+                        QAbstractItemView.ScrollHint.PositionAtCenter,
+                    )
+                else:
+                    # Fallback: at least restore raw scroll position.
+                    self.fileTree.verticalScrollBar().setValue(saved_vscroll)
+                    self.fileTree.horizontalScrollBar().setValue(saved_hscroll)
+            except Exception:
+                pass
+        QTimer.singleShot(0, _restore_view)
 
         if failures:
             msg = self.tr("Deleted {0} file(s). {1} failed:").format(len(removed_indices), len(failures))
@@ -4651,6 +5984,8 @@ class BlinkTab(QWidget):
             return
 
         self.zoom_level = new_zoom
+        # Manual zoom via wheel/trackpad — stop auto-fitting on image switch.
+        self._set_auto_fit(False)
         self.apply_zoom()
         event.accept()
 
@@ -4833,6 +6168,11 @@ class BlinkTab(QWidget):
 
     def toggle_aggressive(self):
         self.aggressive_stretch_enabled = self.aggressive_button.isChecked()
+        try:
+            QSettings().setValue("blink/aggressive_stretch",
+                                 bool(self.aggressive_stretch_enabled))
+        except Exception:
+            pass
         cur = self.fileTree.currentItem()
         if cur:
             self._last_preview_name = None
@@ -4883,7 +6223,6 @@ from setiastro.saspro.widgets.preview_dialogs import ImagePreviewDialog
 
 BlinkComparatorPro = BlinkTab
 
-# ⬇️ paste your SASv2 code here (exactly as you sent), then end with:
 class BlinkComparatorPro(BlinkTab):
     """Alias class so the main app can import a SASpro-named tool."""
     pass

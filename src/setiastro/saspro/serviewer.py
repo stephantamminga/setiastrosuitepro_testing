@@ -22,7 +22,7 @@ from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
 from setiastro.saspro.ser_stack_config import SERStackConfig
 from setiastro.saspro.ser_stacker import stack_ser
 from setiastro.saspro.ser_stacker_dialog import SERStackerDialog
-
+from setiastro.saspro.help_support import make_help_button
 # Use your stretch functions for DISPLAY
 try:
     from setiastro.saspro.imageops.stretch import stretch_mono_image, stretch_color_image
@@ -66,7 +66,7 @@ class _TrimExportWorker(QObject):
         try:
             from setiastro.saspro.imageops.serloader import export_trimmed_to_ser
 
-            # Progress callback executed from worker thread.
+            #sasprogress callback executed from worker thread.
             # It emits a Qt signal (thread-safe), and checks cancel.
             def _cb(done: int, total: int) -> None:
                 if self._cancel_evt.is_set():
@@ -96,6 +96,46 @@ class _TrimExportWorker(QObject):
                 self.canceled.emit()
             else:
                 self.failed.emit(msg)
+
+
+class _SequenceOpenWorker(QObject):
+    """
+    Opens a planetary source with eager preload on a worker thread, so the GUI
+    can show a 'Loading frames' progress bar. The returned reader is handed
+    back via the finished signal and adopted on the GUI thread.
+
+    Preload runs every frame through the global image loader (full bit-depth /
+    header / Bayer handling), which is slower than the old header-blind read —
+    hence the bar. SER/AVI ignore preload (cheap random access), so this is
+    only meaningfully slow for image sequences / still stacks.
+    """
+    progress = pyqtSignal(int, int)   # done, total
+    finished = pyqtSignal(object)     # the opened PlanetaryFrameSource
+    failed = pyqtSignal(str)
+
+    def __init__(self, source_spec, *, cache_items: int = 10):
+        super().__init__()
+        self._source_spec = source_spec
+        self._cache_items = int(cache_items)
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            from setiastro.saspro.imageops.serloader import open_planetary_source
+
+            def _cb(done: int, total: int) -> None:
+                self.progress.emit(int(done), int(total))
+
+            src = open_planetary_source(
+                self._source_spec,
+                cache_items=self._cache_items,
+                preload=True,
+                progress_cb=_cb,
+            )
+            self.finished.emit(src)
+        except Exception as e:
+            self.failed.emit(str(e))
+
 
 # ── Platform-aware anchor gesture text ──────────────────────────────
 import platform as _platform
@@ -412,6 +452,13 @@ class SERViewer(QDialog):
         right.addWidget(stack, 0)
 
         right.addStretch(1)
+
+        # Help button
+        from setiastro.saspro.help_support import make_help_button
+        help_row = QHBoxLayout()
+        help_row.addStretch(1)
+        help_row.addWidget(make_help_button("planetary_viewer", self))
+        right.addLayout(help_row, 0)
 
         # Keep the right panel from getting too wide
         for gb in (opts, stack):
@@ -1235,10 +1282,15 @@ class SERViewer(QDialog):
             dlg.setDirectory(start_dir)
         dlg.setFileMode(QFileDialog.FileMode.ExistingFiles)
         dlg.setNameFilters([
-            "Planetary Sources (*.ser *.avi *.mp4 *.mov *.mkv *.png *.tif *.tiff *.jpg *.jpeg *.bmp *.webp *.fit *.fits)",
+            "Planetary Sources (*.ser *.avi *.mp4 *.mov *.mkv "
+            "*.png *.tif *.tiff *.jpg *.jpeg *.bmp *.webp "
+            "*.fit *.fits *.fts *.fz *.gz *.xisf "
+            "*.cr2 *.cr3 *.nef *.arw *.dng *.raf *.orf *.rw2 *.pef)",
             "SER Videos (*.ser)",
             "AVI/Video (*.avi *.mp4 *.mov *.mkv)",
-            "Images (*.png *.tif *.tiff *.jpg *.jpeg *.bmp *.webp *.fit *.fits)",
+            "Images (*.png *.tif *.tiff *.jpg *.jpeg *.bmp *.webp)",
+            "FITS/XISF (*.fit *.fits *.fts *.fz *.gz *.xisf)",
+            "RAW camera (*.cr2 *.cr3 *.nef *.arw *.dng *.raf *.orf *.rw2 *.pef)",
             "All Files (*)",
         ])
 
@@ -1263,20 +1315,72 @@ class SERViewer(QDialog):
             pass
         self.reader = None
 
-        try:
-            if len(files_sorted) == 1:
-                src = open_planetary_source(files_sorted[0], cache_items=10)
-                self._set_last_open_dir(files_sorted[0])
-            else:
-                src = open_planetary_source(files_sorted, cache_items=10)
-                self._set_last_open_dir(files_sorted[0])
+        # Open with an eager preload + progress bar. Image sequences read every
+        # frame through the full global loader up front (slower, but correct
+        # bit-depth / header / debayer), so a 'Loading frames' indicator keeps
+        # the open honest. The worker runs off the GUI thread; we pump a local
+        # event loop until it finishes so the rest of this method stays linear.
+        from PyQt6.QtCore import QEventLoop
 
-            self.reader = src
+        open_spec = files_sorted[0] if len(files_sorted) == 1 else files_sorted
+        n_frames_hint = len(files_sorted)
 
-        except Exception as e:
-            QMessageBox.critical(self, "SER Viewer", f"Failed to open:\n{e}")
+        pd = QProgressDialog("Loading frames…", None, 0, max(1, n_frames_hint), self)
+        pd.setWindowTitle("Opening")
+        pd.setWindowModality(Qt.WindowModality.WindowModal)
+        pd.setCancelButton(None)          # non-cancelable (per spec)
+        pd.setAutoClose(False)
+        pd.setAutoReset(False)
+        pd.setMinimumDuration(0)
+        pd.setValue(0)
+
+        thread = QThread(self)
+        worker = _SequenceOpenWorker(open_spec, cache_items=max(10, n_frames_hint))
+        worker.moveToThread(thread)
+
+        loop = QEventLoop(self)
+        result = {"src": None, "err": None}
+
+        @pyqtSlot(int, int)
+        def _on_open_progress(done: int, total: int):
+            total = max(1, int(total))
+            if pd.maximum() != total:
+                pd.setMaximum(total)
+            pd.setValue(int(done))
+            pd.setLabelText(f"Loading frames… {int(done)}/{total}")
+
+        @pyqtSlot(object)
+        def _on_open_finished(src):
+            result["src"] = src
+            loop.quit()
+
+        @pyqtSlot(str)
+        def _on_open_failed(msg: str):
+            result["err"] = msg
+            loop.quit()
+
+        worker.progress.connect(_on_open_progress)
+        worker.finished.connect(_on_open_finished)
+        worker.failed.connect(_on_open_failed)
+        thread.started.connect(worker.run)
+
+        thread.start()
+        pd.show()
+        loop.exec()          # blocks here, GUI stays responsive, until worker done
+
+        thread.quit()
+        thread.wait(5000)
+        pd.close()
+
+        if result["err"] is not None or result["src"] is None:
+            QMessageBox.critical(self, "SER Viewer",
+                                 f"Failed to open:\n{result['err'] or 'unknown error'}")
             self.reader = None
             return
+
+        src = result["src"]
+        self.reader = src
+        self._set_last_open_dir(files_sorted[0])
 
         m = self.reader.meta
         base = os.path.basename(m.path or (files_sorted[0] if files_sorted else ""))
@@ -1553,7 +1657,7 @@ class SERViewer(QDialog):
         self.btn_play.setEnabled(False)
         self.btn_stack.setEnabled(False)
 
-        # Progress dialog
+        #sasprogress dialog
         pd = QProgressDialog("Exporting trimmed SER…", "Cancel", 0, total, self)
         pd.setWindowTitle("Saving Trimmed SER")
         pd.setWindowModality(Qt.WindowModality.WindowModal)
@@ -1592,7 +1696,7 @@ class SERViewer(QDialog):
                 pass
         pd.canceled.connect(_on_cancel)
 
-        # Progress updates (runs on GUI thread)
+        #sasprogress updates (runs on GUI thread)
         @pyqtSlot(int, int)
         def _on_progress(done: int, tot: int):
             try:
@@ -1898,4 +2002,3 @@ class SERViewer(QDialog):
 
         # Fallback
         return getattr(self.reader, "path", None)
-

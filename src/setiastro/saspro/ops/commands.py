@@ -182,6 +182,22 @@ ALIASES: Dict[str, str] = {
     "convolution": "convo",
     "deconvolution": "convo",
     "convo_deconvo": "convo",
+
+    # Narrowband channel extractor
+    "nbextract": "nbextract",
+    "nb_extract": "nbextract",
+    "narrowband_extract": "nbextract",
+    "narrowband_channel_extractor": "nbextract",
+    "extract_narrowband": "nbextract",
+    "nbx": "nbextract",
+
+    "export_fits": "export_fits",
+    "export fits": "export_fits",
+    "save_fits": "export_fits",
+
+    "plate_solve": "plate_solve",
+    "plate solve": "plate_solve",
+    "platesolve": "plate_solve",
 }
 
 
@@ -201,6 +217,72 @@ def list_commands() -> Dict[str, str]:
 # -----------------------------------------------------------------------------
 # Registry population (starter set)
 # -----------------------------------------------------------------------------
+
+register(CommandSpec(
+    id="export_fits",
+    name="Export FITS",
+    group="File",
+    ui_method="_open_export_fits",
+    headless_method="_apply_export_fits_to_doc",
+    notes=(
+        "Export the current view as a .fits file into a chosen output folder. "
+        "Designed as a Function Bundle step for batch saving. "
+        "Preset: out_dir (folder) and overwrite (bool, default True). "
+        "Does not change the in-memory document path."
+    ),
+    presets=[
+        PresetSpec("out_dir", "str", default="",
+                   desc="Destination folder for the .fits files.", optional=False),
+        PresetSpec("overwrite", "bool", default=True,
+                   desc="Overwrite an existing file with the same name."),
+    ],
+    aliases=["export fits", "save_fits", "save as fits"],
+    examples=[
+        "ctx.run_command('export_fits', {'out_dir': r'D:/export', 'overwrite': True})",
+    ],
+    supports_mono=True,
+    supports_rgb=True,
+    supports_linear=True,
+    supports_nonlinear=True,
+))
+
+register(CommandSpec(
+    id="plate_solve",
+    name="Plate Solver",
+    group="Star",
+    ui_method="_open_plate_solver",
+    headless_method="_apply_plate_solve_to_doc",
+    notes=(
+        "Solve WCS/SIP for a view. Usable as a Function Bundle step and by "
+        "dropping a shortcut on a View Bundle. "
+        "Preset: seed_mode, ra/dec/scale, radius, FOV, solver."
+    ),
+    presets=[
+        PresetSpec("seed_mode", "enum", default="auto",
+                   enum=["auto", "manual", "none"],
+                   desc="Header seed, manual RA/Dec/scale, or blind."),
+        PresetSpec("ra", "str", default="", desc="Manual RA (hours or degrees)."),
+        PresetSpec("dec", "str", default="", desc="Manual Dec."),
+        PresetSpec("scale", "float", default=None, desc="Pixel scale in arcsec/pixel."),
+        PresetSpec("radius_mode", "enum", default="auto",
+                   enum=["auto", "value"], desc="ASTAP search radius mode."),
+        PresetSpec("radius_value", "float", default=5.0, desc="Search radius in degrees."),
+        PresetSpec("fov_mode", "enum", default="compute",
+                   enum=["compute", "auto", "value"], desc="ASTAP FOV mode."),
+        PresetSpec("fov_value", "float", default=0.0, desc="FOV in degrees."),
+        PresetSpec("solver", "enum", default="both",
+                   enum=["both", "gaia_only", "astap_only", "astrometry_only"],
+                   desc="Which solver chain to run."),
+    ],
+    aliases=["plate solve", "platesolve"],
+    examples=[
+        "ctx.run_command('plate_solve', {'seed_mode': 'auto', 'solver': 'both'})",
+    ],
+    supports_mono=True,
+    supports_rgb=True,
+    supports_linear=True,
+    supports_nonlinear=True,
+))
 
 # Bundles
 register(CommandSpec(
@@ -1712,6 +1794,73 @@ register(CommandSpec(
 
 
 
-# -----------------------------------------------------------------------------
-# End of file
-# -----------------------------------------------------------------------------
+register(CommandSpec(
+    id="nbextract",
+    name="Narrowband Channel Extractor (NBExtract)",
+    group="Narrowband",
+    import_path="setiastro.saspro.nbextract",
+    callable_name="run_nbextract_via_preset",
+    # ui_method intentionally omitted: the interactive dialog is opened via
+    # nbextract.open_nbextract(doc_manager, sasp_data_path, parent). Point this
+    # at a main-window opener if you want palette drops to launch the UI.
+    notes=(
+        "Empirically-calibrated dual-band narrowband channel extraction "
+        "(headless). Runs the full pipeline on the ACTIVE RGB document: fetch "
+        "stars (image must be plate-solved), fit the per-channel mixing matrix "
+        "from Gaia XP spectra integrated over each filter window, then solve "
+        "per-pixel via NNLS and emit two new mono documents (line1, line2). "
+        "Requires a valid WCS and a local Gaia XP spectral library "
+        "(Ultra-Bright/Bright group or better). Q values are auto-derived from "
+        "the matrix condition number unless you override q1/q2. By default the "
+        "run raises instead of falling back; pass allow_fallback=True to permit "
+        "the stellar-flux color-mixing fallback when the XP fit can't be made. "
+        "Returns the two created documents."
+    ),
+    presets=[
+        PresetSpec("preset", "enum", default="Ha / OIII",
+                   enum=["Ha / OIII", "SII / OIII", "SII / Hβ", "Custom"],
+                   desc="Dual-band filter preset. 'Custom' uses the line "
+                        "name/center/bandwidth keys below."),
+        PresetSpec("line1_name", "str", default="Line1",
+                   desc="Custom only: label for the red-side line."),
+        PresetSpec("line2_name", "str", default="Line2",
+                   desc="Custom only: label for the blue-side line."),
+        PresetSpec("center1_nm", "float", min=350.0, max=1000.0,
+                   desc="Custom only: line-1 center wavelength (nm)."),
+        PresetSpec("center2_nm", "float", min=350.0, max=1000.0,
+                   desc="Custom only: line-2 center wavelength (nm)."),
+        PresetSpec("bw1_nm", "float", min=0.1, max=60.0,
+                   desc="Custom only: line-1 filter bandwidth FWHM (nm)."),
+        PresetSpec("bw2_nm", "float", min=0.1, max=60.0,
+                   desc="Custom only: line-2 filter bandwidth FWHM (nm)."),
+        PresetSpec("max_cal_stars", "int", default=300, min=6, max=2000,
+                   desc="Cap on Gaia XP calibration stars (brightest first)."),
+        PresetSpec("sep_sigma", "float", default=5.0, min=0.5, max=50.0,
+                   desc="SEP detection threshold (sigma) for re-detecting stars."),
+        PresetSpec("stretch", "bool", default=True,
+                   desc="Match each output channel's median to its source channel."),
+        PresetSpec("q1", "float", min=0.0, max=1.0,
+                   desc="Override line-1 NNLS/raw blend (0=raw, 1=full NNLS). "
+                        "Omit to use the auto value."),
+        PresetSpec("q2", "float", min=0.0, max=1.0,
+                   desc="Override line-2 NNLS/raw blend. Omit for auto."),
+        PresetSpec("allow_fallback", "bool", default=False,
+                   desc="Permit the stellar-flux WB fallback when the XP mixing "
+                        "matrix cannot be fitted."),
+    ],
+    aliases=[
+        "nb_extract", "narrowband_extract",
+        "narrowband_channel_extractor", "extract_narrowband", "nbx",
+    ],
+    examples=[
+        "ctx.run_command('nbextract', {'preset': 'Ha / OIII'})",
+        "ctx.run_command('nbextract', {'preset': 'SII / OIII', 'max_cal_stars': 500, 'sep_sigma': 4.0})",
+        "ctx.run_command('nbextract', {'preset': 'Custom', 'line1_name': 'Ha', 'line2_name': 'OIII', 'center1_nm': 656.28, 'bw1_nm': 3.0, 'center2_nm': 500.7, 'bw2_nm': 3.0})",
+        "ctx.run_command('nbextract', {'preset': 'Ha / OIII', 'q1': 0.7, 'q2': 0.6})",
+        "ctx.run_command('nbextract', {'preset': 'Ha / OIII', 'allow_fallback': True})",
+    ],
+    supports_mono=False,
+    supports_rgb=True,
+    supports_linear=True,
+    supports_nonlinear=True,
+))

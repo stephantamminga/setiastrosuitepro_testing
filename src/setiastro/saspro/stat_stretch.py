@@ -1,4 +1,4 @@
-# pro/stat_stretch.py
+#saspro/stat_stretch.py
 from __future__ import annotations
 from PyQt6.QtCore import Qt, QSize, QEvent
 from PyQt6.QtWidgets import (
@@ -18,6 +18,7 @@ from setiastro.saspro.imageops.stretch import (
     _compute_blackpoint_sigma,
     _compute_blackpoint_sigma_per_channel,
 )
+from setiastro.saspro.help_support import make_help_button
 
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
 from setiastro.saspro.luminancerecombine import LUMA_PROFILES
@@ -452,6 +453,8 @@ class StatisticalStretchDialog(QDialog):
         )
         drag_row.addWidget(self.preset_drag_handle)
         drag_row.addStretch(1)
+        self.btn_help = make_help_button("stat_stretch", self)
+        drag_row.addWidget(self.btn_help)
         left.addLayout(drag_row)
 
         right = QVBoxLayout()
@@ -1528,7 +1531,13 @@ class StatisticalStretchDialog(QDialog):
             parts.append("no_black_clip")
 
         step_name = f"Statistical Stretch ({', '.join(parts)})"
-        doc.apply_edit(out.astype(np.float32, copy=False), step_name=step_name)
+        doc.apply_edit(
+            out.astype(np.float32, copy=False),
+            metadata={"step_name": step_name,
+                      "command_id": "stat_stretch",
+                      "preset": dict(p)},
+            step_name=step_name,
+        )
 
         mw = self.parent()
         if hasattr(mw, "mdi") and mw.mdi.activeSubWindow():

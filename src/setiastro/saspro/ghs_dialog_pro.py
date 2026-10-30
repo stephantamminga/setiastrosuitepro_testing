@@ -636,6 +636,7 @@ class GhsDialogPro(QDialog):
         # After the stretch → pins to the lower-left corner.
         # Deferred import avoids any shortcuts.py <-> ghs_dialog_pro cycle.
         from setiastro.saspro.shortcuts import PresetDragHandle
+        from setiastro.saspro.help_support import make_help_button
         try:
             from setiastro.saspro.resources import uhs_path
             _ghs_icon = QIcon(uhs_path)
@@ -657,6 +658,8 @@ class GhsDialogPro(QDialog):
         )
         drag_row.addWidget(self.preset_drag_handle)
         drag_row.addStretch(1)
+        self.btn_help = make_help_button("ghs", self)
+        drag_row.addWidget(self.btn_help)
         left.addLayout(drag_row)
 
         self._left_panel.setMinimumWidth(300)
@@ -1299,7 +1302,9 @@ class GhsDialogPro(QDialog):
 
             _marr, mid, mname = self._active_mask_layer()
             meta = {
-                "step_name": step,
+                "step_name":  step,
+                "command_id": "ghs",
+                "preset":     dict(ghs_params),
                 "ghs":        ghs_params,
                 "masked":     bool(mid),
                 "mask_id":    mid,
@@ -1307,7 +1312,7 @@ class GhsDialogPro(QDialog):
                 "mask_blend": "m*out + (1-m)*src",
             }
 
-            # Propagate to replay system
+            #saspropagate to replay system
             mw = self.parent()
             while mw is not None and not (
                 hasattr(mw, "_remember_last_action_from_dialog")

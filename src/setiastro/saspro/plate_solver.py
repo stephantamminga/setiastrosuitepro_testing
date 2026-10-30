@@ -11,17 +11,17 @@ from functools import lru_cache
 import numpy as np
 import json
 import time
-import requests
 from astropy.io import fits
 from astropy.io.fits import Header
 from astropy.wcs import WCS
 
-from PyQt6.QtCore import QProcess, QTimer, QEventLoop, Qt, QCoreApplication, pyqtSignal, QThread
+from PyQt6.QtCore import QProcess, QTimer, QEventLoop, Qt, QCoreApplication, QSettings, pyqtSignal, QThread
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
-    QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QComboBox, QStackedWidget, QWidget, QMessageBox,
-    QLineEdit, QTextEdit, QApplication, QProgressBar
+    QDialog, QDialogButtonBox, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
+    QFileDialog, QComboBox, QStackedWidget, QWidget, QMessageBox, QFormLayout,
+    QLineEdit, QTextEdit, QApplication, QProgressBar, QListWidget, QListWidgetItem,
+    QCheckBox,
 )
 
 # === our I/O & stretch — migrate from SASv2 ===
@@ -31,7 +31,16 @@ try:
 except Exception:
     stretch_mono_image = None
     stretch_color_image = None
+def make_help_button(*args, **kwargs):
+    """Deferred shim for help_support.make_help_button.
 
+    help_support -> shortcuts -> the command registry -> the tool/widget
+    modules -> matplotlib. This module is imported by the plate-solve CLI,
+    which never builds a dialog and must not pay for any of that. The only
+    caller is a dialog button row, which is GUI-only by definition.
+    """
+    from setiastro.saspro.help_support import make_help_button as _real
+    return _real(*args, **kwargs)
 _NONFITS_META_KEYS = {
     "FILE_PATH",
     "FITS_HEADER",
@@ -96,9 +105,34 @@ class _SolveStatusPopup(QDialog):
         self.label.repaint()  # quick visual feedback
         QApplication.processEvents()
 
+# A scripted or CLI run has nowhere to put a window and nobody watching it.
+# Without this the solver opens a real floating dialog on the user's desktop
+# part-way through a batch, which is both startling and, on a headless box,
+# a crash waiting to happen.
+SUPPRESS_STATUS_POPUP = False
+
+
+def set_status_popup_enabled(on: bool) -> None:
+    """Turn the floating solve-status popup on or off process-wide."""
+    global SUPPRESS_STATUS_POPUP
+    SUPPRESS_STATUS_POPUP = not bool(on)
+
+
 def _status_popup_open(parent, text: str = ""):
     """Show (or create) the singleton status popup for headless runs."""
     global _STATUS_POPUP
+    if SUPPRESS_STATUS_POPUP:
+        # Suppressed must not mean discarded. This popup is the ONLY sink for
+        # status text when there is no status widget -- which is every CLI and
+        # scripted run -- so silently dropping it loses the blind solver's
+        # whole narration: stars detected, layers tried, where the quad index
+        # placed the field, and on what log-odds. Print it instead.
+        if text:
+            try:
+                print(text, flush=True)
+            except Exception:
+                pass
+        return None
     if _STATUS_POPUP is None:
         host = parent if isinstance(parent, QWidget) else QApplication.activeWindow()
         _STATUS_POPUP = _SolveStatusPopup(host)
@@ -288,15 +322,9 @@ def _wcs_header_from_astrometry_calib(calib: dict, image_shape: tuple[int, ...])
     parity = float(calib.get("parity", -1.0))  # default -1.0 = normal
     parity_sign = -1.0 if parity > 0 else 1.0   # flip RA axis when mirrored
 
-    # Standard CD matrix for TAN projection:
-    #   CD1_1 = -scale * cos(theta)  * parity_sign  (RA increases East = negative pixel direction)
-    #   CD1_2 =  scale * sin(theta)                 (RA rotation)
-    #   CD2_1 =  scale * sin(theta)  * parity_sign  (Dec rotation, parity-aware)
-    #   CD2_2 =  scale * cos(theta)                 (Dec increases North = positive pixel direction)
-    h["CD1_1"] = parity_sign * (-scale_deg * math.cos(theta))
-    h["CD1_2"] =               ( scale_deg * math.sin(theta))
-    h["CD2_1"] = parity_sign * (-scale_deg * math.sin(theta))
-    h["CD2_2"] =               ( scale_deg * math.cos(theta))
+    (h["CD1_1"], h["CD1_2"]), (h["CD2_1"], h["CD2_2"]) = _cd_matrix(
+        scale_deg, theta, mirrored=(parity_sign < 0))
+    h["CROTA2"] = float(calib.get("orientation", 0.0))
 
     h["RADECSYS"] = "ICRS"
     h["WCSAXES"]  = 2
@@ -385,6 +413,7 @@ def _astrometry_api_request(method: str, url: str, *, data=None, files=None,
     """
     Robust request with retries, exponential backoff + jitter.
     """
+    import requests  # deferred: ~138 ms, and a local solve never touches the network
     if requests is None:
         print("Requests not available for astrometry.net API.")
         return None
@@ -654,6 +683,7 @@ def _astrometry_download_wcs_file(settings, job_id: int, parent=None) -> Header 
     This includes SIP terms when present.
     Returns fits.Header or None.
     """
+    import requests  # deferred: ~138 ms, and a local solve never touches the network
     import os
     import tempfile
     from astropy.io import fits
@@ -1136,6 +1166,82 @@ def _get_solver_preference(settings) -> str:
 def _set_solver_preference(settings, pref: str):
     settings.setValue("plate_solver/preference", (pref or "both").lower())
 
+_SEED_MODES = {"auto", "manual", "none"}
+_SOLVER_PREFS = {"both", "gaia_only", "astap_only", "astrometry_only"}
+_RADIUS_MODES = {"auto", "value"}
+_FOV_MODES = {"compute", "auto", "value"}
+
+
+def _choice(val, allowed: set[str], default: str) -> str:
+    s = str(val if val is not None else default).strip().lower()
+    return s if s in allowed else default
+
+
+def _opt_bool(val, default=False):
+    if val is None or val == "":
+        return bool(default)
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes", "on")
+    return bool(val)
+
+
+def _opt_float(val):
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+
+def normalize_plate_solve_preset(preset: dict | None) -> dict:
+    p = dict(preset or {})
+    solver = p.get("solver") or p.get("solver_pref") or p.get("preference") or "both"
+    scale = p.get("scale")
+    if scale is None:
+        scale = p.get("scale_arcsec")
+    radius_value = _opt_float(p.get("radius_value"))
+    if radius_value is None:
+        radius_value = 5.0
+    fov_value = _opt_float(p.get("fov_value"))
+    if fov_value is None:
+        fov_value = 0.0
+    return {
+        "seed_mode": _choice(p.get("seed_mode"), _SEED_MODES, "auto"),
+        "ra": str(p.get("ra") or "").strip(),
+        "dec": str(p.get("dec") or "").strip(),
+        "scale": _opt_float(scale),
+        "radius_mode": _choice(p.get("radius_mode"), _RADIUS_MODES, "auto"),
+        "radius_value": float(radius_value),
+        "fov_mode": _choice(p.get("fov_mode"), _FOV_MODES, "compute"),
+        "fov_value": float(fov_value),
+        "solver": _choice(solver, _SOLVER_PREFS, "both"),
+        "blind": _opt_bool(p.get("blind"), True),
+        "force_blind": _opt_bool(p.get("force_blind"), False),
+    }
+
+
+def apply_plate_solve_preset(settings, preset: dict | None) -> dict:
+    spec = normalize_plate_solve_preset(preset)
+    if settings is None:
+        return spec
+    _set_seed_mode(settings, spec["seed_mode"])
+    _set_manual_seed(settings, spec["ra"], spec["dec"], spec["scale"])
+    settings.setValue("astap/seed_radius_mode", spec["radius_mode"])
+    settings.setValue("astap/seed_radius_value", float(spec["radius_value"]))
+    settings.setValue("astap/seed_fov_mode", spec["fov_mode"])
+    settings.setValue("astap/seed_fov_value", float(spec["fov_value"]))
+    _set_solver_preference(settings, spec["solver"])
+    _set_blind_enabled(settings, spec["blind"])
+    _set_force_blind(settings, spec["force_blind"])
+    return spec
+
+
+def apply_plate_solve_to_doc(parent, doc, settings, preset: dict | None = None):
+    """Headless plate-solve of a specific document, using an optional preset."""
+    apply_plate_solve_preset(settings, preset)
+    return plate_solve_doc_inplace(parent, doc, settings)
+
 def _read_header_from_fits(path: str) -> Dict[str, Any]:
     with fits.open(path, memmap=False) as hdul:
         d = dict(hdul[0].header)
@@ -1321,10 +1427,31 @@ def _merge_wcs_into_base_header(base_header: Header | None, wcs_header: Header |
         pass
 
     # CROTA from CD if missing.
+    #
+    # Written in the convention CROTA2 is defined in and _summarize reports:
+    # the position angle of celestial north. The previous form,
+    # atan2(CD1_2, CD1_1), was a THIRD convention -- it works out to
+    # 180 - theta, which agrees with the position angle only at theta = 0 and
+    # drifts by 2*theta everywhere else. Whatever it wrote, a later solve of
+    # the same file read back through _make_seed_wcs as if it were theta.
+    #
+    #     det > 0:   PA = atan2(CD1_2, -CD1_1) + 180
+    #     det < 0:   PA = atan2(CD1_2, -CD1_1)
+    #
+    # which tracks the numerically measured north angle to 0.06 deg, and to
+    # better than 0.01 deg once a real solution's skew is present.
     try:
         if ("CROTA1" not in merged or "CROTA2" not in merged) and \
            ("CD1_1" in merged and "CD1_2" in merged):
-            rot = math.degrees(math.atan2(float(merged["CD1_2"]), float(merged["CD1_1"])))
+            _c11 = float(merged["CD1_1"])
+            _c12 = float(merged["CD1_2"])
+            _c21 = float(merged.get("CD2_1", 0.0))
+            _c22 = float(merged.get("CD2_2", 0.0))
+            _det = _c11 * _c22 - _c12 * _c21
+            rot = math.degrees(math.atan2(_c12, -_c11))
+            if _det > 0:
+                rot += 180.0
+            rot %= 360.0
             merged["CROTA1"] = rot
             merged["CROTA2"] = rot
     except Exception:
@@ -1511,14 +1638,119 @@ def _write_temp_fit_via_save_image(gray2d: np.ndarray, _header: Header | None) -
     print(f"Saved FITS image to: {fit_path}")
     return fit_path, os.path.splitext(fit_path)[0] + ".wcs"
 
-def _solve_numpy_with_fallback(
+def _solve_numpy_with_fallback(parent, settings, image, seed_header):
+    """
+    Four-pass solve strategy — thin wrapper that guarantees the status
+    popup goes away when the solver finishes.
+
+    The popup had a Hide button but no auto-close, so a solve kicked off
+    from a tool other than the main PlateSolverDialog (the Supernova /
+    Asteroid Hunter runs it directly) left a modeless "Plate Solving"
+    window stuck on top until the user hunted it down and clicked Hide.
+    Wrapping the real implementation here closes it on every exit path —
+    success, failure, or raised exception — in exactly one place rather
+    than at every one of the implementation's many `return` statements.
+    """
+    try:
+        return _solve_numpy_with_fallback_impl(parent, settings, image, seed_header)
+    finally:
+        try:
+            _status_popup_close()
+        except Exception:
+            pass
+
+
+def _gaia_pass(parent, settings, image, seed_header, say=None):
+    """
+    Pass 1, plus one blind retry when a seeded attempt fails.
+
+    The blind path only runs on its own when the header has NO RA/Dec at all,
+    and _parse_ra_deg accepts eight keys -- CRVAL1, RA, OBJCTRA, TELRA, MNTRA,
+    CENTERRA, RA_OBJ, ALPHA_J2000. Capture software writes the mount's RA/DEC
+    into every light, and a stacked master inherits them, so a master almost
+    always LOOKS seeded. When those numbers are stale or the scale is wrong,
+    the spiral searches around a position or scale the field is not at, finds
+    nothing, and the whole chain fails -- even though the quad index could
+    have identified the field outright without either number.
+
+    So: if a seeded attempt fails, throw the seed away and ask the index.
+    That is the one case the seed cannot be trusted, by definition. It costs
+    a couple of seconds on a path that has already failed, and nothing at all
+    when the first attempt succeeds.
+
+    Returns (ok, Header | error_str).
+    """
+    ok, res = _solve_with_GAIA_threaded(parent, settings, image, seed_header)
+    if ok:
+        return True, res
+
+    # Only worth retrying if the first pass actually USED a seed. If it was
+    # already blind -- no pointing in the header, seed mode "none", or the
+    # force-blind box ticked -- the retry would repeat it exactly.
+    try:
+        if _get_force_blind(settings) or _get_seed_mode(settings) == "none":
+            return False, res
+        if not _get_blind_enabled(settings):
+            return False, res
+        if not isinstance(seed_header, Header):
+            return False, res
+        if _parse_ra_deg(seed_header) is None or _parse_dec_deg(seed_header) is None:
+            return False, res
+        from setiastro.saspro.gaia_quad_index import get_quad_library
+        if not get_quad_library().any_installed():
+            return False, res
+    except Exception:
+        return False, res
+
+    # Drop the SCALE as well as the pointing. Force-blind alone keeps the
+    # header's pixel scale, which is the right call for the user's checkbox --
+    # focal length times pixel size stays true even when the mount lied. But
+    # here we only know that SOMETHING in the seed was wrong, and if it was
+    # the scale, keeping it poisons the retry twice over: layers_for_field
+    # picks the wrong quad layers from it, and the spiral searches the wrong
+    # scale band. With no hint, the blind solver tries every built layer
+    # coarsest-first and works it out. That is slower, on a path that has
+    # already failed.
+    retry_header = seed_header.copy()
+    for _k in ("FOCALLEN", "PIXSCALE", "SCALE", "PLTSCALE", "SECPIX",
+               "SECPIX1", "SECPIX2", "XPIXSZ", "YPIXSZ", "PIXSZ",
+               "PIXSIZE1", "PIXSIZE2", "XBINNING", "YBINNING"):
+        try:
+            del retry_header[_k]
+        except Exception:
+            pass
+    retry_header = _strip_wcs_keys(retry_header)
+
+    msg = ("Status: Seeded solve failed \u2014 the header pointing or scale may be "
+           "wrong. Retrying blind from the quad index\u2026")
+    print("[PlateSolver] Pass 1 failed with a seed; retrying blind "
+          "(pointing and scale discarded)")
+    if say is not None:
+        say(msg)
+    else:
+        _set_status_ui(parent, msg)
+
+    ok2, res2 = _solve_with_GAIA_threaded(parent, settings, image, retry_header,
+                                          force_blind=True)
+    if ok2:
+        print("[PlateSolver] blind retry succeeded where the seeded pass failed")
+        return True, res2
+    # Report the seeded failure: it is the one that describes the user's
+    # actual header, and the blind failure is a consequence of it.
+    return False, f"{res}  (blind retry also failed: {res2})"
+
+
+def _solve_numpy_with_fallback_impl(
     parent, settings, image: np.ndarray, seed_header
 ) -> tuple[bool, "Header | str"]:
     """
     Four-pass solve strategy:
 
-    Pass 1 — In-House Gaia DR3 (Hough matching against local Gaia catalog).
-              Fast, no external process, handles rotation/scale variants.
+    Pass 1 — In-House Gaia DR3 (Hough/triangle matching against the local
+              Gaia catalog). Fast, no external process, handles rotation/scale
+              variants. When the header carries no usable RA/Dec this pass now
+              recovers one blind from the local quad index first, so a missing
+              or wrong pointing no longer forces the chain down to ASTAP.
 
     Pass 2 — ASTAP seeded (auto from header, compute FOV from scale).
               Fast when header has good RA/Dec.
@@ -1543,7 +1775,7 @@ def _solve_numpy_with_fallback(
     if pref in ("gaia_only", "vizier_only"):
         _set_status_ui(parent, QCoreApplication.translate("PlateSolver",
             "Status: Solver preference = In-House Gaia DR3 only…"))
-        ok, res = _solve_with_GAIA_threaded(parent, settings, image, seed_header)
+        ok, res = _gaia_pass(parent, settings, image, seed_header)
         if ok:
             _set_status_ui(parent, QCoreApplication.translate("PlateSolver",
                 "Status: Solved via in-house Gaia DR3."))
@@ -1558,7 +1790,7 @@ def _solve_numpy_with_fallback(
             "Status: Trying in-house Gaia DR3 solver…"))
         QApplication.processEvents()
 
-        ok1, res1 = _solve_with_GAIA_threaded(parent, settings, image, seed_header)
+        ok1, res1 = _gaia_pass(parent, settings, image, seed_header)
         if ok1:
             _set_status_ui(parent, QCoreApplication.translate("PlateSolver",
                 "Status: Solved via in-house Gaia DR3."))
@@ -1590,7 +1822,15 @@ def _solve_numpy_with_fallback(
     # ── Determine if we have useful seed data ────────────────────────────────
     _has_seed = False
     _seed_mode = _get_seed_mode(settings)
-    
+
+    if _get_force_blind(settings):
+        # Pass 1 ignored the header position, so Pass 2 must not reinstate it:
+        # ASTAP seeded on the same wrong coordinates would just fail slowly
+        # before the blind pass gets its turn.
+        _seed_mode = "none"
+        print("[PlateSolver] Force blind solve — header position ignored "
+              "for every pass")
+
     if _seed_mode == "manual":
         # Check if manual fields have valid RA/Dec
         ra_s  = _get_manual_ra(settings)
@@ -1947,22 +2187,46 @@ def _make_seed_wcs(ra_deg: float, dec_deg: float, scale_arcsec: float,
     w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
 
     scale_deg = float(scale_arcsec) / 3600.0
-    rot_rad   = math.radians(rot_deg)
-    cos_r     = math.cos(rot_rad)
-    sin_r     = math.sin(rot_rad)
 
-    if not flip:
-        # det > 0 (original behavior)
-        w.wcs.cd = np.array([
-            [-scale_deg * cos_r,  scale_deg * sin_r],
-            [-scale_deg * sin_r, -scale_deg * cos_r],
-        ])
-    else:
-        # det < 0 — standard CROTA2 convention, CDELT1=-s, CDELT2=+s
-        w.wcs.cd = np.array([
-            [-scale_deg * cos_r, -scale_deg * sin_r],
-            [-scale_deg * sin_r,  scale_deg * cos_r],
-        ])
+    # CROTA2 is a POSITION ANGLE. _cd_matrix's theta is a different number.
+    # For a CD built by _cd_matrix, the position angle of celestial north --
+    # which is what CROTA2 means, and what plate_solve_cli._summarize
+    # reports -- works out to
+    #
+    #     det > 0  (mirrored=False):   PA = theta + 180
+    #     det < 0  (mirrored=True):    PA = -theta
+    #
+    # exact to 0.06 deg from the equator to dec +89.3, that residual being
+    # the TAN projection's own field rotation rather than an error.
+    #
+    # Passing CROTA2 straight in as theta therefore built a seed rotated 180
+    # deg wrong on the det > 0 branch and sign-flipped on the other. The
+    # triangle matcher absorbs it -- side-ratio invariants survive any
+    # similarity transform -- which is why it stayed invisible for so long.
+    # The evidence was in the matcher's own output all along: a seeded solve
+    # whose header CROTA2 was already correct reported
+    #
+    #     [TriMatch] affine consensus: 48/60  scale=1.0000  parity=+  rot=-180.00
+    #
+    # a seed perfect in every respect except exactly 180 degrees of roll.
+    # Inverting the mapping here lets the matcher start where the header
+    # actually says, so it has nothing to undo -- which matters most on a
+    # marginal field, where the rotation it must search through is the
+    # difference between a match and a miss.
+    theta_deg = (-rot_deg) if flip else (rot_deg - 180.0)
+    if seed_header is not None and rot_deg:
+        print(f"[GaiaLocal] seed rotation: CROTA2 {rot_deg:.2f}\u00b0 "
+              f"(position angle) -> CD theta {theta_deg % 360.0:.2f}\u00b0 "
+              f"for {'det<0' if flip else 'det>0'} parity")
+    rot_rad = math.radians(theta_deg)
+
+    # Stashed for the rotation diagnostic in _solve_fingerprint(): the seed is
+    # built here and the solution is judged there, so comparing the two is the
+    # only way to see how much roll the matcher had to remove.
+    global _LAST_SEED_ROT
+    _LAST_SEED_ROT = (float(rot_deg), float(theta_deg % 360.0), bool(flip))
+
+    w.wcs.cd = np.array(_cd_matrix(scale_deg, rot_rad, mirrored=flip))
     w.wcs.set()
     return w
 
@@ -2388,10 +2652,12 @@ class _GaiaSolveWorker(QThread):
     status = pyqtSignal(str)
     done = pyqtSignal(bool, object)   # (ok, Header|error_str)
 
-    def __init__(self, image: np.ndarray, seed_header, settings_scope=None, parent=None):
+    def __init__(self, image: np.ndarray, seed_header, settings_scope=None,
+                 parent=None, force_blind: "bool | None" = None):
         super().__init__(parent)
         self._image = image
         self._seed_header = seed_header
+        self._force_blind = force_blind
         # Capture the org/app name so the worker thread opens the same
         # QSettings file as the caller (avoids the "SASpro" vs
         # "Seti Astro Suite Pro" mismatch when the main app uses QSettings()).
@@ -2411,13 +2677,15 @@ class _GaiaSolveWorker(QThread):
                 self._image, self._seed_header,
                 parent=None, settings=settings,
                 status_cb=self.status.emit,
+                force_blind=self._force_blind,
             )
         except Exception as e:
             import traceback; traceback.print_exc()
             ok, res = False, f"Gaia DR3 solver: worker exception: {e}"
         self.done.emit(ok, res)
 
-def _solve_with_GAIA_threaded(parent, settings, image, seed_header) -> tuple[bool, "Header | str"]:
+def _solve_with_GAIA_threaded(parent, settings, image, seed_header,
+                              force_blind: "bool | None" = None) -> tuple[bool, "Header | str"]:
     """
     Same signature/contract as _solve_with_GAIA but runs it in a QThread,
     spinning a local event loop so the UI stays responsive. Synchronous to
@@ -2439,7 +2707,8 @@ def _solve_with_GAIA_threaded(parent, settings, image, seed_header) -> tuple[boo
         except Exception:
             pass
 
-    worker = _GaiaSolveWorker(image, seed_header, settings_scope=_scope)
+    worker = _GaiaSolveWorker(image, seed_header, settings_scope=_scope,
+                              force_blind=force_blind)
     worker.status.connect(lambda t: _set_status_ui(parent, t))   # queued → GUI thread
 
     def _on_done(ok, res):
@@ -2453,11 +2722,386 @@ def _solve_with_GAIA_threaded(parent, settings, image, seed_header) -> tuple[boo
     worker.deleteLater()
     return result.get("ok", False), result.get("res", "Gaia DR3 solver: worker did not return")
 
+# ---------- Blind solving via the local quad index ----------
+
+def _get_blind_enabled(settings) -> bool:
+    """Blind solving through the quad index. On by default."""
+    if settings is None:
+        return True
+    try:
+        v = settings.value("plate_solver/blind_quads", True)
+        if isinstance(v, str):
+            return v.strip().lower() not in ("false", "0", "no")
+        return bool(v)
+    except Exception:
+        return True
+
+
+def _set_blind_enabled(settings, on: bool):
+    if settings is not None:
+        settings.setValue("plate_solver/blind_quads", bool(on))
+
+
+def _get_force_blind(settings) -> bool:
+    """
+    Ignore the header RA/Dec and locate the field from the star pattern.
+
+    For when the pointing is WRONG rather than missing. A wrong seed is worse
+    than no seed: the spiral search quarters a patch of sky the field is not
+    in, fails slowly, and then hands ASTAP the same bad position to fail on
+    again. The pixel scale is kept, because it is derived from focal length
+    and pixel size and stays right even when the mount was lying.
+    """
+    if settings is None:
+        return False
+    try:
+        v = settings.value("plate_solver/force_blind", False)
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes")
+        return bool(v)
+    except Exception:
+        return False
+
+
+def _set_force_blind(settings, on: bool):
+    if settings is not None:
+        settings.setValue("plate_solver/force_blind", bool(on))
+
+
+def _blind_seed_header(image: np.ndarray, scale_hint, say) -> tuple[bool, object]:
+    """
+    Ask the quad index where this image points. Returns (True, Header) with
+    CRVAL/CD/CROTA2 only, or (False, reason).
+    """
+    try:
+        from setiastro.saspro.gaia_blind_solver import blind_seed
+    except Exception as e:
+        return False, (f"blind solver unavailable ({e}). Build a Blind Solve "
+                       f"Index on the Gaia DR3 Library dialog.")
+    # _set_status_ui only forwards a line to the batch log when it is tagged
+    # like the rest of the chain, so tag everything the blind solver says
+    # here rather than prefixing a dozen strings over there.
+    def blind_say(msg: str):
+        m = str(msg)
+        say(m if m.startswith(("Status:", "\u25b6", "\u2714", "\u274c")) else f"Status: {m}")
+
+    blind_say("Status: Blind solving \u2014 no usable RA/Dec, identifying the "
+              "field from the star pattern\u2026")
+    try:
+        return blind_seed(image, scale_hint_arcsec=scale_hint,
+                          status_cb=blind_say)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        blind_say(f"Status: Blind solve failed: {type(e).__name__}: {e}")
+        return False, f"blind solve raised {type(e).__name__}: {e}"
+
+
+def _merge_blind_seed(original: "Header | None", blind: "Header") -> "Header":
+    """
+    Acquisition header + the blind WCS. The original's own WCS keys are dropped
+    first: if they were any good we would not be here, and a stale CROTA2 would
+    otherwise override the roll the blind solve just measured.
+    """
+    base = (_strip_wcs_keys(original.copy())
+            if isinstance(original, Header) else Header())
+    for k in ("CTYPE1", "CTYPE2", "CRPIX1", "CRPIX2", "CRVAL1", "CRVAL2",
+              "CD1_1", "CD1_2", "CD2_1", "CD2_2", "CROTA1", "CROTA2",
+              "RADESYS", "WCSAXES", "BLNDODDS", "BLNDLAYR"):
+        if k in blind:
+            try:
+                base[k] = blind[k]
+            except Exception:
+                pass
+    return base
+
+
+#: Catalogue stars to aim for in one query. Four thousand rather than the
+#: ~1000 the 3x3 grid keeps, because the grid wants its quota in EVERY cell
+#: and the brightest stars in a field are not spread evenly -- a cluster or
+#: the galactic plane will hog one cell while another starves. Headroom here
+#: is what lets the grid make a uniform selection out of a clumpy one.
+_CATALOG_TARGET_STARS = 4000
+
+#: Per-detection multiplier, and the floor/ceiling around it. Tying the target
+#: to the detection count is what keeps the catalogue reliably DEEPER than the
+#: image: both scale the same way with field area, so a frame that detects
+#: more stars asks for proportionally more catalogue.
+_CATALOG_STARS_PER_DETECTION = 4
+_CATALOG_TARGET_MIN = 2000
+_CATALOG_TARGET_MAX = 20000
+
+
+def _catalog_mag_limit(ra_lo, ra_hi, dec_lo, dec_hi, n_detected: int = 0) -> float:
+    """
+    Faintest G worth querying for this sky box.
+
+    Unlimited, a query returns every Gaia source in the field, which on a wide
+    frame is enormous and almost entirely useless: a 12.6 x 8.2 degree field
+    holds about 1.2 million sources at full depth, and the matcher downstream
+    keeps at most 999 of them. The rest are fetched, sorted, built into a
+    SkyCoord, projected to pixels and discarded -- once per search centre,
+    scale and parity attempted.
+
+    Because the limit falls as the field grows, the row count stays roughly
+    constant whatever the field size, so the query cost no longer depends on
+    how wide the frame is. A narrow deep field is unaffected: at a third of a
+    square degree it still takes G ~ 18 to find a few thousand stars.
+
+    Never raises -- a solve must not fail because this estimate could not be
+    made, so anything unexpected falls back to no limit at all.
+    """
+    try:
+        from setiastro.saspro.gaia_database import (
+            field_area_deg2, mag_limit_for_field)
+        area = field_area_deg2(ra_lo, ra_hi, dec_lo, dec_hi)
+        # A non-finite box must fall back to NO limit, not to the bright
+        # floor. Both are "wrong", but one of them under-fetches and fails the
+        # solve, while the other merely costs what today already costs.
+        if not np.isfinite(area) or area <= 0.0:
+            return 99.0
+        target = _CATALOG_TARGET_STARS
+        if n_detected > 0:
+            target = int(np.clip(_CATALOG_STARS_PER_DETECTION * n_detected,
+                                 _CATALOG_TARGET_MIN, _CATALOG_TARGET_MAX))
+        return float(mag_limit_for_field(area, target_stars=target))
+    except Exception as e:
+        print(f"[GaiaLocal] could not size the magnitude limit ({e}); "
+              f"querying unlimited")
+        return 99.0
+
+
+def _solve_fingerprint(wcs_solution, img_matched, sep_arcsec,
+                       img_w: int, img_h: int) -> None:
+    """
+    Print what two solves of the same frame can actually be compared on.
+
+    RMS and pair count cannot be compared between runs: they are computed over
+    whatever pairs each run happened to keep, and the matcher chooses its own
+    tolerance, so a run that paired more stars reports a worse RMS even when
+    its astrometry is identical. Everything here is independent of that choice.
+
+      * The FINGERPRINT evaluates the final WCS at fixed pixel positions. Two
+        runs that agree here are the same solution, whatever their RMS says --
+        and the corners are the test that matters, because the centre can
+        agree while the SIP terms disagree out at the edges.
+      * The PERCENTILES show the shape of the residual distribution. A
+        population of genuine mismatches is a heavy tail; noisier centroids on
+        fainter stars are a broad, tight-tailed spread. These are 2-D angular
+        separations, so isotropic Gaussian position error makes them Rayleigh
+        distributed, giving p95/RMS = 2.448/sqrt(2) ~ 1.73; below that there
+        is no outlier population to prune.
+      * The RADIAL PROFILE says whether the error is uniform or lives at the
+        field edge, which separates a distortion model that has not converged
+        from pairs that are simply wrong.
+
+    Purely diagnostic. Never raises -- a solve must not fail because a print
+    could not be produced.
+    """
+    try:
+        print("[GaiaLocal] --- comparable between runs "
+              "(RMS and pair count are not) ---")
+
+        # How much roll did the matcher have to remove from the seed?
+        #
+        # A residual near zero means the seed rotation was right. Near +/-180
+        # means the convention is inverted somewhere. Anything else is a real
+        # error in whatever produced the hint -- and the blind solver's
+        # roll_deg has shown ~16 deg of it on top of the 180, which is too
+        # large to be a convention and wants watching across several frames.
+        #
+        # globals().get rather than a bare name: a solve that never built a
+        # seed through _make_seed_wcs simply has nothing to report.
+        _seed = globals().get("_LAST_SEED_ROT")
+        if _seed is not None:
+            _crota, _theta, _flip = _seed
+            try:
+                _cx, _cy = (img_w - 1) / 2.0, (img_h - 1) / 2.0
+                _c = wcs_solution.pixel_to_world(_cx, _cy)
+                _xn, _yn = wcs_solution.world_to_pixel_values(
+                    float(_c.ra.deg), float(_c.dec.deg) + 10.0 / 3600.0)
+                _pa = math.degrees(math.atan2(float(_xn) - _cx,
+                                              float(_yn) - _cy)) % 360.0
+                _solved_theta = ((-_pa) if _flip else (_pa - 180.0)) % 360.0
+                _resid = (_solved_theta - _theta + 180.0) % 360.0 - 180.0
+                print(f"[GaiaLocal]   rotation: seed CROTA2 "
+                      f"{_crota:.2f}\u00b0 -> CD theta {_theta:.2f}\u00b0; "
+                      f"solved theta {_solved_theta:.2f}\u00b0 "
+                      f"(north PA {_pa:.2f}\u00b0); matcher removed "
+                      f"{_resid:+.2f}\u00b0")
+                if abs(abs(_resid) - 180.0) < 5.0:
+                    print("[GaiaLocal]   rotation: a residual near "
+                          "+/-180\u00b0 means the seed convention is inverted")
+                elif abs(_resid) > 5.0:
+                    print(f"[GaiaLocal]   rotation: {_resid:+.2f}\u00b0 is a "
+                          f"real seed error, not a convention offset")
+            except Exception:
+                pass
+
+        pts = [("centre", (img_w - 1) / 2.0, (img_h - 1) / 2.0),
+               ("TL", 0.0, 0.0), ("TR", img_w - 1.0, 0.0),
+               ("BL", 0.0, img_h - 1.0), ("BR", img_w - 1.0, img_h - 1.0)]
+        for name, x, y in pts:
+            c = wcs_solution.pixel_to_world(x, y)
+            print(f"[GaiaLocal]   fingerprint {name:<7} "
+                  f"RA={float(c.ra.deg):11.6f}  Dec={float(c.dec.deg):+11.6f}")
+
+        q = np.percentile(sep_arcsec, [50, 75, 90, 95, 99])
+        rms = float(np.sqrt(np.mean(sep_arcsec ** 2)))
+        print(f"[GaiaLocal]   residuals p50={q[0]:.2f}\" p75={q[1]:.2f}\" "
+              f"p90={q[2]:.2f}\" p95={q[3]:.2f}\" p99={q[4]:.2f}\" "
+              f"max={float(sep_arcsec.max()):.2f}\"")
+        # p95/RMS was the obvious shape test and it is a trap: a tail big
+        # enough to matter inflates the RMS it is being compared against, so
+        # the ratio SHRINKS as the tail grows. Measured on this very field,
+        # the run with a 77" worst pair scored 1.48 ("no outliers") while the
+        # clean one scored 2.31. Ratios against the MEDIAN do not move with
+        # the tail, so they actually report it.
+        _med = q[0] if q[0] > 0 else float("nan")
+        print(f"[GaiaLocal]   shape p95/p50={q[3] / _med:.1f}  "
+              f"p99/p50={q[4] / _med:.1f}  "
+              f"max/p50={float(sep_arcsec.max()) / _med:.1f}  "
+              f"(Rayleigh gives 2.1 / 2.6 / 3.3 at ~1000 pairs; "
+              f"far above means real outliers)")
+
+        # Residual against distance from the frame centre, in four equal-count
+        # rings so every bin carries the same weight.
+        cx, cy = (img_w - 1) / 2.0, (img_h - 1) / 2.0
+        r = np.hypot(img_matched[:, 0] - cx, img_matched[:, 1] - cy)
+        order = np.argsort(r)
+        rings = np.array_split(order, 4)
+        parts = []
+        for i, ring in enumerate(rings):
+            if len(ring) == 0:
+                continue
+            rr = float(np.sqrt(np.mean(sep_arcsec[ring] ** 2)))
+            parts.append(f"r{i}({len(ring)}@{float(r[ring].max()) / max(cx, 1):.2f}R)"
+                         f"={rr:.2f}\"")
+        print("[GaiaLocal]   radial RMS  " + "  ".join(parts))
+
+        # Coverage, stated outright. This is the line that distinguishes a
+        # solution fitted across the frame from one fitted in the middle and
+        # extrapolated outward -- and the RMS alone cannot tell them apart,
+        # because the second number is lower precisely BECAUSE it describes
+        # less of the image.
+        _corner = math.hypot(cx, cy)
+        _reach = float(r.max()) / _corner if _corner > 0 else 0.0
+        _inside = float(np.mean(
+            np.hypot(np.random.default_rng(0).uniform(0, img_w, 20000) - cx,
+                     np.random.default_rng(1).uniform(0, img_h, 20000) - cy)
+            <= float(r.max())))
+        print(f"[GaiaLocal]   coverage: outermost pair at "
+              f"{_reach * 100:.0f}% of the corner distance, "
+              f"pairs span ~{_inside * 100:.0f}% of the frame area"
+              + ("" if _reach > 0.95 else
+                 f"  <-- the outer {(1 - _inside) * 100:.0f}% is EXTRAPOLATED"))
+    except Exception as e:
+        print(f"[GaiaLocal] fingerprint unavailable: {e}")
+
+
+def _field_sky_box(corner_sky, margin_deg):
+    """
+    RA/Dec bounding box for a field, correct at the poles and across RA=0.
+
+    Taking min/max of the four corner RAs is wrong twice over:
+
+      * A field containing a pole has corner RAs scattered anywhere around the
+        circle. min/max then spans the gap BETWEEN them and excludes
+        everything outside it -- which is most of the field. The catalogue
+        comes back missing a wedge of real stars, the matcher pairs the
+        survivors with whatever is nearest, and the fit lands hundreds of
+        arcseconds out while still reporting a confident-looking consensus.
+      * A field straddling RA=0 has corners at (say) 359.9 and 0.2, and the
+        box runs the long way round the sky.
+
+    Both are fixed the same way: when the corners span more than half the sky
+    in RA, or the field reaches a pole, take all RA and let the in-frame
+    projection filter downstream do the trimming. Over-fetching is harmless --
+    the caller already drops anything that does not project into the frame --
+    whereas under-fetching is silent and fatal.
+    """
+    ras = [float(c.ra.deg) % 360.0 for c in corner_sky]
+    decs = [float(c.dec.deg) for c in corner_sky]
+    dec_min = min(decs) - margin_deg
+    dec_max = max(decs) + margin_deg
+
+    polar = (dec_max >= 89.0) or (dec_min <= -89.0)
+    if polar:
+        if dec_max >= 89.0:
+            dec_max = 90.0
+        if dec_min <= -89.0:
+            dec_min = -90.0
+    if polar or (max(ras) - min(ras)) > 180.0:
+        return 0.0, 360.0, max(-90.0, dec_min), min(90.0, dec_max)
+    return (min(ras) - margin_deg, max(ras) + margin_deg,
+            max(-90.0, dec_min), min(90.0, dec_max))
+
+
+def _quad_refine_seed(img_stars, img_w, img_h, scale_hint, say):
+    """
+    Ask the quad index where this field actually is, reusing the stars the
+    caller already detected.
+
+    This exists to collapse the search grid. The spiral is 19 centres x 5
+    scales x 2 parities = 190 attempts, and each failing attempt that falls
+    through to the Hough matcher costs a pure-Python O(n^2) vote: measured at
+    4.3 s for 1000 stars. One hash lookup gets the answer outright, so the
+    grid becomes a single attempt that is already correct.
+
+    Returns the solve_blind_core result dict, or None to leave the grid alone.
+    Every failure path returns None: this is an accelerator, never a gate.
+
+    NOT CURRENTLY CALLED. It used to run on every solve, which made the
+    "blind-solve when there is no RA/Dec" checkbox consult the quad index even
+    when the header had a good pointing. Kept because the idea is sound and
+    cheap to re-enable -- but a wrong seed is now handled by the blind retry
+    in _gaia_pass(), so switching it back on would only buy speed on frames
+    that already solve on the first attempt.
+    """
+    try:
+        from setiastro.saspro.gaia_quad_index import get_quad_library
+        from setiastro.saspro.gaia_blind_solver import (
+            solve_blind_core, make_fetch_box)
+    except Exception as e:
+        print(f"[GaiaLocal] quad index unavailable: {e}")
+        return None
+    try:
+        lib = get_quad_library()
+        if not lib.any_installed():
+            return None
+        fetch = make_fetch_box()
+        if fetch is None:
+            return None
+
+        a = np.asarray(img_stars, dtype=np.float64)
+        if a.ndim != 2 or len(a) < 8:
+            return None
+        # The index keeps the brightest stars per sky cell, so the solver has
+        # to rank globally by brightness or the two sets never correspond.
+        if a.shape[1] >= 3:
+            a = a[np.argsort(-a[:, 2])]
+
+        field_arcmin = ((max(img_w, img_h) * scale_hint / 60.0)
+                        if scale_hint else None)
+        layers = lib.layers_for_field(field_arcmin)
+        if not layers:
+            return None
+        res = solve_blind_core(a[:, :2], int(img_w), int(img_h), layers, fetch,
+                               scale_hint_arcsec=scale_hint, status_cb=say)
+        return res if res.get("ok") else None
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[GaiaLocal] quad refine failed, using the search grid: {e}")
+        return None
+
+
 def _solve_with_GAIA(image: np.ndarray,
                      seed_header: "Header | None",
                      parent=None,
                      settings=None,
-                     status_cb=None) -> tuple[bool, "Header | str"]:
+                     status_cb=None,
+                     force_blind: "bool | None" = None) -> tuple[bool, "Header | str"]:
     """
         Match image stars to catalog stars by voting on (dx, dy) translation space
         — a Generalized Hough Transform restricted to pure translation.
@@ -2488,14 +3132,45 @@ def _solve_with_GAIA(image: np.ndarray,
     # Check if we're in manual seed mode — if so, prefer settings over header
     _seed_mode = _get_seed_mode(settings) if settings is not None else "auto"
 
-    if _seed_mode == "none":
-        return False, (
-            "Gaia DR3 solver: blind solving is not supported by the In-House Gaia DR3 solver. "
-            "A seed position is required. Set Seed Mode to 'Auto' (uses header RA/Dec) or "
-            "'Manual' (enter coordinates), or switch to ASTAP for blind solving."
-        )
+    def _say(text: str):
+        if status_cb is not None:
+            status_cb(text)
+        else:
+            _set_status_ui(parent, text)
 
-    if _seed_mode == "manual" and settings is not None:
+    # None = honour the user's checkbox; True/False = caller decides, used
+    # by the blind retry below so it need not write to persisted settings.
+    _force_blind = (_get_force_blind(settings) if force_blind is None
+                    else bool(force_blind))
+    _from_blind = False
+
+    if _seed_mode == "none" or _force_blind:
+        # Explicit blind, or forced. Throw the POSITION away but keep the
+        # pixel scale — it comes from focal length and pixel size, so it stays
+        # right even when the mount was lying, and it narrows the quad search
+        # to one or two layers. A manually entered scale outranks the header,
+        # since someone who typed it in knows something we do not.
+        ra = dec = None
+        # Only trust the manual scale in MANUAL mode. The manual fields are
+        # disabled in every other mode, but current_preset() still reads and
+        # persists whatever text is sitting in them, so outside manual mode
+        # they are stale leftovers. Honouring one here is actively harmful: a
+        # stale 1.0"/px against a real 1.63"/px puts the scale filter at
+        # 0.7-1.3, which discards every correct candidate before it is ever
+        # verified, and the solve grinds through junk instead of failing.
+        scale = None
+        _scale_src = "manual entry"
+        if _seed_mode == "manual" and settings is not None:
+            scale = _get_manual_scale(settings)
+        if scale is None:
+            scale = (_estimate_scale_arcsec_from_header(seed_header)
+                     if isinstance(seed_header, Header) else None)
+            _scale_src = "the header"
+        if _force_blind and _seed_mode != "none":
+            _say("Status: Force blind solve — ignoring the given position"
+                 + (f", keeping {scale:.3f}\"/px from {_scale_src}"
+                    if scale else " and searching every scale"))
+    elif _seed_mode == "manual" and settings is not None:
         ra_s  = _get_manual_ra(settings)
         dec_s = _get_manual_dec(settings)
         ra    = _parse_ra_input_to_deg(ra_s)
@@ -2509,6 +3184,31 @@ def _solve_with_GAIA(image: np.ndarray,
         ra    = _parse_ra_deg(seed_header)  if isinstance(seed_header, Header) else None
         dec   = _parse_dec_deg(seed_header) if isinstance(seed_header, Header) else None
         scale = _estimate_scale_arcsec_from_header(seed_header) if isinstance(seed_header, Header) else None
+
+    # ── 1b) No position? Recover one blind from the quad index ───────────────
+    # The quad index identifies the field from the star pattern alone. What it
+    # returns is a SEED, not a solution: everything below — the spiral search,
+    # the matcher, the refinement, the SIP fit and the quality gate — then runs
+    # exactly as it does for a header-seeded solve.
+    if ra is None or dec is None:
+        if not (_get_blind_enabled(settings) or _force_blind):
+            return False, ("Gaia DR3 solver: no RA/Dec seed in header, and blind "
+                           "solving via the quad index is disabled in settings.")
+        ok_b, blind = _blind_seed_header(image, scale, _say)
+        if not ok_b:
+            return False, f"Gaia DR3 solver: {blind}"
+        _from_blind = True
+        ra = _parse_ra_deg(blind)
+        dec = _parse_dec_deg(blind)
+        scale = _estimate_scale_arcsec_from_header(blind) or scale
+        seed_header = _merge_blind_seed(seed_header, blind)
+        _odds = blind.get("BLNDODDS", None)
+        _lyr = blind.get("BLNDLAYR", None)
+        _say("Status: Blind solve located the field at "
+             f"RA={ra:.4f}° Dec={dec:+.4f}°, {scale:.3f}\"/px"
+             + (f", log-odds {float(_odds):,.0f}" if _odds is not None else "")
+             + (f", layer {int(_lyr)}" if _lyr is not None else "")
+             + " — handing to the Gaia solver to refine…")
 
     if ra is None or dec is None:
         return False, "Gaia DR3 solver: no RA/Dec seed in header"
@@ -2641,6 +3341,44 @@ def _solve_with_GAIA(image: np.ndarray,
     if len(img_stars) < 10:
         return False, f"Gaia DR3 solver: only {len(img_stars)} stars detected — too few"
 
+    # ── 4b) Collapse the search grid with the quad index ────────────────────
+    # PREPENDED, never substituted: the quad answer becomes attempt 0, and the
+    # whole original grid stays behind it untouched. If the quad solution is
+    # subtly wrong the spiral still runs exactly as it does today, so this can
+    # only ever save attempts, never cost a solve.
+    # Held for the fallback below: if every refinement attempt fails its
+    # quality gate, this verified placement is still the best astrometry we
+    # have, and returning it beats returning nothing.
+    _quad_seed = None
+
+    if _from_blind:
+        # Blind already ran the quad index; its answer is the seed. Collapse
+        # the grid to it rather than paying for a second identical lookup.
+        search_centers = [(ra, dec)] + list(search_centers)
+        scale_variants = [scale] + list(scale_variants)
+        if isinstance(seed_header, Header) and seed_header.get("BLNDODDS") is not None:
+            _quad_seed = {
+                "ra": ra, "dec": dec, "scale_arcsec": scale,
+                "roll_deg": seed_header.get("CROTA2", 0.0),
+                "parity": seed_header.get("BLNDPAR", "normal"),
+                "log_odds": seed_header.get("BLNDODDS"),
+                "layer": seed_header.get("BLNDLAYR"),
+            }
+    # No `elif` consulting the quad index here on purpose.
+    #
+    # This branch used to run _quad_refine_seed on EVERY solve whenever the
+    # blind box was ticked, seed or no seed, as an accelerator: one lookup
+    # collapses 19 centres x 5 scales x 2 parities to a single attempt that is
+    # already right. But the checkbox says "when there is no RA/Dec", and a
+    # header carrying a perfectly good pointing still went through the quad
+    # index -- the control did not mean what it said.
+    #
+    # It is also no longer needed. A seed that turns out to be wrong is caught
+    # by _gaia_pass(), which retries blind once Pass 1 has failed, so the only
+    # thing the unconditional lookup bought was speed on exactly the frames
+    # that did not need it. Blind now runs when the header has no usable
+    # pointing (handled above) or when Force blind solve is ticked.
+
     # ── 5) Search loop: spiral centers × scale variants ──────────────────────
     import sqlite3
 
@@ -2672,13 +3410,25 @@ def _solve_with_GAIA(image: np.ndarray,
 
                         corners_pix = [(0,0),(img_w-1,0),(0,img_h-1),(img_w-1,img_h-1)]
                         corner_sky  = [seed_wcs.pixel_to_world(x, y) for x, y in corners_pix]
-                        ra_min  = min(c.ra.deg  for c in corner_sky) - 0.1
-                        ra_max  = max(c.ra.deg  for c in corner_sky) + 0.1
-                        dec_min = min(c.dec.deg for c in corner_sky) - 0.1
-                        dec_max = max(c.dec.deg for c in corner_sky) + 0.1
+                        (ra_min, ra_max, dec_min,
+                         dec_max) = _field_sky_box(corner_sky, 0.1)
 
+                        # Only ever ask for as many stars as the matcher can
+                        # use. Unlimited, a wide field returns every Gaia
+                        # source inside it -- 1.2 million on a 12.6 x 8.2 deg
+                        # frame -- all of which get sorted, turned into a
+                        # SkyCoord, projected to pixels, and then decimated to
+                        # at most 999 by the 3x3 grid below. And that happens
+                        # once per search centre, scale and parity tried.
+                        #
+                        # The limit is derived per box rather than once, so a
+                        # scale variant that widens the field correspondingly
+                        # brightens the cut.
+                        _gmax = _catalog_mag_limit(ra_min, ra_max, dec_min,
+                                                   dec_max, len(img_stars))
                         if use_astro:
-                            stars = astro_lib.find_stars_in_box(ra_min, ra_max, dec_min, dec_max)
+                            stars = astro_lib.find_stars_in_box(
+                                ra_min, ra_max, dec_min, dec_max, max_mag=_gmax)
                             seen_sids = {
                                 s.source_id: {"ra": s.ra, "dec": s.dec, "gmag": s.gmag, "sid": s.source_id}
                                 for s in stars if s.source_id not in excluded_sids
@@ -2691,7 +3441,9 @@ def _solve_with_GAIA(image: np.ndarray,
                                     cur.execute("""
                                         SELECT source_id, ra, dec, phot_g_mean_mag FROM sources
                                         WHERE dec BETWEEN ? AND ? AND ra BETWEEN ? AND ?
-                                    """, (dec_min, dec_max, ra_min, ra_max))
+                                          AND phot_g_mean_mag IS NOT NULL
+                                          AND phot_g_mean_mag <= ?
+                                    """, (dec_min, dec_max, ra_min, ra_max, float(_gmax)))
                                     all_sources.extend(cur.fetchall())
                                 except Exception as e:
                                     print(f"[GaiaLocal] query failed on {fname}: {e}")
@@ -2711,7 +3463,8 @@ def _solve_with_GAIA(image: np.ndarray,
 
                         if is_center:
                             print(f"[GaiaLocal] {len(seen_sids)} unique catalog stars found in field "
-                                f"({len(excluded_sids)} excluded from prior round)")
+                                f"(G <= {_gmax:.1f} for this field size, "
+                                f"{len(excluded_sids)} excluded from prior round)")
                         _status(f"Status: {len(seen_sids)} Gaia stars — trying {label}…")
 
                         cat_infos = list(seen_sids.values())
@@ -2815,7 +3568,7 @@ def _solve_with_GAIA(image: np.ndarray,
             img_matched, cat_matched_xy, seed_wcs, cat_sky,
             img_w, img_h, lib, parent,
             use_astro=use_astro, astro_lib=astro_lib,
-            status_cb=status_cb,
+            status_cb=status_cb, img_stars_all=img_stars,
         )
 
         # Best of both worlds: if the triangle-derived pairs matched but the
@@ -2836,7 +3589,7 @@ def _solve_with_GAIA(image: np.ndarray,
                     h_img, h_cat, seed_wcs, cat_sky,
                     img_w, img_h, lib, parent,
                     use_astro=use_astro, astro_lib=astro_lib,
-                    status_cb=status_cb,
+                    status_cb=status_cb, img_stars_all=img_stars,
                 )
                 if ok_round:
                     img_matched, cat_matched_xy = h_img, h_cat
@@ -2850,9 +3603,194 @@ def _solve_with_GAIA(image: np.ndarray,
             print(f"[GaiaLocal] excluding {len(matched_sids)} catalog stars from this bad match, retrying…")
             continue
         else:
+            _fb = _quad_seed_solution(_quad_seed, img_w, img_h, seed_header,
+                                      result_or_err)
+            if _fb is not None:
+                print("[GaiaLocal] refinement failed the gate — returning the "
+                      "quad index seed as a seed-grade solution")
+                _say("Status: Refinement could not reach the accuracy gate. "
+                     "Returning the quad index placement instead — the field "
+                     "is correctly identified, but the WCS is approximate "
+                     "(no distortion fit). SOLVSRC='quad-seed'.")
+                return True, _fb
             return False, result_or_err
 
+    _fb = _quad_seed_solution(_quad_seed, img_w, img_h, seed_header,
+                              "no match across all search attempts")
+    if _fb is not None:
+        print("[GaiaLocal] no refined match — returning the quad index seed")
+        _say("Status: No refined match. Returning the quad index placement "
+             "— approximate WCS, SOLVSRC='quad-seed'.")
+        return True, _fb
     return False, "Gaia DR3 solver: no match found across all search attempts"
+
+def _quad_index_status_html() -> str:
+    """
+    One line on what the blind solver actually has to work with.
+
+    The useful fact is not how many files exist but which FIELD WIDTHS they
+    cover: each layer answers a band of about 4x in field size, so a user
+    with three layers built still gets nothing on a frame that falls outside
+    them. Lead with the covered range, and say plainly when a gap sends the
+    solve to ASTAP instead.
+    """
+    import html as _html
+    try:
+        from setiastro.saspro.gaia_quad_index import (
+            get_quad_library, refresh_quad_library, QUAD_LAYER_DEFS, _fmt_ang)
+    except Exception:
+        return ("<span style='color:#c87f00'>Quad index module unavailable \u2014 "
+                "blind solving will use ASTAP.</span>")
+    try:
+        refresh_quad_library()
+        lib = get_quad_library()
+        built = [l for l in lib.installed() if l.defn is not None]
+        total = len(QUAD_LAYER_DEFS)
+    except Exception as e:
+        return ("<span style='color:#c87f00'>Quad index could not be read: "
+                f"{_html.escape(str(e))}</span>")
+
+    try:
+        from setiastro.saspro.gaia_database import get_astro_library
+        n_bands = len(get_astro_library().installed_bands() or [])
+    except Exception:
+        n_bands = 0
+    bands = (f"{n_bands} Gaia catalogue band{'s' if n_bands != 1 else ''} installed"
+             if n_bands else "<b>no Gaia catalogue bands installed</b>")
+
+    if not built:
+        return ("<span style='color:#c87f00'><b>Quad index: not built.</b> "
+                "Blind solving will fall back to ASTAP. Build it from the Gaia "
+                "data you already have \u2014 Blind Solve Index tab.</span>"
+                f"<br><small>{bands}.</small>")
+
+    lo = min(l.defn.field_lo_arcmin for l in built)
+    hi = max(l.defn.field_hi_arcmin for l in built)
+    quads = sum(int(l.n_quads) for l in built)
+    missing = total - len(built)
+
+    txt = (f"<b>Quad index: {len(built)} of {total} layers built</b> "
+           f"({quads:,} quads) \u2014 solves fields "
+           f"{_fmt_ang(lo)} to {_fmt_ang(hi)} wide.<br><small>{bands}.")
+    if missing:
+        txt += (f" {missing} layer{'s' if missing != 1 else ''} not built; "
+                "fields outside that range fall back to ASTAP.")
+    return txt + "</small>"
+
+
+def _cd_matrix(scale_deg: float, theta_rad: float, mirrored: bool):
+    """
+    The CD matrix for a TAN image at pixel scale `scale_deg` and roll
+    `theta_rad`, mirrored or not. Returns ((CD1_1, CD1_2), (CD2_1, CD2_2)).
+
+    One definition, because getting this wrong is quiet. The earlier form
+    multiplied CD1_1 and CD2_1 by the parity sign and left CD1_2 and CD2_2
+    alone. That is not a mirror -- a mirror negates a whole axis, so it must
+    take a full row or a full column, never half of each. What it produced
+    was a shear: det = -parity * scale^2 * cos(2*theta), which is zero at a
+    45 degree roll (singular matrix), changes sign past it (parity silently
+    inverts), and leaves the two column vectors non-perpendicular at every
+    roll that is not a multiple of 90 degrees. Column norms stay correct, so
+    a pixel scale read back from it still looks right while the WCS itself
+    is skewed.
+
+    Here det is +scale^2 or -scale^2 exactly, at every roll.
+    """
+    c = math.cos(theta_rad)
+    s = math.sin(theta_rad)
+    if mirrored:
+        # det = -scale^2  (standard CROTA2 convention, CDELT1=-s, CDELT2=+s)
+        return ((-scale_deg * c, -scale_deg * s),
+                (-scale_deg * s,  scale_deg * c))
+    # det = +scale^2
+    return ((-scale_deg * c,  scale_deg * s),
+            (-scale_deg * s, -scale_deg * c))
+
+
+def _sky_centroid(coords) -> "SkyCoord":
+    """
+    Mean direction of a set of sky coordinates, as a mean of unit vectors.
+
+    Averaging RA in degrees is wrong wherever the set wraps. A field straddling
+    RA 0h averages to 12h. A field containing a celestial pole holds stars at
+    every RA at once, so its mean RA is meaningless -- on the Polaris frame the
+    stars span 0.1 deg to 360.0 deg and average to 137.7 deg against a true
+    centre of 37.0 deg. Either way the tangent point lands degrees away from
+    the field, and a TAN fit anchored there cannot represent the true WCS: the
+    same 489 pairs fit to 551" RMS about the averaged point and 0.84" about the
+    real centre, with the plate scale inflated from 4.03"/px to 4.59"/px.
+
+    Averaging the unit vectors instead has no wrap and no pole.
+    """
+    from astropy.coordinates import SkyCoord
+    from astropy import units as u
+
+    v = np.atleast_2d(coords.cartesian.xyz.value.reshape(3, -1).T)
+    m = v.mean(axis=0)
+    n = float(np.linalg.norm(m))
+    if not np.isfinite(n) or n < 1e-12:
+        # Antipodally symmetric: no mean direction exists. Any member of the
+        # set beats a point outside it.
+        f = coords.flatten()[0]
+        return SkyCoord(ra=f.ra, dec=f.dec, frame=coords.frame)
+    m = m / n
+    return SkyCoord(
+        ra=(math.degrees(math.atan2(m[1], m[0])) % 360.0) * u.deg,
+        dec=math.degrees(math.asin(max(-1.0, min(1.0, float(m[2]))))) * u.deg,
+        frame=coords.frame,
+    )
+
+
+def _quad_seed_solution(quad_seed, img_w, img_h, seed_header, reason):
+    """
+    Last resort: hand back the quad index's own placement of the field.
+
+    The refinement pipeline has failed its quality gate, so there is no
+    distortion-corrected fit to return. The quad match itself, though, was
+    accepted on log-odds against the background hypothesis -- it is a real
+    identification of the field, carrying its own centre, scale, roll and
+    parity, accurate to about what a 4-star similarity fit allows. For a user
+    who would otherwise get nothing at all, a correctly centred WCS good to a
+    few pixels is worth far more than a failure.
+
+    It is returned clearly labelled, and deliberately WITHOUT a SOLVRMS card:
+    there is no fit to quote a residual from, and inventing one would let a
+    seed-grade WCS pass for a refined one downstream.
+
+    Returns a Header, or None if there is no quad match to fall back on.
+    """
+    if not quad_seed:
+        return None
+    try:
+        # The quad match brought its own roll. The seed header's rotation is
+        # not trustworthy here -- a wrong CROTA2 is one of the reasons the
+        # refinement can fail in the first place -- so carry the quad's.
+        _rot = Header()
+        _rot["CROTA2"] = float(quad_seed.get("roll_deg", 0.0) or 0.0)
+        w = _make_seed_wcs(float(quad_seed["ra"]), float(quad_seed["dec"]),
+                           float(quad_seed["scale_arcsec"]), img_w, img_h,
+                           _rot, flip=(quad_seed.get("parity") == "flipped"))
+        hdr = _gaia_build_final_header(w, seed_header)
+        for _k in ("SOLVRMS", "SOLVP95", "SOLVNSTR"):
+            hdr.pop(_k, None)
+        hdr["SOLVSRC"] = ("quad-seed",
+                          "WCS from quad index match - NOT refined")
+        if quad_seed.get("log_odds") is not None:
+            hdr["BLNDODDS"] = (round(float(quad_seed["log_odds"]), 1),
+                               "Quad match log-odds vs background")
+        if quad_seed.get("layer") is not None:
+            hdr["BLNDLAYR"] = (quad_seed["layer"],
+                               "Quad index layer that matched")
+        hdr.add_history("SASpro: astrometric refinement failed its quality "
+                        "gate; this WCS is the quad index seed")
+        hdr.add_history("SASpro: seed-grade astrometry - approximate centre "
+                        "and scale, no distortion terms")
+        hdr.add_history(f"SASpro: gate failure was: {str(reason)[:60]}")
+        return hdr
+    except Exception as e:
+        print(f"[GaiaLocal] quad seed fallback failed: {e}")
+        return None
+
 
 def _gaia_build_final_header(wcs_solution: WCS, seed_header: "Header | None") -> Header:
     wcs_hdr  = _as_header(wcs_solution.to_header(relax=True))
@@ -2885,10 +3823,17 @@ def _gaia_fit_and_validate(
     use_astro: bool = False,
     astro_lib=None,
     status_cb=None,
+    img_stars_all=None,
 ) -> tuple[bool, "WCS | str"]:
     """
     Run steps 6-9 of the Gaia solve (TAN fit, iterative refinement,
     quality gate, SIP fit) on one matched-pair candidate set.
+
+    img_stars_all is EVERY star detected in the frame, not just the matched
+    ones. Two things need it: the per-iteration catalogue query is sized from
+    the detection count (the matched count would under-size it, since
+    refinement exists to grow the pair set), and the outer-field recovery pass
+    below re-matches the stars the affine never managed to pair.
     Returns (True, wcs_solution) on success, (False, error_str) on failure.
     """
     import astropy.units as u
@@ -2897,6 +3842,8 @@ def _gaia_fit_and_validate(
     from scipy.spatial import KDTree
 
     n_matched = len(img_matched)
+    _n_detected = (len(img_stars_all) if img_stars_all is not None
+                   else n_matched)
 
     # ── Map matched catalog pixel positions back to sky coords ───────────────
     try:
@@ -2908,10 +3855,7 @@ def _gaia_fit_and_validate(
 
     # ── Fit initial TAN WCS ────────────────────────────────────────────────
     try:
-        proj_point = SkyCoord(
-            ra=float(np.mean([c.ra.deg for c in matched_sky])) * u.deg,
-            dec=float(np.mean([c.dec.deg for c in matched_sky])) * u.deg,
-        )
+        proj_point = _sky_centroid(matched_sky)
         wcs_tan = fit_wcs_from_points(
             (img_matched[:, 0], img_matched[:, 1]),
             matched_sky,
@@ -2926,9 +3870,33 @@ def _gaia_fit_and_validate(
     # ── Iterative refinement via fitted-WCS reprojection ──────────────────────
     try:
         MAX_ITER     = 5
-        RMS_CONVERGE = 0.05
-        NN_TOL_PX    = 8.0
+        NN_TOL_PX    = 8.0        # ceiling, and the value used on iteration 0
+        NN_TOL_FLOOR = 2.5        # never prune tighter than this
+        NN_TOL_K     = 3.0        # multiples of the current RMS to accept
         MIN_PAIRS    = 10
+
+        # How much worse the RMS may get in exchange for MORE pairs. Growing
+        # the pair set is normally a good sign, but it is not self-evidently
+        # one: at 8 px of nearest-neighbour slack -- which on a wide field is
+        # a minute of arc -- a coarse seed pairs plenty of image stars with
+        # the WRONG catalogue star, and those pairs still count. 10% absorbs
+        # the honest case, where a larger sample simply reports a slightly
+        # truer RMS than a small one did, while refusing the case where the
+        # extra pairs are wrong.
+        PAIR_GAIN_RMS_SLACK = 1.10
+
+        # Convergence threshold is pixel-relative, like the matcher and gate:
+        # stop when the RMS improvement drops below a small fraction of a pixel.
+        # A flat 0.05" is 0.007px on a 7"/px rig (never fires) and 0.1px on a
+        # 0.5"/px rig (fires early) — neither is right.
+        try:
+            from astropy.wcs.utils import proj_plane_pixel_scales
+            _pxsc_conv  = proj_plane_pixel_scales(wcs_solution)
+            _scale_conv = float(np.mean(_pxsc_conv[:2])) * 3600.0
+        except Exception:
+            _scale_conv = None
+        RMS_CONVERGE_PX = 0.02
+        RMS_CONVERGE = (RMS_CONVERGE_PX * _scale_conv) if (_scale_conv and _scale_conv > 0) else 0.05
         prev_rms = None
         rms = None
 
@@ -2939,21 +3907,29 @@ def _gaia_fit_and_validate(
             print(f"[GaiaLocal] iter={iteration} RMS={rms:.3f}\"  n={n_matched}")
 
             if prev_rms is not None and (prev_rms - rms) < RMS_CONVERGE:
-                print(f"[GaiaLocal] converged (improvement {prev_rms-rms:.3f}\" < {RMS_CONVERGE}\")")
+                print(f"[GaiaLocal] converged (improvement {prev_rms-rms:.3f}\" < {RMS_CONVERGE:.3f}\")")
                 break
             prev_rms = rms
 
             try:
                 corners_pix = [(0,0),(img_w-1,0),(0,img_h-1),(img_w-1,img_h-1)]
                 corner_sky  = [wcs_solution.pixel_to_world(x, y) for x, y in corners_pix]
-                t_ra_min  = min(c.ra.deg  for c in corner_sky) - 0.05
-                t_ra_max  = max(c.ra.deg  for c in corner_sky) + 0.05
-                t_dec_min = min(c.dec.deg for c in corner_sky) - 0.05
-                t_dec_max = max(c.dec.deg for c in corner_sky) + 0.05
+                (t_ra_min, t_ra_max, t_dec_min,
+                 t_dec_max) = _field_sky_box(corner_sky, 0.05)
 
+                # Same limit as the search above, and for a sharper reason: the
+                # refinement runs this query once per iteration and builds a
+                # KD-tree over everything it returns. A faint star the image
+                # never detected cannot become a matched pair -- it can only
+                # sit in the tree and occasionally capture a detection as its
+                # nearest neighbour, which is a wrong pair, not a useful one.
+                _t_gmax = _catalog_mag_limit(t_ra_min, t_ra_max, t_dec_min,
+                                             t_dec_max, _n_detected)
                 t_seen = {}
                 if use_astro:
-                    for s in astro_lib.find_stars_in_box(t_ra_min, t_ra_max, t_dec_min, t_dec_max):
+                    for s in astro_lib.find_stars_in_box(
+                            t_ra_min, t_ra_max, t_dec_min, t_dec_max,
+                            max_mag=_t_gmax):
                         if s.source_id not in t_seen:
                             t_seen[s.source_id] = {"ra": s.ra, "dec": s.dec}
                 else:
@@ -2964,7 +3940,10 @@ def _gaia_fit_and_validate(
                             cur.execute("""
                                 SELECT source_id, ra, dec FROM sources
                                 WHERE dec BETWEEN ? AND ? AND ra BETWEEN ? AND ?
-                            """, (t_dec_min, t_dec_max, t_ra_min, t_ra_max))
+                                  AND phot_g_mean_mag IS NOT NULL
+                                  AND phot_g_mean_mag <= ?
+                            """, (t_dec_min, t_dec_max, t_ra_min, t_ra_max,
+                                  float(_t_gmax)))
                             t_sources.extend(cur.fetchall())
                         except Exception:
                             pass
@@ -2997,23 +3976,41 @@ def _gaia_fit_and_validate(
                     print(f"[GaiaLocal] iter={iteration}: only {len(t_cat_xy)} catalog stars in frame, stopping")
                     break
 
+                # Tolerance follows the fit instead of sitting at a constant.
+                # A fixed 8 px is downstream of an ADAPTIVE matcher tolerance
+                # (_triangle_match_catalog_to_image settles on 4x the median
+                # residual, which has been seen anywhere from 5.0 to 10.2 px),
+                # so the refinement prunes nothing at all whenever the matcher
+                # was stricter than 8 px, and prunes almost nothing when it was
+                # looser. Keyed to the current RMS it tightens as the solution
+                # improves, which is the only point at which a residual outlier
+                # is distinguishable from honest distortion.
+                #
+                # Iteration 0 is deliberately unchanged: the RMS is still the
+                # seed's, so the ceiling governs and behaviour matches today's.
+                _nn_tol = NN_TOL_PX
+                if _scale_conv and _scale_conv > 0 and rms and rms > 0:
+                    _nn_tol = float(np.clip(NN_TOL_K * rms / _scale_conv,
+                                            NN_TOL_FLOOR, NN_TOL_PX))
+
                 tree = KDTree(t_cat_xy)
                 dists, idxs = tree.query(img_matched, k=1, workers=-1)
-                inlier_mask = dists < NN_TOL_PX
+                inlier_mask = dists < _nn_tol
                 t_img_m     = img_matched[inlier_mask]
                 t_cat_sky_m = t_cat_sky_f[idxs[inlier_mask]]
 
-                print(f"[GaiaLocal] iter={iteration}: {inlier_mask.sum()} pairs within {NN_TOL_PX}px "
-                      f"from {len(t_cat_xy)} catalog stars")
+                print(f"[GaiaLocal] iter={iteration}: {inlier_mask.sum()} pairs within "
+                      f"{_nn_tol:.1f}px ({_nn_tol * (_scale_conv or 0):.1f}\") "
+                      f"from {len(t_cat_xy)} catalog stars"
+                      + ("" if _nn_tol >= NN_TOL_PX - 1e-9
+                         else f" [tightened from {NN_TOL_PX:.1f}px by the "
+                              f"{rms:.2f}\" fit]"))
 
                 if len(t_img_m) < MIN_PAIRS:
                     print(f"[GaiaLocal] iter={iteration}: too few pairs ({len(t_img_m)}), stopping")
                     break
 
-                t_proj = SkyCoord(
-                    ra=float(np.mean([c.ra.deg for c in t_cat_sky_m])) * u.deg,
-                    dec=float(np.mean([c.dec.deg for c in t_cat_sky_m])) * u.deg,
-                )
+                t_proj = _sky_centroid(t_cat_sky_m)
                 t_wcs_tan = fit_wcs_from_points(
                     (t_img_m[:,0], t_img_m[:,1]),
                     t_cat_sky_m,
@@ -3026,7 +4023,32 @@ def _gaia_fit_and_validate(
                 t_rms     = float(np.sqrt(np.mean(t_cat_sky_m.separation(t_sky_fit).arcsec**2)))
                 print(f"[GaiaLocal] iter={iteration}: new WCS RMS={t_rms:.3f}\" ({len(t_img_m)} pairs)")
 
-                if len(t_img_m) > n_matched or (len(t_img_m) >= n_matched and t_rms <= rms):
+                # A pair gain has to come with a fit that is not materially
+                # worse. Unconditional, this clause rewards COUNT rather than
+                # QUALITY, and the two part company exactly when the seed is
+                # coarse: a blind seed arrives as a linear TAN with no
+                # distortion terms and can sit an arc-minute off, so each
+                # iteration brings more image stars within the 8 px tolerance
+                # of SOME catalogue star -- not necessarily the right one.
+                # Every such increase was adopted, so the refinement ratcheted
+                # toward a larger, dirtier pair set. Measured on a 12.6 x 8.2
+                # degree frame: blind finished at 1136 pairs and 6.20" where
+                # the same field seeded from an existing solution finished at
+                # 791 pairs and 3.93". Same WCS to a few tenths of an arcsec;
+                # the whole difference was which pairs went into the fit.
+                _gained = (len(t_img_m) > n_matched
+                           and t_rms <= rms * PAIR_GAIN_RMS_SLACK + 1e-9)
+                _kept   = len(t_img_m) >= 0.8 * n_matched   # tolerate small pair loss
+                _better = t_rms <= rms + 1e-9
+                # The 0.8 retention rule is right when the fit is already good:
+                # do not shed a fifth of the pairs for a marginal gain. It is
+                # backwards when the fit is broken. A fit whose RMS halves was
+                # being dragged by pairs that do not belong in it, and keeping
+                # them to protect the count throws the solve away -- measured
+                # on a near-pole field that went 519" -> 24" and was refused
+                # for dropping 975 pairs to 507.
+                _rescue = (t_rms < 0.5 * rms) and len(t_img_m) >= 20
+                if _gained or (_better and _kept) or _rescue:
                     print(f"[GaiaLocal] iter={iteration}: adopting ({len(t_img_m)} pairs, RMS={t_rms:.3f}\")")
                     img_matched  = t_img_m
                     matched_sky  = t_cat_sky_m
@@ -3034,7 +4056,20 @@ def _gaia_fit_and_validate(
                     rms          = t_rms
                     wcs_solution = t_wcs_tan
                 else:
-                    print(f"[GaiaLocal] iter={iteration}: not better, stopping")
+                    # Say WHICH way it failed. "More pairs but a worse fit" and
+                    # "fewer pairs" are opposite problems, and lumping them
+                    # under "not better" hides the one that used to be
+                    # silently accepted.
+                    if len(t_img_m) > n_matched:
+                        print(f"[GaiaLocal] iter={iteration}: rejecting "
+                              f"{len(t_img_m)} pairs (up from {n_matched}) — "
+                              f"RMS would go {rms:.3f}\" -> {t_rms:.3f}\", "
+                              f"past the {PAIR_GAIN_RMS_SLACK:.2f}x gain "
+                              f"allowance; the extra pairs are mismatches")
+                    else:
+                        print(f"[GaiaLocal] iter={iteration}: not better "
+                              f"({len(t_img_m)} pairs, RMS={t_rms:.3f}\"), "
+                              f"stopping")
                     break
             except Exception as e:
                 print(f"[GaiaLocal] iter={iteration} refinement failed: {e}")
@@ -3045,53 +4080,364 @@ def _gaia_fit_and_validate(
         sep_arcsec = matched_sky.separation(sky_fit).arcsec
         rms        = float(np.sqrt(np.mean(sep_arcsec**2)))
         p95        = float(np.percentile(sep_arcsec, 95))
-        print(f"[GaiaLocal] final RMS={rms:.3f}\"  p95={p95:.3f}\"  n={n_matched}")
+        print(f"[GaiaLocal] TAN RMS={rms:.3f}\"  p95={p95:.3f}\"  n={n_matched}")
 
-        QUALITY_RMS_LIMIT = 3.0
-        QUALITY_MIN_PAIRS = 20
+        # ── Fit SIP BEFORE the quality gate ──────────────────────────────────
+        # A linear TAN projection cannot absorb wide-field lens distortion, so a
+        # distorted rig can sit above the gate on TAN yet well under it on SIP.
+        # Fit SIP here (own try/except -> fall back to TAN) and let the gate below
+        # judge whichever is better; otherwise a fixable distorted field is
+        # rejected before SIP ever runs.
+        if n_matched >= 20:
+            try:
+                _sip_proj = _sky_centroid(matched_sky)
+
+                def _sip_terms(_d):
+                    # (d+1)(d+2)/2 - 3 distortion coefficients per axis (the
+                    # constant and both linear terms are already in the CD
+                    # matrix), two axes, plus the 6 linear WCS parameters.
+                    return 2 * ((_d + 1) * (_d + 2) // 2 - 3) + 6
+
+                def _sip_feasible(_d):
+                    if not (2 <= _d <= SIP_MAX_DEGREE):
+                        return False
+                    # Degree 5 needs a genuinely well-populated frame: its 42
+                    # parameters are only worth solving for when the stars
+                    # cover the field densely enough to pin the edges down.
+                    if _d >= 5 and n_matched < SIP5_MIN_PAIRS:
+                        return False
+                    # 4x oversampling: 2 residuals per matched pair.
+                    return 2 * n_matched >= 4 * _sip_terms(_d)
+
+                _sip_cache = {}
+
+                def _fit_sip(_d):
+                    """Fit one SIP degree -> (wcs, rms, p95, penalised rms)."""
+                    if _d in _sip_cache:
+                        return _sip_cache[_d]
+                    _res = None
+                    try:
+                        _w = fit_wcs_from_points(
+                            (img_matched[:, 0], img_matched[:, 1]),
+                            matched_sky,
+                            projection='TAN',
+                            proj_point=_sip_proj,
+                            sip_degree=_d,
+                        )
+                        _w.array_shape = (img_h, img_w)
+                        _sep = matched_sky.separation(
+                            _w.pixel_to_world(img_matched[:, 0],
+                                              img_matched[:, 1])).arcsec
+                        _r = float(np.sqrt(np.mean(_sep ** 2)))
+                        _p95 = float(np.percentile(_sep, 95))
+                        # In-sample RMS almost always falls as coefficients are
+                        # added, so comparing degrees on raw RMS biases toward
+                        # the highest one. Penalise by the small-sample
+                        # correction sqrt(2N / (2N - k)): negligible when pairs
+                        # vastly outnumber coefficients, decisive when they do
+                        # not.
+                        _k = _sip_terms(_d)
+                        _adj = _r * math.sqrt((2.0 * n_matched)
+                                              / max(2 * n_matched - _k, 1))
+                        print(f"[GaiaLocal] SIP-{_d}: RMS={_r:.3f}\" "
+                              f"p95={_p95:.3f}\" ({_k} terms, "
+                              f"penalised {_adj:.3f}\")")
+                        _res = (_w, _r, _p95, _adj)
+                    except Exception as _e:
+                        print(f"[GaiaLocal] SIP-{_d} fit failed: {_e}")
+                    _sip_cache[_d] = _res
+                    return _res
+
+                # Start at the degree the matched-star count comfortably
+                # supports, then search OUTWARD in both directions. A higher
+                # degree is not merely redundant when it fails -- the extra
+                # freedom lets the polynomial diverge where stars are sparsest,
+                # usually the frame corners, so it can be far worse than a
+                # lower one. Climbing only upward would miss that; we want the
+                # best-fitting polynomial, not the highest-order one.
+                if n_matched >= 100:
+                    _base_degree = 4
+                elif n_matched >= 50:
+                    _base_degree = 3
+                else:
+                    _base_degree = 2
+                while _base_degree > 2 and not _sip_feasible(_base_degree):
+                    _base_degree -= 1
+
+                _best = _fit_sip(_base_degree)       # (wcs, rms, p95, adj)
+                _best_deg = _base_degree if _best is not None else None
+
+                # Both walks are anchored at the BASE degree and chained from
+                # their own last accepted step, never from the running winner.
+                # Anchoring the downward walk on the winner would make it start
+                # one step below whatever the upward walk reached, re-test that
+                # degree and stop -- leaving a far better low degree unfitted.
+                for _step in (+1, -1):
+                    _ref = _sip_cache.get(_base_degree)
+                    _d = _base_degree + _step
+                    while _sip_feasible(_d):
+                        _got = _fit_sip(_d)
+                        if _got is None:
+                            break
+                        if _ref is None:
+                            pass                     # base fit failed; take it
+                        elif _step > 0:
+                            # Going up has to EARN its extra terms, and must not
+                            # blow out the residual tail -- divergence at the
+                            # edges shows up in p95 long before it moves the
+                            # mean.
+                            if not (_got[3] < _ref[3] * SIP_STEP_UP_GAIN
+                                    and _got[2] <= _ref[2] * 1.25):
+                                break
+                        else:
+                            # Going down is already favoured by the penalty, so
+                            # any strict improvement is enough.
+                            if not _got[3] < _ref[3]:
+                                break
+                        _ref = _got
+                        if _best is None or _got[3] < _best[3]:
+                            _best, _best_deg = _got, _d
+                        _d += _step
+
+                if _best is not None:
+                    # Judge SIP against TAN the same way the degrees were
+                    # judged against each other: penalised for parameter count,
+                    # and having to clear the same margin. Otherwise an
+                    # undistorted field adopts a distortion polynomial for a
+                    # fraction of a percent of RMS, which is just fitting the
+                    # centroid noise.
+                    _tan_adj = rms * math.sqrt((2.0 * n_matched)
+                                               / max(2 * n_matched - 6, 1))
+                    print(f"[GaiaLocal] TAN RMS={rms:.3f}\" "
+                          f"(penalised {_tan_adj:.3f}\")  "
+                          f"best SIP-{_best_deg} RMS={_best[1]:.3f}\" "
+                          f"(penalised {_best[3]:.3f}\")")
+                    if _best[3] < _tan_adj * SIP_STEP_UP_GAIN:
+                        wcs_solution = _best[0]
+                        print(f"[GaiaLocal] using SIP-{_best_deg} solution")
+                    else:
+                        print("[GaiaLocal] no SIP degree earned its terms "
+                              "- keeping the linear solution")
+            except Exception as e:
+                print(f"[GaiaLocal] SIP fit failed, using TAN: {e}")
+
+        # ── Recover the outer field against the chosen solution ──────────────
+        # The affine the matcher recovers is fitted on a few dozen
+        # correspondences, so it describes the middle of the frame and
+        # extrapolates badly beyond them -- measured at p90 = 701 px on a
+        # 12.6 x 8.2 degree frame. The matcher's tolerance is then set from the
+        # residual MEDIAN, which that core dominates, so every star out where
+        # the affine has drifted fails the gate and is never paired at all.
+        #
+        # The consequence is not a worse RMS, it is a DISHONEST one. Two solves
+        # of the same image: one paired stars out to 1.18R and reported 6.18",
+        # the other stopped at 0.87R and reported 3.09". The second number is
+        # better only because it describes the inner 78% of the frame and
+        # extrapolates a 30-term polynomial across the rest -- which is exactly
+        # where the two disagreed, by 29" at one corner.
+        #
+        # Once a SIP solution exists that stops being a problem, because the
+        # model is now good everywhere to within a few pixels, and a few pixels
+        # is far less than the ~49 px that separates neighbouring catalogue
+        # stars. So the nearest catalogue star is the RIGHT star even out where
+        # the fit is still extrapolating, and the pairs can simply be found and
+        # the model refitted with the whole frame constrained.
+        #
+        # Note the direction: this ADDS the edge pairs that were missed. A
+        # previous attempt did the reverse -- clipping the worst residuals,
+        # which are at the edge by construction -- and made every measure worse
+        # for exactly that reason.
+        try:
+            RECOVER_K      = 3.0     # tolerance in multiples of the current RMS
+            RECOVER_MIN_PX = 5.0     # but never tighter than the extrapolation
+            RECOVER_MAX_PX = 15.0    # and never near the catalogue spacing
+            RECOVER_SPACING_FRAC = 0.40   # nor past this much of it
+
+            _cx0, _cy0 = (img_w - 1) / 2.0, (img_h - 1) / 2.0
+            _cov_before = float(np.hypot(img_matched[:, 0] - _cx0,
+                                         img_matched[:, 1] - _cy0).max())
+
+            if img_stars_all is None or len(img_stars_all) <= n_matched:
+                print("[GaiaLocal] recover: no unpaired detections to try")
+            else:
+                _sep_now = matched_sky.separation(
+                    wcs_solution.pixel_to_world(img_matched[:, 0],
+                                                img_matched[:, 1])).arcsec
+                _rms_now = float(np.sqrt(np.mean(_sep_now ** 2)))
+                _px = _scale_conv or 1.0
+                _rtol = float(np.clip(RECOVER_K * _rms_now / _px,
+                                      RECOVER_MIN_PX, RECOVER_MAX_PX))
+
+                # Fresh catalogue box from the CURRENT solution, magnitude
+                # limited the same way every other query is.
+                _rc = [wcs_solution.pixel_to_world(x, y) for x, y in
+                       ((0, 0), (img_w - 1, 0), (0, img_h - 1),
+                        (img_w - 1, img_h - 1))]
+                _rra0, _rra1, _rd0, _rd1 = _field_sky_box(_rc, 0.05)
+                _rg = _catalog_mag_limit(_rra0, _rra1, _rd0, _rd1, _n_detected)
+                _seen = {}
+                if use_astro:
+                    for _st in astro_lib.find_stars_in_box(
+                            _rra0, _rra1, _rd0, _rd1, max_mag=_rg):
+                        if _st.source_id not in _seen:
+                            _seen[_st.source_id] = (_st.ra, _st.dec)
+                else:
+                    for _fn, _cn in lib._connections.items():
+                        try:
+                            for _sid, _sra, _sdec in _cn.execute(
+                                    "SELECT source_id, ra, dec FROM sources "
+                                    "WHERE dec BETWEEN ? AND ? "
+                                    "  AND ra BETWEEN ? AND ? "
+                                    "  AND phot_g_mean_mag IS NOT NULL "
+                                    "  AND phot_g_mean_mag <= ?",
+                                    (_rd0, _rd1, _rra0, _rra1, float(_rg))):
+                                if _sid not in _seen:
+                                    _seen[_sid] = (_sra, _sdec)
+                        except Exception:
+                            pass
+
+                if len(_seen) < MIN_PAIRS:
+                    print(f"[GaiaLocal] recover: catalogue returned only "
+                          f"{len(_seen)} stars, skipping")
+                else:
+                    _rv = list(_seen.values())
+                    _rsky = SkyCoord(ra=[v[0] for v in _rv] * u.deg,
+                                     dec=[v[1] for v in _rv] * u.deg)
+                    _rpx, _rpy = wcs_solution.world_to_pixel(_rsky)
+                    _rxy = np.column_stack([_rpx, _rpy])
+                    _rin = ((_rxy[:, 0] > -50) & (_rxy[:, 0] < img_w + 50) &
+                            (_rxy[:, 1] > -50) & (_rxy[:, 1] < img_h + 50))
+                    _rxy, _rsky = _rxy[_rin], _rsky[_rin]
+
+                    # Hard ceiling from the catalogue's own density: a
+                    # tolerance approaching half the mean separation can reach
+                    # the WRONG star, which is the one way this pass could do
+                    # real harm. At ~10k stars over this frame the spacing is
+                    # about 49 px, so the 15 px cap already binds -- but on a
+                    # sparse field it would not, and the guard has to come from
+                    # the data rather than a constant.
+                    _spacing = math.sqrt(img_w * img_h / max(len(_rxy), 1))
+                    _rtol = min(_rtol, RECOVER_SPACING_FRAC * _spacing)
+                    print(f"[GaiaLocal] recover: catalogue spacing "
+                          f"~{_spacing:.0f}px, matching within {_rtol:.1f}px")
+
+                    _all_img = np.asarray(img_stars_all, np.float64)[:, :2]
+                    _rtree = KDTree(_rxy)
+                    _rd, _ri = _rtree.query(_all_img, k=1, workers=-1)
+                    _rkeep = _rd < _rtol
+                    _n_rec = int(_rkeep.sum())
+
+                    if _n_rec <= n_matched:
+                        print(f"[GaiaLocal] recover: {_n_rec} pairs within "
+                              f"{_rtol:.1f}px is no more than the {n_matched} "
+                              f"already held, keeping them")
+                    else:
+                        _r_img = _all_img[_rkeep]
+                        _r_sky = _rsky[_ri[_rkeep]]
+                        _kw = dict(projection='TAN',
+                                   proj_point=_sky_centroid(_r_sky))
+                        _rdeg = None
+                        try:
+                            if getattr(wcs_solution, "sip", None) is not None:
+                                _rdeg = int(wcs_solution.sip.a_order)
+                        except Exception:
+                            _rdeg = None
+                        if _rdeg:
+                            _kw["sip_degree"] = _rdeg
+                        _r_wcs = fit_wcs_from_points(
+                            (_r_img[:, 0], _r_img[:, 1]), _r_sky, **_kw)
+                        _r_wcs.array_shape = (img_h, img_w)
+                        _r_sep = _r_sky.separation(
+                            _r_wcs.pixel_to_world(_r_img[:, 0],
+                                                  _r_img[:, 1])).arcsec
+                        _r_rms = float(np.sqrt(np.mean(_r_sep ** 2)))
+                        _cov_after = float(np.hypot(_r_img[:, 0] - _cx0,
+                                                    _r_img[:, 1] - _cy0).max())
+                        _corner = float(np.hypot(_cx0, _cy0))
+
+                        print(f"[GaiaLocal] recover: {n_matched} -> {_n_rec} pairs "
+                              f"within {_rtol:.1f}px of the "
+                              + (f"SIP-{_rdeg}" if _rdeg else "TAN")
+                              + f" solution; reach "
+                                f"{_cov_before / _corner * 100:.0f}% -> "
+                                f"{_cov_after / _corner * 100:.0f}% of the way "
+                                f"to the corner")
+                        # The RMS is EXPECTED to rise -- the edge of a
+                        # distorted field is genuinely harder than its middle,
+                        # and that rise is the honest number replacing a
+                        # flattering one. So a "RMS got worse" test would
+                        # refuse exactly the case this exists for; on a
+                        # synthetic field the true corner error halved while
+                        # RMS went 3.06" -> 23.39".
+                        #
+                        # What would really be wrong is MIS-pairing, and that
+                        # has a different signature: pairs land on neighbouring
+                        # stars, so residuals approach half the catalogue
+                        # spacing rather than staying inside the tolerance they
+                        # were matched within. A refit whose RMS exceeds its own
+                        # matching tolerance is incoherent; one inside it is
+                        # merely describing a harder region.
+                        if _r_rms / _px > _rtol:
+                            print(f"[GaiaLocal] recover: rejected — refit RMS "
+                                  f"{_r_rms / _px:.1f}px exceeds the {_rtol:.1f}px "
+                                  f"it matched within, so these are mismatches "
+                                  f"rather than missing stars")
+                        else:
+                            img_matched = _r_img
+                            matched_sky = _r_sky
+                            n_matched = _n_rec
+                            wcs_solution = _r_wcs
+                            print(f"[GaiaLocal] recover: adopted — RMS "
+                                  f"{_rms_now:.3f}\" -> {_r_rms:.3f}\" now "
+                                  f"describes the WHOLE frame"
+                                  + (" (higher, and honest)"
+                                     if _r_rms > _rms_now else ""))
+        except Exception as e:
+            print(f"[GaiaLocal] recover skipped: {e}")
+
+        # Final residuals of the CHOSEN (SIP or TAN) solution — the gate uses these.
+        sky_fit    = wcs_solution.pixel_to_world(img_matched[:, 0], img_matched[:, 1])
+        sep_arcsec = matched_sky.separation(sky_fit).arcsec
+        rms        = float(np.sqrt(np.mean(sep_arcsec**2)))
+        p95        = float(np.percentile(sep_arcsec, 95))
+        print(f"[GaiaLocal] final RMS={rms:.3f}\"  p95={p95:.3f}\"  n={n_matched}")
+        _solve_fingerprint(wcs_solution, img_matched, sep_arcsec,
+                           img_w, img_h)
+
+        # ── Quality gate — PIXEL-RELATIVE, not raw arcsec ─────────────────────
+        # The matcher and NN refinement are already in pixels; the gate must be
+        # too, or a wide-field rig gets failed for a sub-pixel solve (e.g. a
+        # 7"/px image where 3.0" is 0.4px). Derive the solved plate scale and
+        # express the RMS limit in pixels, with an arcsec floor so fine-scale
+        # rigs keep their old strictness (no regression at/above ~1.5"/px).
+        try:
+            from astropy.wcs.utils import proj_plane_pixel_scales
+            _pxsc = proj_plane_pixel_scales(wcs_solution)
+            scale_arcsec = float(np.mean(_pxsc[:2])) * 3600.0
+        except Exception:
+            scale_arcsec = None
+
+        RMS_GATE_PX           = 2.0    # pixel-relative tolerance
+        RMS_GATE_FLOOR_ARCSEC = 3.0    # don't loosen below this on fine scales
+        QUALITY_MIN_PAIRS     = 20
+
+        if scale_arcsec and scale_arcsec > 0:
+            QUALITY_RMS_LIMIT = max(RMS_GATE_FLOOR_ARCSEC, RMS_GATE_PX * scale_arcsec)
+            rms_px_str = f", {rms / scale_arcsec:.2f}px @ {scale_arcsec:.2f}\"/px"
+        else:
+            QUALITY_RMS_LIMIT = RMS_GATE_FLOOR_ARCSEC
+            rms_px_str = ""
+
         if rms > QUALITY_RMS_LIMIT or n_matched < QUALITY_MIN_PAIRS:
             return False, (
-                f"match quality too low (RMS={rms:.2f}\", n={n_matched}; "
-                f"need RMS<={QUALITY_RMS_LIMIT}\" and n>={QUALITY_MIN_PAIRS})"
+                f"match quality too low (RMS={rms:.2f}\"{rms_px_str}, n={n_matched}; "
+                f"need RMS<={QUALITY_RMS_LIMIT:.2f}\" and n>={QUALITY_MIN_PAIRS})"
             )
     except Exception as e:
         return False, f"Gaia DR3 solver: refinement exception: {e}"
 
     # ── SIP fit ────────────────────────────────────────────────────────────
-    if n_matched >= 20:
-        try:
-            if n_matched >= 100:
-                sip_degree = 4
-            elif n_matched >= 50:
-                sip_degree = 3
-            else:
-                sip_degree = 2
-
-            proj_point = SkyCoord(
-                ra=float(np.mean([c.ra.deg for c in matched_sky])) * u.deg,
-                dec=float(np.mean([c.dec.deg for c in matched_sky])) * u.deg,
-            )
-            wcs_sip = fit_wcs_from_points(
-                (img_matched[:, 0], img_matched[:, 1]),
-                matched_sky,
-                projection='TAN',
-                proj_point=proj_point,
-                sip_degree=sip_degree,
-            )
-            wcs_sip.array_shape = (img_h, img_w)
-
-            sky_sip  = wcs_sip.pixel_to_world(img_matched[:, 0], img_matched[:, 1])
-            res_sip  = matched_sky.separation(sky_sip).arcsec
-            sky_tan2 = wcs_solution.pixel_to_world(img_matched[:, 0], img_matched[:, 1])
-            res_tan2 = matched_sky.separation(sky_tan2).arcsec
-            rms_sip  = float(np.sqrt(np.mean(res_sip**2)))
-            rms_tan2 = float(np.sqrt(np.mean(res_tan2**2)))
-            print(f"[GaiaLocal] TAN RMS={rms_tan2:.3f}\"  SIP-{sip_degree} RMS={rms_sip:.3f}\"")
-            if rms_sip < rms_tan2:
-                wcs_solution = wcs_sip
-                print(f"[GaiaLocal] using SIP-{sip_degree} solution")
-        except Exception as e:
-            print(f"[GaiaLocal] SIP fit failed, using TAN: {e}")
+    # SIP fit now runs BEFORE the quality gate (see above); nothing to do here.
 
     # Recompute final residuals against whichever solution (TAN or SIP) won,
     # and stash on the WCS object for _gaia_build_final_header to pick up.
@@ -3319,6 +4665,20 @@ def _solve_numpy_with_astap(parent, settings, image: np.ndarray, seed_header: He
 
 # --- Debug helpers ---------------------------------------------------
 DEBUG_PLATESOLVE_HEADERS = False  # set False to silence all header dumps
+
+# SIP distortion fitting. Degree 5 carries 36 distortion coefficients, so it
+# wants a few hundred matched stars before it is better determined than
+# degree 4; below that the penalty below would reject it anyway, and fitting
+# it is just wasted seconds.
+# Highest SIP order offered. Degree 5 adds the odd-order terms a
+# radial lens profile actually needs; a sixth order mostly
+# re-describes what 4 already captured, at 14 more parameters.
+SIP_MAX_DEGREE = 5
+SIP5_MIN_PAIRS = 300
+# A higher degree must cut the penalised RMS by at least this factor to be
+# adopted. 0.97 = a real 3% gain, not the fraction of a percent that extra
+# free parameters always buy on the very points they were fitted to.
+SIP_STEP_UP_GAIN = 0.97
 
 
 def _debug_dump_header(label: str, hdr: Header | None):
@@ -3959,6 +5319,20 @@ def show_solve_summary(parent, hdr: Header, img_w: int, img_h: int,
             lines.append(f"<b>Fit RMS vs Gaia:</b>  {float(rms):.2f}\"{px_txt}{n_txt}")
     except Exception:
         pass
+    # A seed-grade solution carries no RMS, so without this it would look
+    # exactly like a normal solve in the panel. Say plainly what it is.
+    try:
+        if str(hdr.get("SOLVSRC", "")).strip().lower() == "quad-seed":
+            lines.append(
+                "<b>Fit quality:</b>  <span style=\'color:#c87f00\'>seed-grade"
+                " — quad index placement only</span><br>"
+                "<span style=\'color:#c87f00\'>The field is identified, but "
+                "refinement did not reach the accuracy gate: centre and scale "
+                "are approximate (expect a few pixels) and there are no "
+                "distortion terms. Not suitable for photometry or "
+                "mosaicking.</span>")
+    except Exception:
+        pass
     if not lines:
         return
 
@@ -3980,6 +5354,107 @@ def show_solve_summary(parent, hdr: Header, img_w: int, img_h: int,
 # ---------------------------------------------------------------------
 # Dialog UI with Active/File and Batch modes
 # ---------------------------------------------------------------------
+
+class PlateSolverPresetDialog(QDialog):
+    """Compact preset editor used by shortcuts / Function Bundles."""
+
+    def __init__(self, parent=None, initial: dict | None = None):
+        super().__init__(parent)
+        self.setWindowTitle(self.tr("Plate Solver — Preset"))
+        spec = normalize_plate_solve_preset(initial)
+        form = QFormLayout(self)
+
+        self.cb_seed_mode = QComboBox(self)
+        self.cb_seed_mode.addItem(self.tr("Auto (from header)"), "auto")
+        self.cb_seed_mode.addItem(self.tr("Manual"), "manual")
+        self.cb_seed_mode.addItem(self.tr("None (blind)"), "none")
+        self.cb_seed_mode.setCurrentIndex(max(0, self.cb_seed_mode.findData(spec["seed_mode"])))
+        form.addRow(self.tr("Seed mode:"), self.cb_seed_mode)
+
+        self.le_ra = QLineEdit(spec["ra"]); self.le_ra.setPlaceholderText(self.tr("RA"))
+        self.le_dec = QLineEdit(spec["dec"]); self.le_dec.setPlaceholderText(self.tr("Dec"))
+        self.le_scale = QLineEdit("" if spec["scale"] is None else str(spec["scale"]))
+        self.le_scale.setPlaceholderText(self.tr('Scale ["/px]'))
+        seed_row = QHBoxLayout()
+        seed_row.addWidget(self.le_ra, 1)
+        seed_row.addWidget(self.le_dec, 1)
+        seed_row.addWidget(self.le_scale, 1)
+        seed_w = QWidget(self); seed_w.setLayout(seed_row)
+        form.addRow(self.tr("Manual RA/Dec/Scale:"), seed_w)
+
+        self.cb_radius_mode = QComboBox(self)
+        self.cb_radius_mode.addItem(self.tr("Auto"), "auto")
+        self.cb_radius_mode.addItem(self.tr("Value (deg)"), "value")
+        self.cb_radius_mode.setCurrentIndex(max(0, self.cb_radius_mode.findData(spec["radius_mode"])))
+        self.le_radius_val = QLineEdit(str(spec["radius_value"]))
+        rad_row = QHBoxLayout(); rad_row.addWidget(self.cb_radius_mode); rad_row.addWidget(self.le_radius_val)
+        rad_w = QWidget(self); rad_w.setLayout(rad_row)
+        form.addRow(self.tr("Search radius:"), rad_w)
+
+        self.cb_fov_mode = QComboBox(self)
+        self.cb_fov_mode.addItem(self.tr("Compute from scale"), "compute")
+        self.cb_fov_mode.addItem(self.tr("Auto"), "auto")
+        self.cb_fov_mode.addItem(self.tr("Value (deg)"), "value")
+        self.cb_fov_mode.setCurrentIndex(max(0, self.cb_fov_mode.findData(spec["fov_mode"])))
+        self.le_fov_val = QLineEdit(str(spec["fov_value"]))
+        fov_row = QHBoxLayout(); fov_row.addWidget(self.cb_fov_mode); fov_row.addWidget(self.le_fov_val)
+        fov_w = QWidget(self); fov_w.setLayout(fov_row)
+        form.addRow(self.tr("FOV:"), fov_w)
+
+        self.cb_solver_pref = QComboBox(self)
+        self.cb_solver_pref.addItem(self.tr("Gaia DR3 → ASTAP → Astrometry.net (all)"), "both")
+        self.cb_solver_pref.addItem(self.tr("In-House Gaia DR3 only"), "gaia_only")
+        self.cb_solver_pref.addItem(self.tr("ASTAP only"), "astap_only")
+        self.cb_solver_pref.addItem(self.tr("Astrometry.net only"), "astrometry_only")
+        self.cb_solver_pref.setCurrentIndex(max(0, self.cb_solver_pref.findData(spec["solver"])))
+        form.addRow(self.tr("Solver:"), self.cb_solver_pref)
+
+        self.chk_blind = QCheckBox(self.tr("Blind-solve when there is no RA/Dec"), self)
+        self.chk_blind.setChecked(spec["blind"])
+        form.addRow("", self.chk_blind)
+        self.chk_force_blind = QCheckBox(
+            self.tr("Force blind solve (ignore any RA/Dec seed)"), self)
+        self.chk_force_blind.setChecked(spec["force_blind"])
+        self.chk_force_blind.toggled.connect(
+            lambda on: self.chk_blind.setEnabled(not on))
+        self.chk_blind.setEnabled(not spec["force_blind"])
+        form.addRow("", self.chk_force_blind)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def result_dict(self) -> dict:
+        try:
+            radius_value = float(self.le_radius_val.text().strip())
+        except Exception:
+            radius_value = 5.0
+        try:
+            fov_value = float(self.le_fov_val.text().strip())
+        except Exception:
+            fov_value = 0.0
+        try:
+            scale = float(self.le_scale.text().strip()) if self.le_scale.text().strip() else None
+        except Exception:
+            scale = None
+        return normalize_plate_solve_preset({
+            "seed_mode": self.cb_seed_mode.currentData(),
+            "ra": self.le_ra.text().strip(),
+            "dec": self.le_dec.text().strip(),
+            "scale": scale,
+            "radius_mode": self.cb_radius_mode.currentData(),
+            "radius_value": radius_value,
+            "fov_mode": self.cb_fov_mode.currentData(),
+            "fov_value": fov_value,
+            "solver": self.cb_solver_pref.currentData(),
+            "blind": self.chk_blind.isChecked(),
+            "force_blind": self.chk_force_blind.isChecked(),
+        })
+
 
 class PlateSolverDialog(QDialog):
     """
@@ -4079,6 +5554,46 @@ class PlateSolverDialog(QDialog):
         self.cb_solver_pref.addItem(self.tr("Astrometry.net only"),                      "astrometry_only") 
         seed_form.addRow(self.tr("Solver:"), self.cb_solver_pref)
 
+        self.chk_blind = QCheckBox(
+            self.tr("Blind-solve from the local quad index when there is no RA/Dec"),
+            seed_box)
+        self.chk_blind.setToolTip(self.tr(
+            "Identify the field from the star pattern alone — no coordinates and no\n"
+            "field of view needed. Build the index on the Gaia DR3 Library dialog,\n"
+            "Blind Solve Index tab; it is built from the Gaia data you already have.\n\n"
+            "Turn this off to fall back to ASTAP's blind solve instead."))
+        seed_form.addRow("", self.chk_blind)
+
+        self.chk_force_blind = QCheckBox(
+            self.tr("Force blind solve (ignore any RA/Dec seed)"), seed_box)
+        self.chk_force_blind.setToolTip(self.tr(
+            "Throw the header pointing away and locate the field from the star\n"
+            "pattern, even when the header does contain an RA/Dec.\n\n"
+            "Overrides the seed mode above, including manual coordinates.\n\n"
+            "Use this when the coordinates are WRONG rather than missing \u2014 a\n"
+            "wrong seed is worse than none, because the solver searches around\n"
+            "a position the field is not in, and ASTAP then fails on the same\n"
+            "bad position afterwards.\n\n"
+            "The pixel scale from the header is still used; it comes from focal\n"
+            "length and pixel size and stays right even when the mount lied."))
+        self.chk_force_blind.toggled.connect(
+            lambda on: self.chk_blind.setEnabled(not on))
+        seed_form.addRow("", self.chk_force_blind)
+
+        # What the blind solver has to work with, and a way to go change it.
+        quad_row = QHBoxLayout()
+        self.lbl_quad_status = QLabel("", seed_box)
+        self.lbl_quad_status.setWordWrap(True)
+        self.lbl_quad_status.setTextFormat(Qt.TextFormat.RichText)
+        self.btn_gaia_db = QPushButton(self.tr("Open Gaia Database\u2026"), seed_box)
+        self.btn_gaia_db.setToolTip(self.tr(
+            "Open the Gaia DR3 Library: download catalogue bands, and build the\n"
+            "blind-solve quad index from the data you already have."))
+        self.btn_gaia_db.clicked.connect(self._open_gaia_database)
+        quad_row.addWidget(self.lbl_quad_status, 1)
+        quad_row.addWidget(self.btn_gaia_db, 0, Qt.AlignmentFlag.AlignTop)
+        seed_form.addRow("", quad_row)
+
         # Tooltips
         self.cb_seed_mode.setToolTip(self.tr("Use FITS header, your manual RA/Dec/scale, or blind solve."))
         self.le_scale.setToolTip(self.tr('Pixel scale in arcseconds/pixel (e.g., 1.46).'))
@@ -4122,15 +5637,43 @@ class PlateSolverDialog(QDialog):
         # ---------------- Status + buttons ----------------
         self.status = QLabel("", self)
         self.status.setMinimumHeight(20)
+        self.status.setWordWrap(True)
         main.addWidget(self.status)
 
         btn_row = QHBoxLayout()
+        self.btn_apply_vbundle = QPushButton(self.tr("Apply to View Bundle…"), self)
+        self.btn_apply_vbundle.setToolTip(
+            self.tr("Plate-solve every open view (and on-disk files) in a View Bundle.")
+        )
+        btn_row.addWidget(self.btn_apply_vbundle)
         btn_row.addStretch(1)
+        btn_row.addWidget(make_help_button("plate_solver", self))
         self.btn_go = QPushButton(self.tr("Start"), self)
         self.btn_close = QPushButton(self.tr("Close"), self)
         btn_row.addWidget(self.btn_go)
         btn_row.addWidget(self.btn_close)
         main.addLayout(btn_row)
+
+        from setiastro.saspro.shortcuts import PresetDragHandle
+        try:
+            from setiastro.saspro.resources import platesolve_path as _ps_icon
+        except Exception:
+            _ps_icon = None
+        drag_row = QHBoxLayout()
+        self.preset_drag_handle = PresetDragHandle(
+            "plate_solve",
+            self.current_preset,
+            icon=QIcon(_ps_icon) if _ps_icon else QIcon(),
+            tooltip=self.tr(
+                "Drag to the canvas to create a Plate Solver shortcut\n"
+                "with these settings. Drop on an image or a View Bundle chip\n"
+                "to solve headlessly."
+            ),
+            parent=self,
+        )
+        drag_row.addWidget(self.preset_drag_handle)
+        drag_row.addStretch(1)
+        main.addLayout(drag_row)
 
         # ---------------- Connections ----------------
         self.mode_combo.currentIndexChanged.connect(self.stack.setCurrentIndex)
@@ -4139,6 +5682,7 @@ class PlateSolverDialog(QDialog):
         b_out.clicked.connect(self._browse_out)
         self.btn_go.clicked.connect(self._run)
         self.btn_close.clicked.connect(self.close)
+        self.btn_apply_vbundle.clicked.connect(self._apply_to_view_bundle)
 
         # ---------------- Load settings & init UI ----------------
         mode_map = {"auto": 0, "manual": 1, "none": 2}
@@ -4158,6 +5702,10 @@ class PlateSolverDialog(QDialog):
         self.cb_solver_pref.setCurrentIndex(
             pref_map.get(_get_solver_preference(self.settings), 0)
         )
+        self.chk_blind.setChecked(_get_blind_enabled(self.settings))
+        self.chk_force_blind.setChecked(_get_force_blind(self.settings))
+        self.chk_blind.setEnabled(not self.chk_force_blind.isChecked())
+        self._refresh_quad_status()
 
         def _update_visibility():
             manual = (self.cb_seed_mode.currentIndex() == 1)
@@ -4178,6 +5726,96 @@ class PlateSolverDialog(QDialog):
         self.status.setObjectName("status_label")
         # if batch page exists:
         self.log.setObjectName("batch_log")
+
+    def _refresh_quad_status(self):
+        """Re-read the quad library and repaint the status line."""
+        try:
+            self.lbl_quad_status.setText(_quad_index_status_html())
+        except Exception as e:
+            print(f"[PlateSolver] quad status refresh failed: {e}")
+
+    def _open_gaia_database(self):
+        from setiastro.saspro.gaia_database import GaiaDatabaseDialog
+        if getattr(self, "_gaia_db_window", None) and self._gaia_db_window.isVisible():
+            self._gaia_db_window.raise_()
+            self._gaia_db_window.activateWindow()
+            return
+        self._gaia_db_window = GaiaDatabaseDialog(parent=self)
+        try:
+            from setiastro.saspro.resources import gaia_path
+            self._gaia_db_window.setWindowIcon(QIcon(gaia_path))
+        except Exception:
+            pass
+
+        def _gone(*_):
+            # Layers are usually built from inside that dialog, so the count
+            # on this one is stale the moment it closes. Clear the handle and
+            # repaint together.
+            self._gaia_db_window = None
+            self._refresh_quad_status()
+
+        for _sig in ("destroyed", "finished"):
+            try:
+                getattr(self._gaia_db_window, _sig).connect(_gone)
+            except Exception:
+                pass
+        self._gaia_db_window.show()
+
+    def current_preset(self) -> dict:
+        idx = self.cb_seed_mode.currentIndex()
+        seed = "auto" if idx == 0 else ("manual" if idx == 1 else "none")
+        try:
+            scale = float(self.le_scale.text().strip()) if self.le_scale.text().strip() else None
+        except Exception:
+            scale = None
+        try:
+            radius_value = float(self.le_radius_val.text().strip()) if self.le_radius_val.text().strip() else 5.0
+        except Exception:
+            radius_value = 5.0
+        try:
+            fov_value = float(self.le_fov_val.text().strip()) if self.le_fov_val.text().strip() else 0.0
+        except Exception:
+            fov_value = 0.0
+        pref_idx_map = {0: "both", 1: "gaia_only", 2: "astap_only", 3: "astrometry_only"}
+        return normalize_plate_solve_preset({
+            "seed_mode": seed,
+            "ra": self.le_ra.text().strip(),
+            "dec": self.le_dec.text().strip(),
+            "scale": scale,
+            "radius_mode": "auto" if self.cb_radius_mode.currentIndex() == 0 else "value",
+            "radius_value": radius_value,
+            "fov_mode": (
+                "compute" if self.cb_fov_mode.currentIndex() == 0
+                else ("auto" if self.cb_fov_mode.currentIndex() == 1 else "value")
+            ),
+            "fov_value": fov_value,
+            "solver": pref_idx_map.get(self.cb_solver_pref.currentIndex(), "both"),
+            "blind": self.chk_blind.isChecked(),
+            "force_blind": self.chk_force_blind.isChecked(),
+        })
+
+    def seed_from_preset(self, preset: dict | None):
+        spec = normalize_plate_solve_preset(preset)
+        mode_map = {"auto": 0, "manual": 1, "none": 2}
+        self.cb_seed_mode.setCurrentIndex(mode_map.get(spec["seed_mode"], 0))
+        self.le_ra.setText(spec["ra"])
+        self.le_dec.setText(spec["dec"])
+        self.le_scale.setText("" if spec["scale"] is None else str(spec["scale"]))
+        self.cb_radius_mode.setCurrentIndex(0 if spec["radius_mode"] == "auto" else 1)
+        self.le_radius_val.setText(str(spec["radius_value"]))
+        fov_map = {"compute": 0, "auto": 1, "value": 2}
+        self.cb_fov_mode.setCurrentIndex(fov_map.get(spec["fov_mode"], 0))
+        self.le_fov_val.setText(str(spec["fov_value"]))
+        pref_map = {"both": 0, "gaia_only": 1, "astap_only": 2, "astrometry_only": 3}
+        self.cb_solver_pref.setCurrentIndex(pref_map.get(spec["solver"], 0))
+        self.chk_blind.setChecked(spec["blind"])
+        self.chk_force_blind.setChecked(spec["force_blind"])
+        self.chk_blind.setEnabled(not spec["force_blind"])
+
+    def _persist_ui_to_settings(self) -> dict:
+        spec = self.current_preset()
+        apply_plate_solve_preset(self.settings, spec)
+        return spec
 
     def _lookup_catalog_object(self):
         """
@@ -4395,34 +6033,27 @@ class PlateSolverDialog(QDialog):
         if not self.btn_go.isEnabled():
             return
         self.btn_go.setEnabled(False)
+        # The Gaia dialog can rebuild the quad index, and refreshing the
+        # library closes and reopens the memmaps the running solve is reading
+        # from. _run_impl is synchronous but pumps events, so this button is
+        # reachable mid-solve unless it is disabled with the Go button.
+        try:
+            self.btn_gaia_db.setEnabled(False)
+        except Exception:
+            pass
         try:
             self._run_impl()
         finally:
             self.btn_go.setEnabled(True)
+            try:
+                self.btn_gaia_db.setEnabled(True)
+            except Exception:
+                pass
 
     def _run_impl(self):
         # ── Save all settings first ──────────────────────────────────────────
-        idx = self.cb_seed_mode.currentIndex()
-        _set_seed_mode(self.settings, "auto" if idx == 0 else ("manual" if idx == 1 else "none"))
-        try:
-            manual_scale = float(self.le_scale.text().strip()) if self.le_scale.text().strip() else None
-        except Exception:
-            manual_scale = None
-        _set_manual_seed(self.settings, self.le_ra.text().strip(), self.le_dec.text().strip(), manual_scale)
-        self.settings.setValue("astap/seed_radius_mode", "auto" if self.cb_radius_mode.currentIndex()==0 else "value")
-        try:
-            self.settings.setValue("astap/seed_radius_value", float(self.le_radius_val.text().strip()))
-        except Exception:
-            pass
-        pref_idx_map = {0: "both", 1: "gaia_only", 2: "astap_only", 3: "astrometry_only"}
-        pref = pref_idx_map.get(self.cb_solver_pref.currentIndex(), "both")
-        _set_solver_preference(self.settings, pref)
-        self.settings.setValue("astap/seed_fov_mode",
-                               "compute" if self.cb_fov_mode.currentIndex()==0 else ("auto" if self.cb_fov_mode.currentIndex()==1 else "value"))
-        try:
-            self.settings.setValue("astap/seed_fov_value", float(self.le_fov_val.text().strip()))
-        except Exception:
-            pass
+        spec = self._persist_ui_to_settings()
+        pref = spec["solver"]
 
         # ── ASTAP check only when ASTAP will actually be used ────────────────
         if pref not in ("gaia_only", "astrometry_only"):
@@ -4515,10 +6146,20 @@ class PlateSolverDialog(QDialog):
         if save_path:
             try:
                 # never persist 'file_path' inside FITS
-                h2 = Header()
-                for k in hdr_final.keys():
-                    if k.upper() != "FILE_PATH":
-                        h2[k] = hdr_final[k]
+                # Copy the header wholesale, then drop FILE_PATH. Rebuilding
+                # it card by card looks equivalent and is not: for a
+                # commentary keyword, hdr[k] returns ALL of its cards joined
+                # by newlines, and assigning that back raises ValueError on
+                # the newline. Any solve that writes two HISTORY cards --
+                # a recomputed FOCALLEN, or a seed-grade fallback -- would
+                # therefore solve fine and then fail to save.
+                h2 = hdr_final.copy()
+                for _k in list(h2.keys()):
+                    if _k.upper() == "FILE_PATH":
+                        try:
+                            del h2[_k]
+                        except Exception:
+                            pass
 
                 save_image(
                     img_array=image_data,
@@ -4602,10 +6243,20 @@ class PlateSolverDialog(QDialog):
                     hdr_final = _sanitized_header_for_wcs(hdr) if isinstance(hdr, Header) else Header()
 
                 # Build header to save (and strip FILE_PATH)
-                h2 = Header()
-                for k in hdr_final.keys():
-                    if k.upper() != "FILE_PATH":
-                        h2[k] = hdr_final[k]
+                # Copy the header wholesale, then drop FILE_PATH. Rebuilding
+                # it card by card looks equivalent and is not: for a
+                # commentary keyword, hdr[k] returns ALL of its cards joined
+                # by newlines, and assigning that back raises ValueError on
+                # the newline. Any solve that writes two HISTORY cards --
+                # a recomputed FOCALLEN, or a seed-grade fallback -- would
+                # therefore solve fine and then fail to save.
+                h2 = hdr_final.copy()
+                for _k in list(h2.keys()):
+                    if _k.upper() == "FILE_PATH":
+                        try:
+                            del h2[_k]
+                        except Exception:
+                            pass
 
                 # Save using original pixels
                 save_image(
@@ -4625,3 +6276,167 @@ class PlateSolverDialog(QDialog):
 
         self.log.append(self.tr("Batch plate solving completed."))
 
+    def _load_view_bundle_choices(self):
+        settings = QSettings()
+        settings.sync()
+        raw = ""
+        for key in ("viewbundles/v3", "viewbundles/v2", "viewbundles/v1"):
+            raw = settings.value(key, "", type=str) or ""
+            if raw:
+                break
+        try:
+            data = json.loads(raw or "[]")
+        except Exception:
+            data = []
+        choices = []
+        for b in data:
+            if not isinstance(b, dict):
+                continue
+            name = str(b.get("name") or "Bundle").strip() or "Bundle"
+            ptrs = []
+            for x in (b.get("doc_ptrs") or []):
+                try:
+                    ptrs.append(int(x))
+                except Exception:
+                    pass
+            files = [str(p) for p in (b.get("file_paths") or []) if p]
+            choices.append((name, ptrs, files))
+        return choices
+
+    def _pick_view_bundle(self):
+        choices = self._load_view_bundle_choices()
+        if not choices:
+            QMessageBox.information(self, self.tr("Plate Solver"), self.tr("No View Bundles found."))
+            return None
+        dlg = QDialog(self)
+        dlg.setWindowTitle(self.tr("Apply to View Bundle…"))
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(self.tr("Select a View Bundle:")))
+        lb = QListWidget(dlg)
+        for name, ptrs, files in choices:
+            it = QListWidgetItem(f"{name}  ({len(ptrs)} views, {len(files)} files)")
+            it.setData(Qt.ItemDataRole.UserRole, (ptrs, files))
+            lb.addItem(it)
+        if lb.count():
+            lb.setCurrentRow(0)
+        v.addWidget(lb, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dlg,
+        )
+        v.addWidget(buttons)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        cur = lb.currentItem()
+        if not cur:
+            return None
+        return cur.data(Qt.ItemDataRole.UserRole)
+
+    def _solve_bundle_file(self, path: str, preset: dict) -> None:
+        from setiastro.saspro.doc_manager import ImageDocument
+        img, header, bit_depth, is_mono = load_image(path)
+        if img is None:
+            raise RuntimeError(f"Could not load: {path}")
+        ext = os.path.splitext(path)[1].lower().lstrip(".") or "fits"
+        doc = ImageDocument(img, metadata={
+            "file_path": path,
+            "original_header": header,
+            "bit_depth": bit_depth,
+            "is_mono": is_mono,
+            "original_format": ext,
+        })
+        ok, res = apply_plate_solve_to_doc(self, doc, self.settings, preset)
+        if not ok:
+            raise RuntimeError(str(res))
+        save_image(
+            img_array=doc.image,
+            filename=path,
+            original_format=ext,
+            bit_depth=doc.metadata.get("bit_depth", bit_depth or "32-bit floating point"),
+            original_header=doc.metadata.get("original_header"),
+            is_mono=doc.metadata.get("is_mono", is_mono),
+        )
+
+    def _apply_to_view_bundle(self):
+        spec = self._persist_ui_to_settings()
+        picked = self._pick_view_bundle()
+        if not picked:
+            return
+        ptrs, files = picked
+        from setiastro.saspro.view_bundle import _find_main_window, _resolve_doc_and_subwindow
+        mw = _find_main_window(self) or self.parent()
+        applied = 0
+        errors = []
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        except Exception:
+            pass
+        try:
+            for p in ptrs or []:
+                doc = None
+                sw = None
+                if mw is not None:
+                    doc, sw = _resolve_doc_and_subwindow(mw, p)
+                    if sw is not None and hasattr(mw, "mdi"):
+                        try:
+                            mw.mdi.setActiveSubWindow(sw)
+                            QApplication.processEvents()
+                        except Exception:
+                            pass
+                if doc is None or getattr(doc, "image", None) is None:
+                    continue
+                ok, res = apply_plate_solve_to_doc(self, doc, self.settings, spec)
+                if ok:
+                    applied += 1
+                    title = getattr(doc, "display_name", lambda: "view")()
+                    self.status.setText(self.tr("Solved: {0}").format(title))
+                else:
+                    errors.append(str(res))
+                QApplication.processEvents()
+            for path in files or []:
+                try:
+                    self._solve_bundle_file(path, spec)
+                    applied += 1
+                    self.status.setText(self.tr("Solved: {0}").format(os.path.basename(path)))
+                except Exception as e:
+                    errors.append(f"{os.path.basename(path)}: {e}")
+                QApplication.processEvents()
+        finally:
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+        if applied == 0 and not errors:
+            QMessageBox.information(self, self.tr("Plate Solver"), self.tr("No valid targets in the selected bundle."))
+            return
+        if errors:
+            QMessageBox.warning(
+                self,
+                self.tr("Plate Solver"),
+                self.tr("Solved {0} target(s).\n\nErrors:\n{1}").format(applied, "\n".join(errors[:12])),
+            )
+        else:
+            self.status.setText(self.tr("Plate solve complete for {0} target(s).").format(applied))
+
+
+def open_plate_solver_with_preset(main_window, preset: dict | None = None):
+    settings = getattr(main_window, "settings", None)
+    if settings is None:
+        settings = QSettings()
+    dlg = PlateSolverDialog(settings, parent=main_window)
+    try:
+        from setiastro.saspro.resources import platesolve_path
+        dlg.setWindowIcon(QIcon(platesolve_path))
+    except Exception:
+        pass
+    try:
+        if preset:
+            dlg.seed_from_preset(preset)
+    except Exception:
+        pass
+    dlg.show()
+    dlg.raise_()
+    dlg.activateWindow()
+    return dlg

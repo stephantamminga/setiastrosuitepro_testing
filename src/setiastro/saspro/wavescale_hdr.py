@@ -1,4 +1,4 @@
-# pro/wavescale_hdr.py
+#saspro/wavescale_hdr.py
 from __future__ import annotations
 import numpy as np
 
@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 # Import centralized widget
 from setiastro.saspro.widgets.graphics_views import ZoomableGraphicsView
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
-
+from setiastro.saspro.help_support import make_help_button
 # Import shared wavelet utilities
 from setiastro.saspro.widgets.wavelet_utils import (
     conv_sep_reflect as _conv_sep_reflect,
@@ -133,7 +133,7 @@ class HDRWorker(QObject):
     def run(self):
         try:
             self.progress_update.emit(self.tr("Converting to Lab color space…"), 10)
-            # progress checkpoints inline here are cosmetic
+            #sasprogress checkpoints inline here are cosmetic
             self.progress_update.emit(self.tr("Decomposing luminance with starlet…"), 20)
             # full compute
             transformed, mask = compute_wavescale_hdr(
@@ -332,7 +332,7 @@ class WaveScaleHDRDialogPro(QDialog):
         zoom_row.addWidget(self.btn_fit)
         form.addRow(zoom_row)
 
-        # progress group (unchanged)
+        #sasprogress group (unchanged)
         self.prog_grp = QGroupBox(self.tr("Processing Progress"))
         vprog = QVBoxLayout(self.prog_grp)
         self.lbl_step = QLabel(self.tr("Idle"))
@@ -375,7 +375,10 @@ class WaveScaleHDRDialogPro(QDialog):
                 parent=self,
             )
             drag_row.addWidget(self.preset_drag_handle)
-            drag_row.addStretch(1)   # pushes grip to the left edge
+            drag_row.addStretch(1)
+            self.btn_help = make_help_button("wavescale_hdr", self)
+            drag_row.addWidget(self.btn_help)
+            
             main.addLayout(drag_row)
         except Exception:
             pass
@@ -655,13 +658,14 @@ class WaveScaleHDRDialogPro(QDialog):
             out = mono
 
         out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+        _meta = {"step_name": "WaveScale HDR",
+                 "command_id": "wavescale_hdr",
+                 "preset": dict(self.get_preset())}
         try:
-            if hasattr(self._doc, "set_image"):
-                self._doc.set_image(out, step_name="WaveScale HDR")
-            elif hasattr(self._doc, "apply_numpy"):
-                self._doc.apply_numpy(out, step_name="WaveScale HDR")
-            else:
-                self._doc.image = out
+            self._doc.set_image(out, metadata=_meta, step_name="WaveScale HDR")
+        except Exception as e:
+            QMessageBox.critical(self, self.tr("WaveScale HDR"), self.tr("Failed to write to document:\n{0}").format(e))
+            return
         except Exception as e:
             QMessageBox.critical(self, self.tr("WaveScale HDR"), self.tr("Failed to write to document:\n{0}").format(e))
             return

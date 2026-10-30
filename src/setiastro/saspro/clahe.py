@@ -1,4 +1,4 @@
-# pro/clahe.py
+#saspro/clahe.py
 from __future__ import annotations
 import numpy as np
 import cv2
@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 from setiastro.saspro.widgets.graphics_views import ZoomableGraphicsView
 from setiastro.saspro.widgets.image_utils import extract_mask_resized as _get_active_mask_resized
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
-
+from setiastro.saspro.help_support import make_help_button
 
 # ----------------------- Core -----------------------
 def apply_clahe(image: np.ndarray, clip_limit: float = 2.0, tile_grid_size: tuple = (8, 8)) -> np.ndarray:
@@ -117,12 +117,17 @@ def apply_clahe_to_doc(doc, preset: dict | None):
 
     # Commit
     out = out.astype(np.float32, copy=False)
-    if hasattr(doc, "set_image"):
-        doc.set_image(out, step_name="CLAHE")
-    elif hasattr(doc, "apply_numpy"):
-        doc.apply_numpy(out, step_name="CLAHE")
-    else:
-        doc.image = out
+    _meta = {
+        "step_name": "CLAHE",
+        "command_id": "clahe",
+        "preset": {
+            "clip_limit": float(clip),
+            **({"tile_px": int(p.get("tile_px", 128))} if "tile_px" in p
+               else {"tile": int(p.get("tile", 8))}),
+            "blend": float(blend),
+        },
+    }
+    doc.set_image(out, metadata=_meta, step_name="CLAHE")
 
 
 # ----------------------- Dialog -----------------------
@@ -252,6 +257,9 @@ class CLAHEDialogPro(QDialog):
             )
             drag_row.addWidget(self.preset_drag_handle)
             drag_row.addStretch(1)
+            self.btn_help = make_help_button("clahe", self)
+            drag_row.addWidget(self.btn_help)
+
             v.addLayout(drag_row)
         except Exception:
             pass
@@ -357,10 +365,11 @@ class CLAHEDialogPro(QDialog):
             out = out.astype(np.float32, copy=False)
 
             # --- Commit to document ---
+            _meta = {"step_name": "CLAHE",
+                     "command_id": "clahe",
+                     "preset": {"clip_limit": float(clip), "tile_px": int(tile_px)}}
             if hasattr(self.doc, "set_image"):
-                self.doc.set_image(out, step_name="CLAHE")
-            elif hasattr(self.doc, "apply_numpy"):
-                self.doc.apply_numpy(out, step_name="CLAHE")
+                self.doc.set_image(out, metadata=_meta, step_name="CLAHE")
             else:
                 self.doc.image = out
 

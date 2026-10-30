@@ -13,6 +13,7 @@ from PyQt6.QtGui import QPixmap, QImage, QIcon
 # Shared utilities (same helpers Star Stretch relies on)
 from setiastro.saspro.widgets.image_utils import to_float01 as _to_float01
 from setiastro.saspro.shortcuts import PresetDragHandle
+from setiastro.saspro.help_support import make_help_button
 
 # Icon is optional; fall back gracefully if resources doesn't expose one yet.
 try:
@@ -285,6 +286,8 @@ class RemovePedestalDialog(QDialog):
         )
         drag_row.addWidget(self.preset_drag_handle)
         drag_row.addStretch(1)
+        self.btn_help = make_help_button("pedestal", self)
+        drag_row.addWidget(self.btn_help)
         left.addLayout(drag_row)
 
         main.addLayout(left, 0)
@@ -466,6 +469,8 @@ class RemovePedestalDialog(QDialog):
             )
             meta = {
                 "step_name": "Pedestal Removal",
+                "command_id": "pedestal",
+                "preset": self._pedestal_params(),
                 "bit_depth": "32-bit floating point",
                 "is_mono": (self._preview.ndim == 2),
                 "pedestal": {
@@ -859,6 +864,8 @@ def remove_pedestal(main, target_doc=None, preset: dict | None = None):
         out, vals, _clip = remove_pedestal_array(src, mode=mode, pct=pct, per_channel=per_channel)
         meta = {
             "step_name": "Pedestal Removal",
+            "command_id": "pedestal",
+            "preset": {"mode": mode, "percentile": pct, "per_channel": per_channel},
             "bit_depth": "32-bit floating point",
             "is_mono": (out.ndim == 2),
             "pedestal": {

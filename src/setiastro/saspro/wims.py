@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QInputDialog, QMessageBox, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QFrame, QTabWidget, QTextEdit, QMenu
 )
-
+from setiastro.saspro.help_support import make_help_button
 try:
     import pyqtgraph as pg
     _HAS_PG = True
@@ -959,7 +959,7 @@ class ObjectSearchDialog(QDialog):
         self._results_list.itemDoubleClicked.connect(self._on_item_selected)
         outer.addWidget(self._results_list, 1)
 
-        # Progress bar (hidden until needed)
+        #sasprogress bar (hidden until needed)
         from PyQt6.QtWidgets import QProgressBar
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
@@ -3195,6 +3195,8 @@ class WhatsInMySkyDialog(QDialog):
             b.setFixedHeight(28)
             b.setStyleSheet(_TOOLBAR_BTN_STYLE)
             toolbar.addWidget(b)
+
+        toolbar.addWidget(make_help_button("whats_in_my_sky", self))
 
         settings_btn.setFixedHeight(28)
         settings_btn.setStyleSheet(_WRENCH_BTN_STYLE)

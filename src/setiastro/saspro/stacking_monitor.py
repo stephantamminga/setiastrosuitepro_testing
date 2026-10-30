@@ -1,16 +1,18 @@
 # ============================================================
-#  ____       _   _ _    _       _
-# / ___|  ___| |_(_) |  / \  ___| |_ _ __ ___
-# \___ \ / _ \ __| | | / _ \/ __| __| '__/ _ \
-#  ___) |  __/ |_| | |/ ___ \__ \ |_| | | (_) |
-# |____/ \___|\__|_|_/_/   \_\___/\__|_|  \___/
+#  ____       _   _      _       _
+# / ___|  ___| |_(_)    / \  ___| |_ _ __ ___
+# \___ \ / _ \ __| |   / _ \/ __| __| '__/ _ \
+#  ___) |  __/ |_| |  / ___ \__ \ |_| | | (_) |
+# |____/ \___|\__|_|_/_/   \_\__/\__|_|  \___/
 #
 #  SASpro – Stacking Execution Monitor
 #  Franklin Marek  |  www.setiastro.com
 # ============================================================
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import time
 from typing import Optional
 
@@ -51,6 +53,40 @@ _ST_FAIL    = "failed"
 _ST_INFO    = "info"
 
 
+# ── Disk helpers (self-contained; no cross-module import) ─────────────────
+def _human_bytes(n) -> str:
+    """Human-readable base-1024 byte count, e.g. 1536 -> '1.50 KB'."""
+    try:
+        n = float(n)
+    except Exception:
+        return "?"
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if n < 1024.0 or unit == "PB":
+            if unit == "B":
+                return f"{sign}{int(n)} {unit}"
+            return f"{sign}{n:.2f} {unit}"
+        n /= 1024.0
+    return f"{sign}{n:.2f} PB"
+
+
+def _disk_free_bytes(path):
+    """Free bytes on the volume holding `path` (walks up to an existing dir)."""
+    try:
+        p = os.path.abspath(path or ".")
+        while p and not os.path.isdir(p):
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        if not p or not os.path.isdir(p):
+            return None
+        return int(shutil.disk_usage(p).free)
+    except Exception:
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Message classifier
 # ═══════════════════════════════════════════════════════════════════════════
@@ -71,7 +107,18 @@ _r(r"⚠️.*dark.*skip",                               "Master Darks",      _ST
 # ── Master flat ───────────────────────────────────────────────────────────
 _r(r"Starting Master Flat",                         "Master Flats",      _ST_RUNNING)
 _r(r"🟢 Processing \d+ flats for .+?\[(.+?)\]",     "Master Flats",      _ST_RUNNING, 1)
+# create_master_flat now writes master FITS files on a background thread
+# pool and emits "✅ Master Flat queued: …" the moment the main-thread work
+# for a group is done (the actual on-disk save completes shortly after and
+# is drained in the function's finally). The old "Master Flat saved" rule
+# never matched the new wording, so the LAST group's Master Flats row kept
+# ticking forever until the whole dialog closed — polluting the "total
+# time" readout. Accept the queued message as the per-group terminator;
+# the final "✅ All master flats saved" message after the drain serves as
+# a belt-and-braces closer when every group finishes together.
+_r(r"✅ Master Flat queued",                         "Master Flats",      _ST_OK)
 _r(r"✅ Master Flat saved",                          "Master Flats",      _ST_OK)
+_r(r"✅ All master flats saved",                     "Master Flats",      _ST_OK)
 _r(r"⚠️.*flat.*skip",                               "Master Flats",      _ST_WARN)
 
 # ── Calibration — specific rules BEFORE generic catch-alls ───────────────
@@ -80,15 +127,45 @@ _r(r"🎚️ Interactive flat",                          "Calibration",       _S
 _r(r"🔧 Calibration frames ready",                  "Calibration",       _ST_INFO)
 _r(r"📷 Calibrating group: (.+)",                   "Calibration",       _ST_RUNNING, 1)
 _r(r"📷 Progress: .+ — \d+/\d+ frames",             "Calibration",       _ST_RUNNING)
+_r(r"📷 Calibration pipeline complete",             "Calibration",       _ST_OK)
+_r(r"📷 All light groups calibrated",               "Calibration",       _ST_OK)
 _r(r"✅ Calibration Complete",                      "Calibration",       _ST_OK)
 _r(r"❌ (?:ERROR|CALIBRATION ERROR)",               "Calibration",       _ST_FAIL)
 
+# ── Satellite trail removal (post-calibration phase 2) ───────────────────
+_r(r"✅ Satellite trail removal complete",          "Satellite Trails",  _ST_OK)
+_r(r"⏹ Satellite pass cancelled",                   "Satellite Trails",  _ST_WARN)
+_r(r"🛰️ Satellite trail removal — (\d+ frame\(s\))", "Satellite Trails", _ST_RUNNING, 1)
+_r(r"🛰️ \d+/\d+:",                                  "Satellite Trails",  _ST_RUNNING)
+
 # ── Measurements ─────────────────────────────────────────────────────────
+# Register path opens on "📏 Phase: Measurements starting"; the integrate-
+# already-registered path uses a different opener ("📊 Found N aligned/
+# normalized frames. Measuring in parallel previews…") and finishes on
+# "✅ All chunks complete! Measured N frames total." — without these two
+# the integrate path has NO Measurements row and the elapsed time silently
+# rolls into the next phase.
 _r(r"📏 Phase: Measurements starting",              "Measurements",      _ST_RUNNING)
+_r(r"📊 Found \d+ aligned/normalized frames",       "Measurements",      _ST_RUNNING)
+_r(r"📦 Measured \d+/\d+ frames",                   "Measurements",      _ST_RUNNING)
 _r(r"📏 Phase: Measurements complete",              "Measurements",      _ST_OK)
+_r(r"✅ All chunks complete! Measured \d+ frames",   "Measurements",      _ST_OK)
+
+# ── Frame weights ────────────────────────────────────────────────────────
+# The integrate-already-registered path scores and weights frames after its
+# preview measurements complete. Without an explicit rule the terminal
+# "✅ Frame weights computed!" was being caught by the generic ^✅ catch-all
+# and spawned an orphan "Complete" row with 0s elapsed (no matching start).
+# Match the start message too so the elapsed cell actually ticks, and capture
+# the weighting mode as the group label.
+_r(r"⚖️ Computing frame weights.*?\(mode:\s*([^)]+)\)", "Frame Weights", _ST_RUNNING, 1)
+_r(r"⚖️ Computing frame weights",                   "Frame Weights",     _ST_RUNNING)
+_r(r"✅ Frame weights computed",                     "Frame Weights",     _ST_OK)
+_r(r"⚖️ Frame weights computed",                     "Frame Weights",     _ST_OK)
 
 # ── Normalization ─────────────────────────────────────────────────────────
 _r(r"📏 Phase: Normalization starting",             "Normalization",     _ST_RUNNING)
+_r(r"🌀 Normalizing chunk \d+/\d+",                 "Normalization",     _ST_RUNNING)
 _r(r"📏 Phase: Normalization complete",             "Normalization",     _ST_OK)
 
 # ── Reference frame ───────────────────────────────────────────────────────
@@ -97,6 +174,7 @@ _r(r"📌 Reference for alignment",                  "Ref Frame Selection", _ST_
 
 # ── Star alignment ────────────────────────────────────────────────────────
 _r(r"📏 Phase: Star alignment starting",            "Registration",      _ST_RUNNING)
+_r(r"(?:📐\s*)?Aligning stars… \(\d+/\d+\)",         "Registration",      _ST_RUNNING)
 _r(r"📏 Phase: Star alignment complete",            "Registration",      _ST_OK)
 _r(r"Alignment summary: (\d+ succeeded)",           "Registration",      _ST_OK,   1)
 _r(r"🚨 Rejected \d+ frame",                        "Registration",      _ST_WARN)
@@ -105,10 +183,16 @@ _r(r"🚨 Rejected \d+ frame",                        "Registration",      _ST_W
 _r(r"📏 Phase: Integration starting",               "Integration",       _ST_RUNNING)
 _r(r"Starting integration for group '(.+?)' with",  "Integration",       _ST_RUNNING, 1)
 _r(r"📊 Stacking group '(.+?)' with (.+)",           "Integration",       _ST_RUNNING, 1)
+_r(r"🔧 \[LowRAM\] Tile \d+/\d+",                   "Integration",       _ST_RUNNING)
+_r(r"🔧 Tile \d+/\d+",                              "Integration",       _ST_RUNNING)
 _r(r"Post-align finalize from prepass",             "Integration",       _ST_RUNNING)
 _r(r"🔹 .* Finalizing '(.+?)' from prepass",         "Integration",       _ST_RUNNING, 1)
 _r(r"✅ Saved integrated image.*for '(.+?)'",        "Integration",       _ST_OK,   1)
+_r(r"Integration complete for group '([^']+)'",     "Integration",       _ST_OK,   1)
+_r(r"✅ \[LowRAM\] Integration complete",            "Integration",       _ST_OK)
 _r(r"📐 Drizzle for '(.+?)'",                        "Integration",       _ST_RUNNING, 1)
+_r(r"✅ Drizzle .*saved",                            "Integration",       _ST_OK)
+_r(r"⚠️ Drizzle failed for '([^']+)'",               "Integration",       _ST_FAIL, 1)
 
 # ── Star Trail ────────────────────────────────────────────────────────────
 _r(r"🌠 Star-Trail Mode enabled",                        "Star Trail",            _ST_INFO)
@@ -124,11 +208,30 @@ _r(r"⚡ Running max-value projection",                   "Star Trail: Stack",  
 _r(r"✅ Star-Trail image saved",                          "Star Trail: Stack",     _ST_OK)
 
 # ── Autocrop ──────────────────────────────────────────────────────────────
-_r(r"✂️.*[Cc]rop",                                  "Autocrop",          _ST_RUNNING)
+# Terminal rules FIRST — the greedy running rule below also matches the word
+# "auto-cropped" (…crop…); with it first it swallowed every "Saved auto-
+# cropped" message, so the Autocrop row never left the running state. The
+# negative lookahead on "saved" keeps the running rule from grabbing the
+# MF / comet / drizzle "Saved … (auto-cropped)" messages, which have their
+# own terminal rules.
+#
+# Note the two different wordings coming out of the suite:
+#   normal integration → "✂️ Saved auto-cropped image for 'group': …"
+#   drizzle            → "✂️ Drizzle (auto-cropped) saved: …"
+# The drizzle path phrases "saved" after "(auto-cropped)", so the first
+# rule's "✂️ Saved auto-cropped" prefix never matches it and the Autocrop
+# row stays running forever (even though the running rule's lookahead on
+# "saved" correctly refuses to re-open the row on the drizzle message).
+# Second terminator pins the drizzle wording so both paths close cleanly.
 _r(r"✂️ Saved auto-cropped",                         "Autocrop",          _ST_OK)
+_r(r"✂️ Drizzle \(auto-cropped\) saved",             "Autocrop",          _ST_OK)
+_r(r"✂️(?!.*[Ss]aved).*[Cc]rop",                    "Autocrop",          _ST_RUNNING)
 
 # ── Astrometric solution ──────────────────────────────────────────────────
 _r(r"Transform file saved.*\.sasd \(v2\)",          "Alignment Transforms", _ST_OK)
+# The integrate-already-registered path reconstructs transforms from aligned
+# frame headers instead of solving them, so it emits a different message.
+_r(r"✅ Wrote alignment_transforms\.sasd",           "Alignment Transforms", _ST_OK)
 
 # ── MF Deconvolution ──────────────────────────────────────────────────────
 _r(r"MFDeconv launched for (\d+) group",            "MF Deconvolution",  _ST_RUNNING, 1)
@@ -160,6 +263,38 @@ _r(r"⚠️ Comet star removal pre-process aborted",   "Comet StarRemoval", _ST_
 _r(r"🟡 Blending Stars\+Comet",                    "Comet Blend",       _ST_RUNNING)
 _r(r"✅ Saved CometBlend",                          "Comet Blend",       _ST_OK)
 
+# ── Satellite trail removal (calibration Phase 2) ─────────────────────────
+# calibrate_lights defers satellite removal to a dedicated pass that runs
+# AFTER calibration finishes. Without these rules those messages are
+# unrecognised (suppressed), so the last calibration row stays "running" and
+# silently accrues the entire satellite-pass duration. Give the pass its own
+# row. A per-frame failure keeps the row RUNNING (updates the note) instead
+# of terminating the whole pass on a single bad frame.
+_r(r"🛰️ Satellite trail removal",                   "Satellite Removal", _ST_RUNNING)
+_r(r"🛰️ \d+/\d+:",                                   "Satellite Removal", _ST_RUNNING)
+_r(r"✅ Satellite trail removal complete",            "Satellite Removal", _ST_OK)
+_r(r"⏹ Satellite pass cancelled",                    "Satellite Removal", _ST_WARN)
+_r(r"⚠️ Satellite pass failed on",                    "Satellite Removal", _ST_RUNNING)
+
+# ── Advanced dual-band NB split (matrix) ──────────────────────────────────
+# OSC dual-band frames (e.g. L-eXtreme) are split into Ha / OIII after
+# alignment. The "advanced" path first solves a per-scene mixing matrix from
+# a few subs — its condition number reports how well-posed that solve was —
+# then applies it to every frame. Two rows are tracked: the outer split
+# (opened by "🌈 Splitting…", closed by "Dual-band split … complete") and the
+# inner matrix calibration (opened by "calibrating … mixing matrix", closed
+# by "Advanced NB matrix"). Keeping the matrix as its own row parks the
+# cond/star-count on screen. Any fallback to a raw split (import failure,
+# pooled-fit failure, or a severely ill-conditioned matrix — all end in
+# "raw split") closes the matrix row as a warning; the split itself carries
+# on and still reports its own completion. Per-frame "↳ NB cal …" chatter is
+# left unrecognised (suppressed), as is the "ℹ️ No dual-band frames …" no-op.
+_r(r"🌈 Splitting aligned dual-band .*? into ([^…]+)",    "Dual-Band Split", _ST_RUNNING, 1)
+_r(r"Advanced NB split: calibrating (\S+) mixing matrix", "NB Matrix Cal",   _ST_RUNNING, 1)
+_r(r"Advanced NB split.*raw split",                       "NB Matrix Cal",   _ST_WARN)
+_r(r"✅ Advanced NB matrix",                               "NB Matrix Cal",   _ST_OK)
+_r(r"✅ Dual-band split .*complete",                       "Dual-Band Split", _ST_OK)
+
 # ── Generic catch-alls — MUST be last ─────────────────────────────────────
 _r(r"^✅",   "Complete",  _ST_OK)
 _r(r"^⚠️",  "Warning",   _ST_WARN)
@@ -167,21 +302,17 @@ _r(r"^❌",   "Error",     _ST_FAIL)
 
 # ── Noise patterns to suppress (tile-level chatter) ──────────────────────
 _SUPPRESS = re.compile(
-    r"tile \d+/\d+"
-    r"|Creating temp memmap"
+    r"Creating temp memmap"
     r"|memmap:"
-    r"|chunk \d+/\d+.*frames"
     r"|Before saving:"
     r"|min ="
     r"|max ="
     r"|LIGHT final"
     r"|💾 Saved:"
-    r"|📷 Progress:"
     r"|  ✓ GPU calibrated:"
     r"|  ✓ Dark loaded:"
     r"|  ✓ Flat loaded:"
     r"|  Mask saved:"
-    r"|Aligning stars… \(\d"
     r"|🗂️"
     r"|📦 \d+ tiles"
     r"|🧭 Total tiles"
@@ -191,6 +322,8 @@ _SUPPRESS = re.compile(
     r"|✅ Master Dark saved: "
     r"|scale_guess"
     r"|✅ Prepass '"
+    r"|✅ SASD v2"
+    r"|✅ Saved rejection map"
     r"|🔹 \[\d+/\d+\] Finalizing"
     r"|Rejection prepass:"
     r"|🔹 .* Finalizing '.+?' from prepass"
@@ -204,10 +337,10 @@ _SUPPRESS = re.compile(
     r"|refine_if"
     r"|Image Registration Started"
     r"|🔄 Image Registration"
-    r"|Aligning stars"
     r"|Measuring chunk"
-    r"|✅ All chunks complete"
-    r"|🌀 Normalizing chunk"
+    # "✅ All chunks complete! Measured N frames total." is handled by a
+    # dedicated Measurements OK rule above (needed for the integrate-already-
+    # registered path, which has no "📏 Phase: Measurements complete").
     r"|Updated self\.light_files"
     r"|Transform file saved.*alignment_transforms\.sasd(?! \(v2\))"
     r"|_n\.fit"
@@ -307,6 +440,19 @@ class StackingMonitorDialog(QDialog):
         self._run_start: Optional[float] = None
         self._log_bus   = None
 
+        # ── bottom-label run state ─────────────────────────────────────────
+        # While True, _tick_elapsed repaints the summary label with a live
+        # "Running · MM:SS" so it never sits on "Ready." mid-run. Terminal
+        # states (finish_run/finish_all/mark_stopped) and clear() flip it off.
+        self._running_active: bool = False
+        self._running_caption: str = "Running"
+
+        # ── disk-budget state (persistent label; live-polled on tick) ──
+        self._disk_dir: Optional[str] = None   # volume to poll for free space
+        self._disk_est: int = 0                # estimated bytes for current step
+        self._disk_step: str = ""              # short step label ("Register", …)
+        self._disk_tick: int = 0               # throttles the free-space poll
+
         self._build_ui()
         self._restore_geometry()
         self._connect_bus()
@@ -373,6 +519,9 @@ class StackingMonitorDialog(QDialog):
                 color: #bbbbbb;
                 font-size: 11px;
             }
+            QLabel#disk_label {
+                font-size: 11px;
+            }
         """)
 
         # header row
@@ -381,6 +530,19 @@ class StackingMonitorDialog(QDialog):
         title.setObjectName("monitor_title")
         hdr_row.addWidget(title)
         hdr_row.addStretch(1)
+
+        # Persistent disk-space readout (right side of the header). Shows the
+        # current free space on the target volume versus the estimated output
+        # for the running step, and updates live as frames are written.
+        self._disk_label = QLabel("")
+        self._disk_label.setObjectName("disk_label")
+        self._disk_label.setTextFormat(Qt.TextFormat.RichText)
+        self._disk_label.setToolTip(
+            "Free space on the stacking volume vs. the estimated output size "
+            "for the current step. Updates as files are written."
+        )
+        self._disk_label.setVisible(False)
+        hdr_row.addWidget(self._disk_label)
         root.addLayout(hdr_row)
 
         # table
@@ -420,6 +582,7 @@ class StackingMonitorDialog(QDialog):
         self.btn_stop.setFixedHeight(26)
         self.btn_stop.setToolTip("Request a graceful stop after the current tile/frame")
         self.btn_stop.clicked.connect(self._on_stop_clicked)
+        self.btn_stop.setEnabled(False)
         bot.addWidget(self.btn_stop)
 
         btn_clear = QPushButton("Clear")
@@ -451,6 +614,89 @@ class StackingMonitorDialog(QDialog):
                 if item is not None:
                     item.setText(self._rows[idx].elapsed_str())
 
+        # The summary line is a static state word ("In Progress"); the live
+        # ticking lives in the per-row Elapsed cells above, so nothing to
+        # repaint here.
+
+        # Refresh the free-space figure every ~3 s so the readout tracks the
+        # disk filling up during a long write phase without polling too often.
+        if self._disk_dir:
+            self._disk_tick += 1
+            if self._disk_tick % 3 == 0:
+                self._refresh_disk_label()
+
+    # ------------------------------------------------------- disk budget API
+    def set_disk_budget(self, target_dir, est_bytes, *, step_label: str = ""):
+        """
+        Show the free-space-vs-estimate readout for the step about to run.
+
+        target_dir : any path on the volume that will receive the output.
+        est_bytes  : estimated bytes this step will write.
+        step_label : short label for the step, e.g. "Register", "Integrate".
+        Safe to call from the GUI thread; never raises.
+        """
+        try:
+            self._disk_dir = str(target_dir) if target_dir else None
+            self._disk_est = int(max(0, est_bytes))
+            self._disk_step = str(step_label or "")
+            self._disk_tick = 0
+            self._refresh_disk_label()
+        except Exception:
+            pass
+
+    def clear_disk_budget(self):
+        """Hide the disk readout (e.g. when no step is queued)."""
+        self._disk_dir = None
+        self._disk_est = 0
+        self._disk_step = ""
+        try:
+            self._disk_label.setVisible(False)
+            self._disk_label.setText("")
+        except Exception:
+            pass
+
+    def _refresh_disk_label(self):
+        """Recompute free space and repaint the header disk readout."""
+        try:
+            if not self._disk_dir:
+                self._disk_label.setVisible(False)
+                return
+
+            free = _disk_free_bytes(self._disk_dir)
+            est = int(self._disk_est or 0)
+            step = f"{self._disk_step} · " if self._disk_step else ""
+
+            if free is None:
+                self._disk_label.setText(
+                    f"<span style='color:{_DIM};'>💽 {step}"
+                    f"est. {_human_bytes(est)} · free space unknown</span>"
+                )
+                self._disk_label.setVisible(True)
+                return
+
+            # Colour by how much of the *current* free space the estimate uses.
+            # Green: comfortable. Yellow: tight (>75%). Red: won't fit (>100%).
+            ratio = (est / free) if free > 0 else float("inf")
+            if ratio >= 1.0:
+                colour = _RED
+            elif ratio >= 0.75:
+                colour = _ORANGE
+            else:
+                colour = _GREEN
+
+            pct = f"{ratio * 100:.0f}%" if free > 0 else "—"
+            self._disk_label.setText(
+                f"💽 {step}"
+                f"<span style='color:{_FG};'>free </span>"
+                f"<span style='color:{colour};font-weight:bold;'>{_human_bytes(free)}</span>"
+                f"<span style='color:{_DIM};'>  /  est. </span>"
+                f"<span style='color:{_FG};'>{_human_bytes(est)}</span>"
+                f"<span style='color:{colour};'> ({pct})</span>"
+            )
+            self._disk_label.setVisible(True)
+        except Exception:
+            pass
+
     # ---------------------------------------------------------------- bus
     def _connect_bus(self):
         from PyQt6.QtWidgets import QApplication
@@ -470,19 +716,70 @@ class StackingMonitorDialog(QDialog):
             self._log_bus = None
 
     # ----------------------------------------------------------- public API
+    def _set_stop_available(self, enabled: bool, *, stopping: bool = False):
+        try:
+            if stopping:
+                self.btn_stop.setText("Stopping…")
+                self.btn_stop.setEnabled(False)
+            else:
+                self.btn_stop.setText("■ Stop")
+                self.btn_stop.setEnabled(bool(enabled))
+        except Exception:
+            pass
+
     def start_run(self):
         self.clear()
         self._run_start = time.monotonic()
-        try:
-            self.btn_stop.setEnabled(True)
-            self.btn_stop.setText("■ Stop")
-        except Exception:
-            pass
+        self._set_stop_available(True)
         self._tick_timer.start()
+        # Replace the "Ready." placeholder with a simple in-progress state.
+        self._set_running_label("In Progress")
         self.show()
         self.raise_()
         self.activateWindow()
 
+    # ------------------------------------------------- bottom-label helpers
+    def _process_seconds(self) -> int:
+        """Total *processing* time: the sum of each finished step's own
+        duration (t_end − t_start). This reconciles with the per-row Elapsed
+        column and deliberately excludes the idle gaps between steps that a
+        wall-clock run total would otherwise fold in."""
+        total = 0.0
+        for r in self._rows:
+            if r.t_end is not None:
+                total += max(0.0, r.t_end - r.t_start)
+        return int(total)
+
+    @staticmethod
+    def _mmss(seconds: float) -> str:
+        m, s = divmod(int(seconds), 60)
+        return f"{m:02d}:{s:02d}"
+
+    def _set_running_label(self, caption: str = "In Progress"):
+        """Show a simple live 'in progress' state on the summary line. The
+        per-row Elapsed cells carry the ticking; this line only states that
+        work is ongoing — no wall-clock total, which would drift from the
+        summed row times."""
+        self._running_caption = caption
+        self._running_active = True
+        self._lbl_total.setText(f"⟳ {caption}…")
+        self._lbl_total.setStyleSheet(
+            "color:#f0c040; font-size:11px; font-weight:bold;"
+        )
+
+
+    def _phase_label(self) -> str:
+        # Name the phase from the operations that actually ran, so a
+        # calibration-only run doesn't report as "Integration". Later phases
+        # win when several are present (a full run ends on Integration).
+        ops = {(r.operation or "").lower() for r in self._rows}
+        if any("integration" in o for o in ops):
+            return "Integration phase done"
+        if any("registration" in o for o in ops):
+            return "Registration phase done"
+        if any("calibration" in o for o in ops):
+            return "Calibration phase complete"
+        return "Phase complete"
 
     def finish_run(self, ok: bool, summary: str = ""):
         # Close any rows that are still marked running
@@ -500,16 +797,18 @@ class StackingMonitorDialog(QDialog):
         # a soft stop; _on_message will restart if new RUNNING ops appear.
         self._tick_timer.stop()
 
-        total_s = ""
-        if self._run_start is not None:
-            t = time.monotonic() - self._run_start
-            m, s = divmod(int(t), 60)
-            total_s = f"{m:02d}:{s:02d}"
+        #sasprocessing-time total (sum of step durations), not wall clock, so it
+        # matches the per-row Elapsed column.
+        total_s = self._mmss(self._process_seconds())
+
+        # Soft finish: hand the summary line over to a phase caption. If a
+        # later phase posts a running op, _on_message re-arms the live label.
+        self._running_active = False
 
         # Show as "integration complete" rather than fully done,
         # since drizzle/MFD may still follow
         if ok:
-            self._lbl_total.setText(f"Integration phase done ({total_s})")
+            self._lbl_total.setText(f"{self._phase_label()} ({total_s})")
             self._lbl_total.setStyleSheet(
                 "color:#f0c040; font-size:11px; font-weight:bold;"
             )
@@ -518,6 +817,7 @@ class StackingMonitorDialog(QDialog):
             self._lbl_total.setStyleSheet(
                 "color:#ff4d4f; font-size:12px; font-weight:bold;"
             )
+        self._set_stop_available(False)
 
     def finish_all(self, ok: bool, summary: str = ""):
         """Call this when the entire pipeline is done including drizzle/MFD."""
@@ -528,12 +828,9 @@ class StackingMonitorDialog(QDialog):
                 self._refresh_row(idx)
         self._open.clear()
         self._tick_timer.stop()
+        self._running_active = False
 
-        total_s = ""
-        if self._run_start is not None:
-            t = time.monotonic() - self._run_start
-            m, s = divmod(int(t), 60)
-            total_s = f"{m:02d}:{s:02d}"
+        total_s = self._mmss(self._process_seconds())
 
         if ok:
             self._lbl_total.setText(f"Executed in {total_s}   ✓ Complete")
@@ -545,13 +842,10 @@ class StackingMonitorDialog(QDialog):
             self._lbl_total.setStyleSheet(
                 "color:#ff4d4f; font-size:12px; font-weight:bold;"
             )
+        self._set_stop_available(False)
 
     def _on_stop_clicked(self):
-        try:
-            self.btn_stop.setEnabled(False)
-            self.btn_stop.setText("Stopping…")
-        except Exception:
-            pass
+        self._set_stop_available(False, stopping=True)
         print("[CANCEL] _on_stop_clicked: emitting cancel_requested")
         self.cancel_requested.emit()
         print("[CANCEL] _on_stop_clicked: emit returned")
@@ -564,21 +858,22 @@ class StackingMonitorDialog(QDialog):
             self._refresh_row(idx)
         self._open.clear()
         self._tick_timer.stop()
-        total_s = ""
-        if self._run_start is not None:
-            t = time.monotonic() - self._run_start
-            m, s = divmod(int(t), 60)
-            total_s = f"{m:02d}:{s:02d}"
+        self._running_active = False
+        total_s = self._mmss(self._process_seconds())
         self._lbl_total.setText(f"⏹ Stopped by user ({total_s})")
         self._lbl_total.setStyleSheet("color:#ffa726; font-size:12px; font-weight:bold;")
+        self._set_stop_available(False)
 
     def clear(self):
         self._table.setRowCount(0)
         self._rows.clear()
         self._open.clear()
         self._run_start = None
+        self._running_active = False
         self._lbl_total.setText("Ready.")
         self._lbl_total.setStyleSheet(f"color:{_DIM};font-size:10px;")
+        self.clear_disk_budget()
+        self._set_stop_available(False)
 
     # ---------------------------------------------------- message handler
     @pyqtSlot(str)
@@ -598,17 +893,35 @@ class StackingMonitorDialog(QDialog):
 
         # ── If a new RUNNING op arrives after the run was marked complete,
         #    resume the timer — drizzle/MFD start after integration finishes
-        if status == _ST_RUNNING and not self._tick_timer.isActive():
-            self._tick_timer.start()
-            # Clear the "Complete" label so it doesn't show as done while work continues
-            self._lbl_total.setText("Running (post-integration phase)…")
-            self._lbl_total.setStyleSheet(f"color:{_YELLOW};font-size:11px;")
+        if status == _ST_RUNNING:
+            if self.btn_stop.text() != "Stopping…":
+                self._set_stop_available(True)
+            if not self._tick_timer.isActive():
+                self._tick_timer.start()
+            # A running op after a soft finish means a later phase (drizzle,
+            # MFDeconv, a fresh mosaic set) has begun — flip the summary line
+            # back to a live running caption so a stale "…done" doesn't linger.
+            if not self._running_active:
+                self._set_running_label("In Progress (post-integration phase)")
 
         # ── finishing transitions ─────────────────────────────────────────
         if status in (_ST_OK, _ST_FAIL, _ST_WARN) and op in self._open:
             idx = self._open.pop(op)
-            self._rows[idx].finish(status, note)
+            row = self._rows[idx]
+            # Keep the last filter's own note; summary messages like
+            # "All light groups calibrated" would otherwise overwrite it.
+            finish_note = "" if (op == "Calibration" and row.group and status == _ST_OK) else note
+            row.finish(status, finish_note)
             self._refresh_row(idx)
+            return
+
+        # "✅ Calibration Complete" after a dedicated satellite pass would
+        # otherwise spawn an empty extra Calibration success row.
+        if (
+            status in (_ST_OK, _ST_FAIL, _ST_WARN)
+            and op == "Calibration"
+            and op not in self._open
+        ):
             return
 
         # ── continuing a running row ──────────────────────────────────────
@@ -632,6 +945,38 @@ class StackingMonitorDialog(QDialog):
                 row.note = note
                 self._refresh_row(idx)
                 return
+
+        # Satellite trail removal is a distinct phase after all groups.
+        # Close the last Calibration row so its elapsed time stops there.
+        if (
+            status == _ST_RUNNING
+            and op == "Satellite Trails"
+            and "Calibration" in self._open
+        ):
+            idx = self._open.pop("Calibration")
+            self._rows[idx].finish(_ST_OK)
+            self._refresh_row(idx)
+
+        # A later mosaic set starts measuring / aligning after the previous
+        # set's drizzle already finished. Without a terminal Integration rule
+        # (or if that message was missed), the old Integration row would stay
+        # "running" next to Registration.
+        if (
+            status == _ST_RUNNING
+            and op in ("Measurements", "Normalization", "Registration")
+            and "Integration" in self._open
+        ):
+            idx = self._open.pop("Integration")
+            self._rows[idx].finish(_ST_OK)
+            self._refresh_row(idx)
+
+        # Generic ✅/⚠️/❌ catch-alls must not spawn orphan rows while a real
+        # phase is still open — e.g. "✅ SASD v2: loaded…" right after
+        # "📐 Drizzle for …" was showing a false "Complete" under a running
+        # Integration/Drizzle row.
+        if op in ("Complete", "Warning", "Error") and self._open:
+            return
+
         # ── new row ───────────────────────────────────────────────────────
         r = _MonitorRow(op, group, status, note)
         self._rows.append(r)

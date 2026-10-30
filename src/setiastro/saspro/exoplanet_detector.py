@@ -43,7 +43,7 @@ import lightkurve as lk
 # ---- project-local imports (adjust paths if needed) --------------------
 from setiastro.saspro.legacy.numba_utils import bin2x2_numba, apply_flat_division_numba
 from setiastro.saspro.imageops.stretch import stretch_mono_image, stretch_color_image
-
+from setiastro.saspro.help_support import make_help_button
 from setiastro.saspro.plate_solver import plate_solve_doc_inplace
 from setiastro.saspro.star_alignment import (
     StarRegistrationWorker,
@@ -51,6 +51,7 @@ from setiastro.saspro.star_alignment import (
     IDENTITY_2x3,
 )
 from setiastro.saspro.legacy.image_manager import load_image, save_image, get_valid_header  # adjust if different
+from setiastro.saspro import photometry_aavso as aav
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
 
 # ------------------------------------------------------------------------
@@ -747,6 +748,51 @@ class ReferenceOverlayDialog(QDialog):
         self._update_highlights()
 
 
+# ---------------------------------------------------------------------------
+# SIMBAD/VSX name-resolution helpers.  Used by ExoPlanetWindow to pick the
+# best display / export name near a (RA, Dec) — biasing toward variable-star
+# designations and named catalogs over incidental Gaia DR3 entries.
+# ---------------------------------------------------------------------------
+
+# SIMBAD otype prefixes considered "variable star".
+_VARIABLE_OTYPE_PREFIXES = (
+    "V*",   "Mi*",  "EB*", "EA*", "EW*", "RR*", "Ce*", "dS*", "SX*",
+    "Sr*",  "SR*",  "LP*", "LPV", "Ir*", "IR*", "Pu*", "Ro*", "RS*",
+    "BY*",  "Er*",  "FU*", "GC*", "Ta*", "TT*", "Y*O",
+)
+
+# Catalog prefixes we prefer as an exported #NAME over a generic Gaia id.
+_PREFERRED_NAME_PREFIXES = (
+    "V*",   "V ",   "NSV",
+    "HD ",  "HR ",  "HIP ", "TYC ", "BD",  "CD",
+    "ASAS ", "ASASSN-", "ASASSN ", "ZTF ", "OGLE",
+    "GSC ", "PPM ",  "SAO ", "WDS ", "WISE ",
+)
+
+# Deprioritise plain Gaia identifiers.
+_DEPRIORITIZED_NAME_PREFIXES = (
+    "Gaia DR3 ", "Gaia DR2 ", "Gaia DR1 ", "Gaia EDR3 ",
+)
+
+
+def _is_variable_otype(otype: str) -> bool:
+    if not otype:
+        return False
+    ot = otype.strip()
+    return any(ot.startswith(p) for p in _VARIABLE_OTYPE_PREFIXES)
+
+
+def _name_score(name: str) -> int:
+    n = (name or "").strip()
+    for p in _DEPRIORITIZED_NAME_PREFIXES:
+        if n.startswith(p):
+            return -30
+    for p in _PREFERRED_NAME_PREFIXES:
+        if n.startswith(p):
+            return 30
+    return 0
+
+
 class ExoPlanetWindow(QDialog):
     def __init__(self, parent=None, wrench_path=None, settings=None):
         super().__init__(parent)
@@ -764,6 +810,8 @@ class ExoPlanetWindow(QDialog):
         self.star_positions   = []
         self.fluxes           = None  # stars × frames
         self.flags            = None
+        self.raw_flux_rgb     = None  # (3, n_stars, n_frames) for color inputs; None for mono
+        self.raw_flux_err_rgb = None
         self.median_fwhm      = None
         self.master_dark      = None
         self.master_flat      = None
@@ -828,6 +876,7 @@ class ExoPlanetWindow(QDialog):
         """)
         self.wrench_button.clicked.connect(self.open_settings)
         mode_layout.addWidget(self.wrench_button)
+        mode_layout.addWidget(make_help_button("exoplanet", self))
 
         # — Calibration controls (hidden in Aligned) —
         cal_layout = QHBoxLayout()
@@ -923,6 +972,14 @@ class ExoPlanetWindow(QDialog):
         self.identify_btn = QPushButton("Identify Star…")
         self.identify_btn.clicked.connect(self.on_identify_star)
         row1.addWidget(self.identify_btn)
+        self.find_star_btn = QPushButton("Find Star…")
+        self.find_star_btn.setToolTip(
+            "Look up a star by name (SIMBAD-resolvable — e.g. V336 Aps,\n"
+            "HD 12345, TYC 9256-617-1, Gaia DR3 …). Selects the closest\n"
+            "detected star in the list."
+        )
+        self.find_star_btn.clicked.connect(self.on_find_star_by_name)
+        row1.addWidget(self.find_star_btn)
         self.show_ensemble_btn = QPushButton("Show Ensemble Members")
         self.show_ensemble_btn.clicked.connect(self.show_ensemble_members)
         row1.addWidget(self.show_ensemble_btn)
@@ -1841,7 +1898,7 @@ class ExoPlanetWindow(QDialog):
                     sky_total = sky_per_pix * ap_area
                     f_sky_sub = f_ap - sky_total
 
-                    # propagate sky subtraction error
+                    #saspropagate sky subtraction error
                     # var(sky_total) = (ap_area/ann_area)^2 * var(ann)
                     sky_err_contrib = float(ann_err[0]) * (ap_area / max(ann_area, 1.0))
                     f_err_total = float(np.sqrt(max(f_err**2 + sky_err_contrib**2, 0.0)))
@@ -1970,6 +2027,11 @@ class ExoPlanetWindow(QDialog):
         self.raw_flux       = raw_flux.copy()       # background-subtracted instrumental flux
         self.raw_flux_err   = raw_flux_err.copy()   # its 1-sigma error -- needed for calibrated mags
         self.flags          = flags
+
+        # Supplementary per-channel R/G/B pass for color inputs. Populates
+        # self.raw_flux_rgb / self.raw_flux_err_rgb, or leaves them None
+        # for mono. Enables multi-band (TB/TG/TR) AAVSO export.
+        self._run_multiband_photometry(xs, ys, keep_mask=None)
 
         # list uses median rel flux, not the first frame
         self.star_list.clear()
@@ -2704,74 +2766,190 @@ class ExoPlanetWindow(QDialog):
         dlg.resize(1000, 640)
         dlg.exec()
 
+    # ---- shared SIMBAD/VSX name resolver ------------------------------
+    #
+    # Query SIMBAD around (ra, dec) at a moderately wide radius, then score
+    # every returned row so that variable-star otypes and named catalog IDs
+    # rank above generic Gaia DR3 entries.  Ties break on angular offset.
+    # If the winning row still isn't obviously a variable, ask VSX (by
+    # coordinate, NOT by the main_id we just got — VSX has no reverse
+    # index on Gaia identifiers) whether anything in the region carries a
+    # variable-star designation, and upgrade the name if so.
+    #
+    # This fixes the exported #NAME landing on "Gaia DR3 5790…" when the
+    # user clicked V336 Aps: with a 5″ SIMBAD radius and a distance-only
+    # sort, a Gaia catalog entry sitting 2–3″ from the click could beat the
+    # actual Mira in row 0, and the old VSX fallback (query_object on that
+    # Gaia string) then returned nothing.
+
+    def _resolve_target_name_row(self, ra_deg, dec_deg, radius_arcsec=15.0):
+        """Return dict {main_id, otype, vmag, offset_arcsec, is_variable,
+        used_vsx} for the best-scoring match near (ra_deg, dec_deg), or
+        None on failure / no match.  Never raises."""
+        coord = SkyCoord(ra=ra_deg*u.deg, dec=dec_deg*u.deg, frame="icrs")
+        table = None
+        for attempt in range(1, 6):
+            try:
+                custom = Simbad(); custom.reset_votable_fields()
+                custom.add_votable_fields("otype")
+                custom.add_votable_fields("flux(V)")
+                table = custom.query_region(coord, radius=radius_arcsec*u.arcsec)
+                break
+            except Exception as e:
+                print(f"[DEBUG] SIMBAD attempt {attempt} failed: {e}")
+                if attempt == 5:
+                    return None
+                non_blocking_sleep(1)
+
+        if table is None or len(table) == 0:
+            # SIMBAD blank — try VSX directly as a last resort.
+            return self._vsx_only_lookup(coord, radius_arcsec)
+
+        try:
+            id_col    = next(c for c in table.colnames if c.lower() == "main_id")
+            ra_col    = next(c for c in table.colnames if c.lower() == "ra")
+            dec_col   = next(c for c in table.colnames if c.lower() == "dec")
+        except StopIteration:
+            return None
+        otype_col = next((c for c in table.colnames if c.lower() == "otype"), None)
+        flux_col  = next((c for c in table.colnames if c.upper() in ("FLUX_V", "V")), None)
+
+        best = None
+        best_score = None
+        for row in table:
+            name = row[id_col]
+            if isinstance(name, bytes):
+                name = name.decode("utf-8")
+            name = str(name).strip()
+
+            try:
+                rra  = float(row[ra_col])
+                rdec = float(row[dec_col])
+            except Exception:
+                continue
+            match  = SkyCoord(ra=rra*u.deg, dec=rdec*u.deg, frame="icrs")
+            offset = float(coord.separation(match).arcsec)
+
+            otype = ""
+            if otype_col is not None:
+                ov = row[otype_col]
+                if isinstance(ov, bytes):
+                    ov = ov.decode("utf-8")
+                otype = str(ov).strip()
+
+            vmag = None
+            if flux_col is not None:
+                try:
+                    fv = float(row[flux_col])
+                    if np.isfinite(fv):
+                        vmag = fv
+                except Exception:
+                    vmag = None
+
+            score = 0.0
+            if _is_variable_otype(otype):
+                score += 100.0
+            score += _name_score(name)
+            score -= offset  # closer wins ties
+
+            if (best_score is None) or (score > best_score):
+                best_score = score
+                best = {
+                    "main_id":       name,
+                    "otype":         otype,
+                    "vmag":          vmag,
+                    "offset_arcsec": offset,
+                    "is_variable":   _is_variable_otype(otype),
+                    "used_vsx":      False,
+                }
+
+        if best is None:
+            return None
+
+        # If the winner still isn't a variable, see if VSX has something
+        # nearby that we should upgrade to.
+        if not best["is_variable"]:
+            vsx_name = self._vsx_name_near(coord, radius_arcsec)
+            if vsx_name:
+                best["main_id"]     = vsx_name
+                best["used_vsx"]    = True
+                best["is_variable"] = True
+
+        return best
+
+    def _vsx_name_near(self, coord, radius_arcsec):
+        """Return the closest VSX 'Name' within `radius_arcsec`, or None."""
+        try:
+            v = Vizier(columns=["Name", "RAJ2000", "DEJ2000"], catalog="B/vsx")
+            v.ROW_LIMIT = 25
+            tbls = v.query_region(coord, radius=radius_arcsec*u.arcsec)
+        except Exception as e:
+            print(f"[DEBUG] VSX region lookup failed: {e}")
+            return None
+        if not tbls or len(tbls) == 0 or len(tbls[0]) == 0:
+            return None
+        t = tbls[0]
+        try:
+            ras  = np.asarray(t["RAJ2000"], dtype=float)
+            decs = np.asarray(t["DEJ2000"], dtype=float)
+        except Exception:
+            return None
+        cands = SkyCoord(ra=ras*u.deg, dec=decs*u.deg, frame="icrs")
+        seps  = coord.separation(cands).arcsec
+        i     = int(np.argmin(seps))
+        name  = t["Name"][i]
+        if isinstance(name, bytes):
+            name = name.decode("utf-8")
+        return str(name).strip() or None
+
+    def _vsx_only_lookup(self, coord, radius_arcsec):
+        """SIMBAD returned nothing — try VSX alone.  Same dict shape."""
+        name = self._vsx_name_near(coord, radius_arcsec)
+        if not name:
+            return None
+        return {
+            "main_id":       name,
+            "otype":         "V*",
+            "vmag":          None,
+            "offset_arcsec": float("nan"),
+            "is_variable":   True,
+            "used_vsx":      True,
+        }
+
+    # ---- UI: Identify Star (uses the shared resolver) -----------------
     def on_identify_star(self):
         radec = self.get_selected_star_radec()
         if radec is None:
             QMessageBox.warning(self, "Identify Star", "Please select exactly one star first.")
             return
         ra, dec = radec
-        coord = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame='icrs')
 
-        custom_simbad = Simbad()
-        custom_simbad.reset_votable_fields()
-        custom_simbad.add_votable_fields("otype")
-        custom_simbad.add_votable_fields("flux(V)")
-
-        result = None
-        for attempt in range(1, 6):
-            try:
-                result = custom_simbad.query_region(coord, radius=5*u.arcsec)
-                break
-            except Exception as e:
-                print(f"[DEBUG] SIMBAD attempt {attempt} failed: {e}")
-                if attempt == 5:
-                    QMessageBox.critical(self, "SIMBAD Error", f"Could not reach SIMBAD after 5 tries:\n{e}")
-                    return
-                # Use non-blocking sleep
-                non_blocking_sleep(1)
-
-        if result is None or len(result) == 0:
-            QMessageBox.information(self, "No SIMBAD Matches", f"No objects found within 5″ of {ra:.6f}, {dec:.6f}.")
+        hit = self._resolve_target_name_row(ra, dec, radius_arcsec=15.0)
+        if hit is None:
+            QMessageBox.information(
+                self, "No SIMBAD/VSX Matches",
+                f"No objects found within 15″ of {ra:.6f}, {dec:.6f}\n"
+                f"(or SIMBAD/VSX unreachable — see console for details)."
+            )
             return
 
-        row = result[0]
-        id_col    = next(c for c in result.colnames if c.lower()=="main_id")
-        ra_col    = next(c for c in result.colnames if c.lower()=="ra")
-        dec_col   = next(c for c in result.colnames if c.lower()=="dec")
-        otype_col = next((c for c in result.colnames if c.lower()=="otype"), None)
-        flux_col  = next((c for c in result.colnames if c.upper()=="V" or c.upper()=="FLUX_V"), None)
-
-        main_id = row[id_col]
-        if isinstance(main_id, bytes):
-            main_id = main_id.decode("utf-8")
-
-        ra_val  = float(row[ra_col]); dec_val = float(row[dec_col])
-        match_coord = SkyCoord(ra=ra_val*u.deg, dec=dec_val*u.deg, frame='icrs')
-        offset = coord.separation(match_coord).arcsec
-
-        obj_type = None
-        if otype_col:
-            obj_type = row[otype_col]
-            if isinstance(obj_type, bytes):
-                obj_type = obj_type.decode("utf-8")
-        obj_type = obj_type or "n/a"
-
-        vmag = None
-        if flux_col:
-            raw = row[flux_col]
-            try: vmag = float(raw)
-            except Exception: vmag = None
+        main_id  = hit["main_id"]
+        obj_type = hit["otype"] or "n/a"
+        vmag     = hit["vmag"]
+        offset   = hit["offset_arcsec"]
         vmag_str = f"{vmag:.3f}" if vmag is not None else "n/a"
+        off_str  = f"{offset:.2f}″" if np.isfinite(offset) else "n/a"
+        tag      = " (VSX)" if hit["used_vsx"] else ""
 
         simbad_url = "https://simbad.cds.unistra.fr/simbad/sim-id" f"?Ident={quote(main_id)}"
         msg = QMessageBox(self)
-        msg.setWindowTitle("SIMBAD Lookup")
+        msg.setWindowTitle("SIMBAD/VSX Lookup")
         msg.setText(
-            f"Nearest object:\n"
+            f"Best match{tag}:\n"
             f"  ID:     {main_id}\n"
             f"  Type:   {obj_type}\n"
             f"  V mag:  {vmag_str}\n"
-            f"  Offset: {offset:.2f}″"
+            f"  Offset: {off_str}"
         )
         open_btn = msg.addButton("Open in SIMBAD", QMessageBox.ButtonRole.ActionRole)
         ok_btn   = msg.addButton(QMessageBox.StandardButton.Ok)
@@ -2779,34 +2957,150 @@ class ExoPlanetWindow(QDialog):
         if msg.clickedButton() == open_btn:
             webbrowser.open(simbad_url)
 
+    # ---- UI: Find Star by name ----------------------------------------
+    #
+    # David's request #1: instead of star-hopping from WIMI to locate a
+    # named target, let the user type the name.  We resolve via SIMBAD,
+    #sasproject through the WCS, and single-select the closest detected
+    # star in the list (which triggers the existing overlay highlight and
+    # light-curve redraw).  Tolerance is generous — max(2·median FWHM,
+    # 10″) — to cover slight WCS residuals; if nothing detected is close
+    # enough we report the resolved pixel so the user can see whether SEP
+    # dropped it (faint, on the border, saturated).
+
+    def on_find_star_by_name(self):
+        if not self.star_positions:
+            QMessageBox.warning(
+                self, "Find Star",
+                "Run photometry first so there are detected stars to search among."
+            )
+            return
+        if self._wcs is None:
+            QMessageBox.warning(
+                self, "Find Star",
+                "No WCS available — plate-solve during photometry first."
+            )
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "Find Star by Name",
+            "Enter a SIMBAD-resolvable name\n"
+            "(e.g. V336 Aps, HD 12345, TYC 9256-617-1, Gaia DR3 …):",
+            QLineEdit.EchoMode.Normal, ""
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        # 1) resolve name -> RA/Dec via SIMBAD
+        tbl = None
+        for attempt in range(1, 4):
+            try:
+                custom = Simbad(); custom.reset_votable_fields()
+                tbl = custom.query_object(name)
+                break
+            except Exception as e:
+                print(f"[DEBUG] SIMBAD name resolve attempt {attempt} failed: {e}")
+                if attempt == 3:
+                    QMessageBox.critical(
+                        self, "SIMBAD Error",
+                        f"Could not reach SIMBAD after 3 tries:\n{e}"
+                    )
+                    return
+                non_blocking_sleep(1)
+        if tbl is None or len(tbl) == 0:
+            QMessageBox.information(
+                self, "Not Found",
+                f"SIMBAD didn't resolve “{name}”.\n"
+                "Try a fuller catalog form (e.g. “V* V336 Aps”, “TYC 9256-617-1”)."
+            )
+            return
+
+        try:
+            ra_col  = next(c for c in tbl.colnames if c.lower() == "ra")
+            dec_col = next(c for c in tbl.colnames if c.lower() == "dec")
+        except StopIteration:
+            QMessageBox.warning(self, "Find Star", "SIMBAD response missing RA/Dec columns.")
+            return
+        try:
+            ra_deg  = float(tbl[0][ra_col])
+            dec_deg = float(tbl[0][dec_col])
+        except (TypeError, ValueError):
+            # Older astroquery returns sexagesimal strings
+            try:
+                sc = SkyCoord(str(tbl[0][ra_col]), str(tbl[0][dec_col]),
+                              unit=(u.hourangle, u.deg), frame="icrs")
+                ra_deg  = float(sc.ra.deg)
+                dec_deg = float(sc.dec.deg)
+            except Exception as e:
+                QMessageBox.warning(self, "Find Star",
+                                    f"Couldn't parse RA/Dec from SIMBAD response:\n{e}")
+                return
+
+        # 2) sky -> detector pixel coordinates
+        sky = SkyCoord(ra=ra_deg*u.deg, dec=dec_deg*u.deg, frame="icrs")
+        try:
+            xw, yw = self._wcs.world_to_pixel(sky)
+            xw = float(xw); yw = float(yw)
+        except Exception as e:
+            QMessageBox.warning(self, "Find Star", f"WCS reverse projection failed:\n{e}")
+            return
+
+        bin_factor = getattr(self, "_wcs_bin_factor", 1) or 1
+        xd = xw / bin_factor
+        yd = yw / bin_factor
+
+        # 3) find nearest detected star
+        xs = np.array([p[0] for p in self.star_positions], dtype=float)
+        ys = np.array([p[1] for p in self.star_positions], dtype=float)
+        d = np.hypot(xs - xd, ys - yd)
+        i_near = int(np.argmin(d))
+        d_near = float(d[i_near])
+
+        # tolerance: max(2·median FWHM in detector px, 10″/px converted, 6px floor)
+        tol_px = max(2.0 * float(self.median_fwhm or 3.0), 6.0)
+        try:
+            from astropy.wcs.utils import proj_plane_pixel_scales
+            scales = proj_plane_pixel_scales(self._wcs) * 3600.0  # deg -> arcsec
+            px_scale = float(np.mean(scales)) / float(bin_factor)
+            if px_scale > 0:
+                tol_px = max(tol_px, 10.0 / px_scale)
+        except Exception:
+            pass
+
+        if d_near > tol_px:
+            QMessageBox.information(
+                self, "Find Star",
+                f"“{name}” resolves to RA/Dec ({ra_deg:.6f}, {dec_deg:.6f})\n"
+                f"= detector pixel ({xd:.1f}, {yd:.1f}), but the closest\n"
+                f"detected star (#{i_near}) is {d_near:.1f} px away — beyond\n"
+                f"the {tol_px:.1f} px tolerance.\n\n"
+                "The star may have been rejected by SEP (too faint / near\n"
+                "the border) or the frame doesn't cover it."
+            )
+            return
+
+        # 4) single-select the matching list item and scroll into view
+        for row in range(self.star_list.count()):
+            it = self.star_list.item(row)
+            if int(it.data(Qt.ItemDataRole.UserRole)) == i_near:
+                self.star_list.clearSelection()
+                self.star_list.setCurrentItem(it)
+                self.star_list.scrollToItem(
+                    it, QAbstractItemView.ScrollHint.PositionAtCenter
+                )
+                break
+
     def _query_simbad_main_id(self):
+        """Kept for API compatibility (called by export_to_aavso).  Now
+        thin — the real work is in _resolve_target_name_row."""
         radec = self.get_selected_star_radec()
         if radec is None:
             return None
-        coord = SkyCoord(ra=radec[0]*u.deg, dec=radec[1]*u.deg, frame="icrs")
-        table = None
-        for attempt in range(1, 6):
-            try:
-                custom = Simbad(); custom.reset_votable_fields()
-                custom.add_votable_fields("otype"); custom.add_votable_fields("flux(V)")
-                table = custom.query_region(coord, radius=5*u.arcsec)
-                break
-            except Exception as e:
-                print(f"[DEBUG] SIMBAD lookup attempt {attempt} failed: {e}")
-                if attempt == 5:
-                    QMessageBox.critical(self, "SIMBAD Error", f"Could not reach SIMBAD after 5 tries:\n{e}")
-                    return None
-                non_blocking_sleep(1)
-        if table is None or len(table) == 0:
+        hit = self._resolve_target_name_row(radec[0], radec[1], radius_arcsec=15.0)
+        if hit is None:
             return None
-        try:
-            id_col = next(c for c in table.colnames if c.lower() == "main_id")
-        except StopIteration:
-            return None
-        val = table[0][id_col]
-        if isinstance(val, bytes):
-            val = val.decode("utf-8")
-        return val
+        return hit["main_id"]
 
     def _query_simbad_name_and_vmag(self, ra_deg, dec_deg, radius=5*u.arcsec):
         coord = SkyCoord(ra=ra_deg*u.deg, dec=dec_deg*u.deg, frame="icrs")
@@ -2931,6 +3225,709 @@ class ExoPlanetWindow(QDialog):
         alt_rad = np.deg2rad(np.clip(alt_deg, 0.1, 90.0))
         return 1.0 / np.sin(alt_rad)
 
+    # ------------------------------------------------------------------
+    # Per-channel (R/G/B) supplementary aperture photometry for OSC inputs
+    # ------------------------------------------------------------------
+    def _run_multiband_photometry(self, xs, ys, keep_mask=None):
+        """Second-pass aperture photometry, done per channel on color inputs.
+
+        Uses the SAME star positions and a single global aperture derived
+        from self.median_fwhm (per-star aperture variation is small and
+        multi-band photometry is about capturing color, not aperture
+        optimization).  Sets self.raw_flux_rgb / self.raw_flux_err_rgb
+        shaped (3, n_stars, n_frames).  For mono inputs, or if anything
+        fails, both attributes are set to None and the exporter falls
+        through to the existing single-band path.
+        """
+        import sep
+        from astropy.stats import sigma_clipped_stats
+
+        self.raw_flux_rgb     = None
+        self.raw_flux_err_rgb = None
+
+        images = getattr(self, "_cached_images", None) or []
+        if not images:
+            return
+        # Any frame with three planes counts as color for this dataset.
+        is_color = any(getattr(im, "ndim", 2) == 3 and im.shape[2] >= 3 for im in images)
+        if not is_color:
+            return
+
+        n_frames = len(images)
+        # Use the SAME post-filter positions as self.star_positions.
+        try:
+            xs_a = np.asarray(xs, dtype=np.float64)
+            ys_a = np.asarray(ys, dtype=np.float64)
+        except Exception:
+            return
+        n_stars = int(xs_a.size)
+        if n_stars <= 0:
+            return
+
+        fwhm = float(self.median_fwhm) if self.median_fwhm else 3.0
+        fwhm = max(1.5, fwhm)
+        r_ap  = float(max(2.5, 1.5 * fwhm))
+        r_in  = float(max(r_ap + 1.0, 3.0 * fwhm))
+        r_out = float(max(r_in + 2.0, 5.0 * fwhm))
+        ap_area  = math.pi * r_ap * r_ap
+        ann_area = math.pi * (r_out * r_out - r_in * r_in)
+
+        raw_flux_rgb     = np.full((3, n_stars, n_frames), np.nan, dtype=np.float32)
+        raw_flux_err_rgb = np.full((3, n_stars, n_frames), np.nan, dtype=np.float32)
+
+        prev_status = self.status_label.text() if hasattr(self, "status_label") else ""
+        try:
+            if hasattr(self, "status_label"):
+                self.status_label.setText("Per-channel photometry (R/G/B)…")
+            if hasattr(self, "progress_bar"):
+                self.progress_bar.setMaximum(n_frames)
+                self.progress_bar.setValue(0)
+
+            xs_c = np.ascontiguousarray(xs_a.astype(np.float64, copy=False))
+            ys_c = np.ascontiguousarray(ys_a.astype(np.float64, copy=False))
+
+            for t, img in enumerate(images):
+                if img is None or getattr(img, "ndim", 2) != 3 or img.shape[2] < 3:
+                    continue  # frame is mono in an otherwise-color set; leave NaN
+                for c in range(3):
+                    plane = np.ascontiguousarray(
+                        np.asarray(img[..., c], dtype=np.float32, order="C")
+                    )
+                    try:
+                        _, med, _ = sigma_clipped_stats(plane)
+                        zeroed = plane - float(med)
+                        bkg    = sep.Background(zeroed)
+                        rmsmap = np.ascontiguousarray(bkg.rms().astype(np.float32, copy=False))
+                        ds     = np.ascontiguousarray((zeroed - bkg.back()).astype(np.float32, copy=False))
+                    except Exception:
+                        continue
+
+                    try:
+                        f_ap, f_err, _ = sep.sum_circle(ds, xs_c, ys_c, r_ap,
+                                                        err=rmsmap, gain=1.0)
+                        ann_flux, ann_err, _ = sep.sum_circann(ds, xs_c, ys_c, r_in, r_out,
+                                                               err=rmsmap)
+                    except Exception:
+                        continue
+
+                    sky_per_pix = ann_flux / max(ann_area, 1.0)
+                    net = f_ap - sky_per_pix * ap_area
+                    # variance = aperture_err^2 + sky_subtraction_err^2
+                    sky_err_contrib = ann_err * (ap_area / max(ann_area, 1.0))
+                    with np.errstate(invalid="ignore"):
+                        err = np.sqrt(np.maximum(f_err ** 2 + sky_err_contrib ** 2, 0.0))
+
+                    raw_flux_rgb[c, :, t]     = net.astype(np.float32, copy=False)
+                    raw_flux_err_rgb[c, :, t] = err.astype(np.float32, copy=False)
+
+                if hasattr(self, "progress_bar") and (t % 4 == 0 or t == n_frames - 1):
+                    self.progress_bar.setValue(t + 1)
+        finally:
+            if hasattr(self, "status_label"):
+                self.status_label.setText(prev_status or "Ready")
+
+        # Only publish if at least ONE channel got a finite measurement
+        # somewhere (guards against a broken color pass yielding all-NaN).
+        if np.any(np.isfinite(raw_flux_rgb)):
+            self.raw_flux_rgb     = raw_flux_rgb
+            self.raw_flux_err_rgb = raw_flux_err_rgb
+
+    # ------------------------------------------------------------------
+    # Per-channel comparison-star catalog mags (extends the V-only helper).
+    # Returns {member_index: {"V": float|None, "B": float|None, "R": float|None,
+    #                         "R_is_sloan": bool, "source": str}}
+    # ------------------------------------------------------------------
+    def _catalog_bvr_mags_for_members(self, members, wcs):
+        """Fetch Johnson B, V and an R-band anchor (Cousins Rc if available,
+        else Sloan r') for as many ensemble members as possible.  Same
+        3-tier resolution as _catalog_vmags_for_members: MagTool cache →
+        APASS DR9 → UCAC4.  R_is_sloan flags when the R value is really
+        Sloan r' (for AAVSO NOTES honesty)."""
+        import numpy as _np
+        out = {}
+        members = [int(m) for m in members if 0 <= int(m) < len(self.star_positions)]
+        if not members:
+            return out
+        try:
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+        except Exception:
+            return out
+
+        bf = getattr(self, "_wcs_bin_factor", 1)
+        mras, mdecs, mkeys = [], [], []
+        for m in members:
+            try:
+                x, y = self.star_positions[m]
+                sky = wcs.pixel_to_world(x * bf, y * bf)
+                mras.append(float(sky.ra.deg))
+                mdecs.append(float(sky.dec.deg))
+                mkeys.append(m)
+            except Exception:
+                continue
+        if not mkeys:
+            return out
+        member_sc = SkyCoord(_np.asarray(mras) * u.deg, _np.asarray(mdecs) * u.deg)
+        TOL = 3.0 * u.arcsec
+
+        def _to_float_nan(arr):
+            try:
+                mm = _np.ma.masked_invalid(_np.ma.asarray(arr, dtype=float))
+                return _np.ma.filled(mm, _np.nan)
+            except Exception:
+                return _np.array([_np.nan if v is None else float(v) for v in arr],
+                                 dtype=float)
+
+        def _apply_catalog(cat_ra, cat_dec, cat_v, cat_b, cat_r, r_is_sloan, source):
+            cra = _to_float_nan(cat_ra); cde = _to_float_nan(cat_dec)
+            cv  = _to_float_nan(cat_v);  cb  = _to_float_nan(cat_b); cr = _to_float_nan(cat_r)
+            good = _np.isfinite(cra) & _np.isfinite(cde) & (
+                _np.isfinite(cv) | _np.isfinite(cb) | _np.isfinite(cr)
+            )
+            if not _np.any(good):
+                return
+            cat_sc = SkyCoord(cra[good] * u.deg, cde[good] * u.deg)
+            cv, cb, cr = cv[good], cb[good], cr[good]
+            todo = [i for i, m in enumerate(mkeys) if m not in out]
+            if not todo:
+                return
+            try:
+                idx_cat, sep2d, _ = member_sc[todo].match_to_catalog_sky(cat_sc)
+            except Exception:
+                return
+            for t, ic, sp in zip(todo, _np.atleast_1d(idx_cat), _np.atleast_1d(sep2d)):
+                if sp <= TOL:
+                    i = int(ic)
+                    entry = {
+                        "V": (float(cv[i]) if _np.isfinite(cv[i]) else None),
+                        "B": (float(cb[i]) if _np.isfinite(cb[i]) else None),
+                        "R": (float(cr[i]) if _np.isfinite(cr[i]) else None),
+                        "R_is_sloan": bool(r_is_sloan),
+                        "source": source,
+                    }
+                    # Only accept if at least one of V/B/R survived
+                    if entry["V"] is not None or entry["B"] is not None or entry["R"] is not None:
+                        out[mkeys[t]] = entry
+
+        # 1) Magnitude tool's cached catalog (no network) — expect V (± B/R)
+        try:
+            from setiastro.saspro.plate_solver import _active_doc_from_parent
+            doc = _active_doc_from_parent(self.parent())
+            meta = getattr(doc, "metadata", {}) or {}
+            cat = meta.get("SFCC_star_list") or []
+            if cat:
+                _apply_catalog(
+                    [c.get("ra") for c in cat],
+                    [c.get("dec") for c in cat],
+                    [c.get("Vmag") for c in cat],
+                    [c.get("Bmag") for c in cat],
+                    [c.get("Rmag") for c in cat],
+                    r_is_sloan=False, source="MagTool",
+                )
+        except Exception:
+            pass
+
+        def _cone():
+            c0 = SkyCoord(_np.mean(mras) * u.deg, _np.mean(mdecs) * u.deg)
+            rad = c0.separation(member_sc).max() * 1.15 + 30 * u.arcsec
+            return c0, rad
+
+        # 2) APASS DR9 — Vmag, Bmag, r'mag (Sloan) → R proxy
+        if any(m not in out for m in mkeys):
+            try:
+                from astroquery.vizier import Vizier
+                c0, rad = _cone()
+                vz = Vizier(columns=["RAJ2000", "DEJ2000", "Vmag", "Bmag", "r_mag", "r\'mag"],
+                            row_limit=50000)
+                res = vz.query_region(c0, radius=rad, catalog="II/336/apass9")
+                if res:
+                    tbl = res[0]
+                    # APASS r'-band column is spelled differently across astroquery
+                    # versions ("r_mag", "r'mag", or "rmag") — try each.
+                    r_col = None
+                    for cand in ("r_mag", "r'mag", "rmag", "rpmag"):
+                        if cand in tbl.colnames:
+                            r_col = cand; break
+                    rvals = tbl[r_col] if r_col else [None] * len(tbl)
+                    _apply_catalog(
+                        tbl["RAJ2000"], tbl["DEJ2000"],
+                        tbl["Vmag"], tbl["Bmag"], rvals,
+                        r_is_sloan=True, source="APASS9",
+                    )
+            except Exception:
+                pass
+
+        # 3) UCAC4 — Vmag (APASS-derived), Bmag, rmag (Sloan) → R proxy
+        if any(m not in out for m in mkeys):
+            try:
+                from astroquery.vizier import Vizier
+                c0, rad = _cone()
+                vz = Vizier(columns=["RAJ2000", "DEJ2000", "Vmag", "Bmag", "rmag"],
+                            row_limit=50000)
+                res = vz.query_region(c0, radius=rad, catalog="I/322A/out")
+                if res:
+                    tbl = res[0]
+                    r_col = "rmag" if "rmag" in tbl.colnames else None
+                    rvals = tbl[r_col] if r_col else [None] * len(tbl)
+                    _apply_catalog(
+                        tbl["RAJ2000"], tbl["DEJ2000"],
+                        tbl["Vmag"], tbl["Bmag"], rvals,
+                        r_is_sloan=True, source="UCAC4",
+                    )
+            except Exception:
+                pass
+
+        return out
+
+    # ------------------------------------------------------------------
+    # Multi-band AAVSO export path (TB + TG + TR interleaved in one file).
+    # ------------------------------------------------------------------
+    def _export_aavso_multiband(self, idx):
+        """AAVSO Extended export using per-channel raw fluxes.  Reuses
+        photometry_aavso.build_rgb_rows + format_aavso_extended for the
+        row/file plumbing so both tools stay in sync.  Falls back to
+        single-comparison calibration on a per-channel basis when the
+        catalog can't cover that band."""
+        wcs = self._wcs
+        if wcs is None:
+            QMessageBox.warning(self, "Export AAVSO", "No WCS available.")
+            return
+        if self.raw_flux_rgb is None or self.raw_flux_err_rgb is None:
+            QMessageBox.warning(self, "Export AAVSO",
+                                "No per-channel photometry available.")
+            return
+
+        # -- STARID ---------------------------------------------------------
+        star_id = self._query_simbad_main_id()
+        if star_id:
+            try:
+                Vizier.ROW_LIMIT = 1
+                v = Vizier(columns=["Name"], catalog="B/vsx")
+                tbls = v.query_object(star_id)
+                if tbls and len(tbls) > 0 and len(tbls[0]) > 0:
+                    star_id = tbls[0]["Name"][0]
+            except Exception as e:
+                print(f"[DEBUG] VSX lookup failed: {e}")
+        star_id, ok = QInputDialog.getText(
+            self, "Target Star Name",
+            "AAVSO STARID for this target:",
+            QLineEdit.EchoMode.Normal, star_id or ""
+        )
+        if not ok or not star_id.strip():
+            return
+        star_id = star_id.strip()
+
+        # -- Observer code + systematic floor -------------------------------
+        settings = QSettings()
+        prev_code = settings.value("AAVSO/observer_code", "", type=str)
+        code, ok = QInputDialog.getText(
+            self, "Observer Code", "Enter your AAVSO observer code:",
+            QLineEdit.EchoMode.Normal, prev_code
+        )
+        if not ok:
+            return
+        code = code.strip().upper()
+        settings.setValue("AAVSO/observer_code", code)
+
+        prev_floor = float(settings.value("AAVSO/sys_floor_mag", 0.10, type=float))
+        sys_floor, ok = QInputDialog.getDouble(
+            self, "Systematic Floor",
+            "Systematic error floor (mag) added in quadrature to MERR.\n"
+            "  0.10 = defensive default;  0.05 ≈ PixInsight;  0.00 disables.",
+            value=prev_floor, min=0.00, max=0.30, decimals=3
+        )
+        if not ok:
+            return
+        settings.setValue("AAVSO/sys_floor_mag", sys_floor)
+
+        # -- Ensemble members & check star ---------------------------------
+        raw_members = self.ensemble_map.get(idx, [])
+        members     = [m for m in raw_members if 0 <= m < len(self.star_positions)]
+
+        # Check star: auto-identify from the ensemble (first with SIMBAD V).
+        kname = None; k_idx = None; kstar_catalog = None
+        for m in members:
+            x, y = self.star_positions[m]
+            bf = getattr(self, "_wcs_bin_factor", 1)
+            sky = wcs.pixel_to_world(x * bf, y * bf)
+            name, v = self._query_simbad_name_and_vmag(sky.ra.deg, sky.dec.deg)
+            if name and (v is not None) and np.isfinite(v):
+                kname, k_idx = name, m
+                kstar_catalog = {"Vmag": float(v), "Bmag": None, "Rmag": None}
+                break
+        if kname is None:
+            kname, ok = QInputDialog.getText(
+                self, "Check Star Name",
+                "Could not auto-identify a check star. Enter check-star ID:"
+            )
+            if not ok or not kname.strip():
+                return
+            kname = kname.strip()
+            k_idx, ok = QInputDialog.getInt(
+                self, "Check Star",
+                "Enter the list index (#) of the check star used for calibration:",
+                0, 0, max(0, len(self.star_positions) - 1)
+            )
+            if not ok:
+                return
+            kstar_catalog = {"Vmag": None, "Bmag": None, "Rmag": None}
+
+        # Per-channel KMAGs: use catalog for check star, then fill missing.
+        kmags = aav.check_star_kmags(kstar_catalog)   # {"R":..,"G":..,"B":..}
+        #sasprompt default = V-mag when we have it. Better than 0 (which
+        # gives MAG=0-ish outputs if the user hits OK without editing —
+        # David saw exactly this on TB/TR for V336 Aps). For most stars
+        # V is within a magnitude or so of B and R, so if the user
+        # doesn't know the exact value, V is a defensible fallback.
+        for ch, prompt_label in (("B", "B"), ("G", "V (green anchor)"), ("R", "R")):
+            if kmags.get(ch) is None:
+                _v_default = float(kmags.get("G") or 0.0)
+                _has_v_hint = kmags.get("G") is not None
+                _hint = (
+                    f"\n\nDefaulted to V-mag ({_v_default:.3f}) as a plausible"
+                    f"\nfallback. Edit for accuracy or Cancel to skip this band."
+                    if _has_v_hint else
+                    "\n\nCancel to skip this band."
+                )
+                val, ok = QInputDialog.getDouble(
+                    self, f"Check-Star {prompt_label} Magnitude",
+                    f"Catalog {prompt_label} magnitude for {kname}\n"
+                    f"(needed to calibrate the {aav.RGB_FILTER_MAP[ch][0]} channel)."
+                    f"{_hint}",
+                    value=(kmags.get("G") if kmags.get("G") is not None else 0.0),
+                    min=-5.0, max=30.0, decimals=3
+                )
+                if ok:
+                    kmags[ch] = float(val)
+                else:
+                    kmags[ch] = None
+
+        # -- File path -----------------------------------------------------
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save AAVSO File (multi-band)", "",
+            "Text files (*.txt *.dat *.csv)"
+        )
+        if not path:
+            return
+
+        # -- Per-channel ensemble ZP or single-comparison fallback ---------
+        # Broadened comp pool: every detected star EXCEPT the target,
+        # the check star, and anything flagged as variable / dip. This
+        # is David0944's msg-6 suggestion — the tight ensemble_map[idx]
+        # (nearest-flux neighbors, K≈8) is too small to reliably clear
+        # the ≥3-catalog-mag bar for the ensemble tier. A bigger pool
+        # gets us more comps with catalog mags; MAD clipping downstream
+        # still removes outliers.
+        _all_indices = list(range(len(self.star_positions)))
+        _flagged     = getattr(self, "flagged_stars", None) or set()
+        comp_members = [m for m in _all_indices
+                        if m != idx and m != k_idx and m not in _flagged]
+        cmap = self._catalog_bvr_mags_for_members(comp_members, wcs)
+
+        LOGC = 2.5 / np.log(10.0)
+        floor = float(sys_floor or 0.0)
+        n_frames = int(self.raw_flux_rgb.shape[2])
+        jd = self.times.utc.jd
+
+        # For each channel produce (mags[n_frames], merr[n_frames], notes).
+        # RGB_FILTER_MAP: R→("TR","R"), G→("TG","V"), B→("TB","B")
+        per_ch = {}
+        used_comps = set()   # comp indices that actually formed the ensemble/comparison
+        r_note_extra = ""
+        # Detect if any comp's R is Sloan-derived; a single flag on the note
+        # is honest enough for AAVSO's NOTES field.
+        if any(v.get("R") is not None and v.get("R_is_sloan") for v in cmap.values()):
+            r_note_extra = "; R anchor = Sloan r' (APASS/UCAC)"
+
+        for ch in ("B", "G", "R"):
+            filt, band_key = aav.RGB_FILTER_MAP[ch]
+            ci = {"R": 0, "G": 1, "B": 2}[ch]     # numpy channel index
+            F_T    = self.raw_flux_rgb[ci, idx, :].astype(np.float64)
+            Ferr_T = self.raw_flux_err_rgb[ci, idx, :].astype(np.float64)
+
+            comp_idx_all = np.array(
+                [m for m in comp_members if m in cmap and cmap[m].get(band_key) is not None],
+                dtype=int
+            )
+            comp_mag = np.array(
+                [cmap[m][band_key] for m in comp_idx_all], dtype=float
+            )
+
+            if comp_idx_all.size >= 3:
+                Fi  = self.raw_flux_rgb[ci, comp_idx_all, :].astype(np.float64)
+                okF = np.isfinite(Fi) & (Fi > 0)
+                zi  = np.where(okF,
+                               comp_mag[:, None] + 2.5 * np.log10(np.where(okF, Fi, 1.0)),
+                               np.nan)
+                # robust MAD-based sigma-clip stars on run-median ZP.
+                # std is inflated by the outliers we're trying to catch;
+                # MAD isn't, so a comp star with a wrong catalog mag now
+                # actually gets clipped instead of masquerading as normal
+                # scatter. Floor sigma at 0.05 mag so tight ensembles
+                # don't over-clip themselves down to one star.
+                z_star = np.nanmedian(zi, axis=1)
+                keepC  = np.isfinite(z_star)
+                for _ in range(3):
+                    if not np.any(keepC):
+                        break
+                    med  = np.nanmedian(z_star[keepC])
+                    mad  = np.nanmedian(np.abs(z_star[keepC] - med))
+                    sd_r = max(1.4826 * float(mad), 0.05)
+                    if not np.isfinite(sd_r) or sd_r == 0:
+                        break
+                    prev_keep = keepC.copy()
+                    keepC &= np.abs(z_star - med) <= 3.0 * sd_r
+                    if np.array_equal(keepC, prev_keep):
+                        break  # converged; no point re-computing MAD
+                zi = zi[keepC, :]
+                ZP_t  = np.nanmedian(zi, axis=0)
+                n_t   = np.sum(np.isfinite(zi), axis=0)
+                madz  = np.nanmedian(np.abs(zi - ZP_t[None, :]), axis=0)
+                SEM_t = np.where(n_t > 1, 1.4826 * madz / np.sqrt(np.maximum(n_t, 1)), np.nan)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    mags = -2.5 * np.log10(F_T) + ZP_t
+                    merr = np.sqrt((LOGC * Ferr_T / F_T) ** 2
+                                   + np.nan_to_num(SEM_t) ** 2 + floor ** 2)
+                bad = ~np.isfinite(mags) | (F_T <= 0) | (n_t < 1)
+                n_ens = int(np.count_nonzero(keepC))
+                note = (f"{filt}: ensemble ZP N={n_ens} vs catalog {band_key}"
+                        f"; err incl SEM+{floor:.2f}floor")
+                if ch == "R" and r_note_extra:
+                    note += r_note_extra
+                # AAVSO ENSEMBLE requires a check star, and for ensemble the
+                # KMAG field is that star's magnitude standardised through the
+                # SAME ensemble ZP (not its catalog value, not a raw
+                # instrumental mag). Compute K exactly like the target so a data
+                # user can diff it against the catalog value as a quality check.
+                used_comps.update(int(m) for m in comp_idx_all[keepC])
+                F_K = self.raw_flux_rgb[ci, k_idx, :].astype(np.float64)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    _K = -2.5 * np.log10(F_K) + ZP_t
+                _K = _K[np.isfinite(_K)]
+                cname_ch = "ENSEMBLE"
+                cmag_ch  = "na"
+                kname_ch = kname
+                kmag_ch  = float(np.median(_K)) if _K.size else "na"
+            elif comp_idx_all.size >= 1:
+                # tier 2: single-comparison vs a comp-member with catalog mag
+                # in this band. Prefer the brightest (highest median flux) —
+                # best SNR, most stable ZP anchor. This tier exists because
+                # the previous code fell straight through to the check star,
+                # which is the wrong role for photometric anchoring AND is
+                # empty in the ensemble=1 case where the sole ensemble
+                # member is also the check star.
+                _c_meds = np.array(
+                    [np.nanmedian(self.raw_flux_rgb[ci, int(mm), :])
+                     for mm in comp_idx_all], dtype=float
+                )
+                _c_local = int(np.argmax(np.nan_to_num(_c_meds, nan=-np.inf)))
+                c_idx = int(comp_idx_all[_c_local])
+                c_mag = float(comp_mag[_c_local])
+                F_C    = self.raw_flux_rgb[ci, c_idx, :].astype(np.float64)
+                Ferr_C = self.raw_flux_err_rgb[ci, c_idx, :].astype(np.float64)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    mags  = c_mag - 2.5 * np.log10(F_T / F_C)
+                    frac2 = (Ferr_T / F_T) ** 2 + (Ferr_C / F_C) ** 2
+                    merr  = np.sqrt((LOGC ** 2) * frac2 + floor ** 2)
+                bad = ~np.isfinite(mags) | (F_T <= 0) | (F_C <= 0)
+                note = (f"{filt}: single-comparison vs member #{c_idx} "
+                        f"({band_key}={c_mag:.3f}); err incl {floor:.2f}floor")
+                if ch == "R" and r_note_extra:
+                    note += r_note_extra
+                # NOT an ensemble: classic differential photometry, so CNAME is
+                # the comparison and CMAG/KMAG are raw INSTRUMENTAL mags (target
+                # standardised to the comp's catalog mag). Keep the independent
+                # check star in KNAME/KMAG.
+                used_comps.add(int(c_idx))
+                F_K = self.raw_flux_rgb[ci, k_idx, :].astype(np.float64)
+                _fc = float(np.nanmedian(F_C[F_C > 0])) if np.any(F_C > 0) else np.nan
+                _fk = float(np.nanmedian(F_K[F_K > 0])) if np.any(F_K > 0) else np.nan
+                cname_ch = f"C{int(c_idx)}"
+                cmag_ch  = float(-2.5 * np.log10(_fc)) if np.isfinite(_fc) else "na"
+                kname_ch = kname
+                kmag_ch  = float(-2.5 * np.log10(_fk)) if np.isfinite(_fk) else "na"
+            elif kmags.get(ch) is not None:
+                # tier 3 (last resort): calibrate against the CHECK STAR
+                # itself. Only lands here when zero comp-members have a
+                # catalog mag in this band. Not ideal (the check star is
+                # meant for verification, not anchoring) but better than
+                # skipping the band entirely.
+                F_C    = self.raw_flux_rgb[ci, k_idx, :].astype(np.float64)
+                Ferr_C = self.raw_flux_err_rgb[ci, k_idx, :].astype(np.float64)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    mags  = kmags[ch] - 2.5 * np.log10(F_T / F_C)
+                    frac2 = (Ferr_T / F_T) ** 2 + (Ferr_C / F_C) ** 2
+                    merr  = np.sqrt((LOGC ** 2) * frac2 + floor ** 2)
+                bad = ~np.isfinite(mags) | (F_T <= 0) | (F_C <= 0)
+                note = (f"{filt}: check-star fallback vs {kname}"
+                        f"; err incl {floor:.2f}floor")
+                # Degenerate: the check star is doubling as the comparison, so
+                # it can't also be an independent check — CNAME=check with its
+                # instrumental CMAG, and KNAME/KMAG left as na.
+                _fc = float(np.nanmedian(F_C[F_C > 0])) if np.any(F_C > 0) else np.nan
+                cname_ch = str(kname)
+                cmag_ch  = float(-2.5 * np.log10(_fc)) if np.isfinite(_fc) else "na"
+                kname_ch = "na"
+                kmag_ch  = "na"
+            else:
+                # Nothing to calibrate this channel — skip it.
+                per_ch[ch] = None
+                continue
+
+            mags = np.where(bad, np.nan, mags)
+            merr = np.where(bad | ~np.isfinite(merr), np.nan, merr)
+            per_ch[ch] = (mags, merr, note, cname_ch, cmag_ch, kname_ch, kmag_ch)
+
+        if not any(v is not None for v in per_ch.values()):
+            QMessageBox.warning(
+                self, "Export AAVSO",
+                "None of the R/G/B channels could be calibrated — no catalog\n"
+                "comparison stars and no check-star magnitude for any band."
+            )
+            return
+
+        # AAVSO asks that the comps forming an ensemble be identified in NOTES.
+        # We have no AUIDs for arbitrary field stars, so list their RA/Dec (ICRS
+        # deg) — enough for a data user to recover which stars set the zero
+        # point. Capped so a large ensemble doesn't blow past NOTES length.
+        def _radec_label(mi):
+            try:
+                x, y = self.star_positions[int(mi)]
+                bf = getattr(self, "_wcs_bin_factor", 1)
+                sky = wcs.pixel_to_world(x * bf, y * bf)
+                return f"{sky.ra.deg:.4f}{sky.dec.deg:+.4f}"
+            except Exception:
+                return None
+        _ids = [s for s in (_radec_label(m) for m in sorted(used_comps)) if s]
+        _MAX_IDS = 10
+        if not _ids:
+            comps_note = ""
+        elif len(_ids) > _MAX_IDS:
+            comps_note = ("comps[RA/Dec]: " + ", ".join(_ids[:_MAX_IDS])
+                          + f", +{len(_ids) - _MAX_IDS} more")
+        else:
+            comps_note = "comps[RA/Dec]: " + ", ".join(_ids)
+
+        # -- Assemble AavsoRow list frame-by-frame -------------------------
+        # Track per-band skip reasons so the summary popup can tell the
+        # user *why* certain bands didn't make it into the file. AAVSO
+        # Extended Format requires MERR ≤ 1.0 — a single over-limit row
+        # gets the whole file rejected at upload, so we drop them here.
+        rows = []
+        _skipped_by_filt = {}
+        _na_by_filt      = {}
+        _skip_reasons = set()
+        _MERR_MAX = 1.0
+        for j, t in enumerate(jd):
+            frame_mags = {}; frame_merrs = {}
+            frame_cnames = {}; frame_cmags = {}
+            frame_knames = {}; frame_kmags = {}
+            for ch in ("B", "G", "R"):
+                pc = per_ch.get(ch)
+                if pc is None:
+                    continue
+                filt_lbl = aav.RGB_FILTER_MAP[ch][0]
+                m = float(pc[0][j]); e = float(pc[1][j])
+                if not np.isfinite(m):
+                    # No MAG to report — drop the row entirely.
+                    _skipped_by_filt[filt_lbl] = _skipped_by_filt.get(filt_lbl, 0) + 1
+                    _skip_reasons.add("non-finite MAG")
+                    continue
+                # Per-band comparison identity (tier-dependent: ENSEMBLE vs single).
+                frame_cnames[ch] = pc[3]
+                frame_cmags[ch]  = pc[4]
+                frame_knames[ch] = pc[5]
+                frame_kmags[ch]  = pc[6]
+                if not np.isfinite(e) or e > _MERR_MAX:
+                    # MAG is real but MERR is out of AAVSO range; emit
+                    # the row with MERR=na (David msg-6 request) rather
+                    # than dropping the observation.
+                    _na_by_filt[filt_lbl] = _na_by_filt.get(filt_lbl, 0) + 1
+                    frame_mags[ch]  = m
+                    frame_merrs[ch] = None
+                    continue
+                frame_mags[ch]  = m
+                frame_merrs[ch] = e
+            if not frame_mags:
+                continue
+            am = float(np.clip(self.airmasses[j] if j < len(self.airmasses) else 1.0, 1.0, 40.0))
+            # Per-frame notes: combine per-channel notes for the bands that
+            # actually landed this frame, then append the comp identifiers once.
+            note_bits = [per_ch[ch][2] for ch in ("B", "G", "R")
+                         if per_ch.get(ch) is not None and ch in frame_mags]
+            frame_note = " | ".join(note_bits)
+            if comps_note:
+                frame_note = f"{frame_note} || {comps_note}" if frame_note else comps_note
+            new_rows = aav.build_rgb_rows(
+                name=star_id, date_jd=float(t),
+                mags=frame_mags, merrs=frame_merrs, amass=am,
+                cnames=frame_cnames, cmags=frame_cmags,
+                knames=frame_knames, kmags=frame_kmags,
+                notes=frame_note,
+            )
+            rows.extend(new_rows)
+
+        if not rows:
+            QMessageBox.warning(
+                self, "Export AAVSO",
+                "No frames produced a finite calibrated magnitude in any band."
+            )
+            return
+
+        # -- #RA / #DEC come from the selected star's WCS position ---------
+        radec = self.get_selected_star_radec()
+        if radec is None:
+            QMessageBox.warning(self, "Export AAVSO",
+                                "Could not determine RA/Dec of selected star.")
+            return
+
+        try:
+            body = aav.format_aavso_extended(rows, obscode=code,
+                                             ra_deg=radec[0], dec_deg=radec[1])
+            with open(path, "w") as f:
+                f.write(body)
+        except Exception as e:
+            QMessageBox.critical(self, "Export AAVSO", f"Failed to write file:\n{e}")
+            return
+
+        n_by_filt = {}
+        for r in rows:
+            n_by_filt[r.filt] = n_by_filt.get(r.filt, 0) + 1
+        breakdown = ", ".join(f"{k}:{v}" for k, v in sorted(n_by_filt.items()))
+
+        # summary of skipped-per-band (row dropped entirely — non-finite MAG)
+        # and emitted-with-MERR=na (per David msg 6 — MAG kept, error unknown)
+        _skip_lines = []
+        if _skipped_by_filt:
+            _skip_breakdown = ", ".join(
+                f"{k}:{v}" for k, v in sorted(_skipped_by_filt.items())
+            )
+            _reason_txt = "; ".join(sorted(_skip_reasons)) if _skip_reasons else "invalid"
+            _skip_lines.append(f"Skipped: {_skip_breakdown}  ({_reason_txt})")
+
+        # summary of emitted-with-MERR=na (per David msg 6)
+        if _na_by_filt:
+            _na_breakdown = ", ".join(
+                f"{k}:{v}" for k, v in sorted(_na_by_filt.items())
+            )
+            _skip_lines.append(
+                f"MERR=na: {_na_breakdown}  (row kept but MERR exceeded {_MERR_MAX:.1f})"
+            )
+
+        _body = f"Wrote {len(rows)} row(s) → {path}\n\nBy filter: {breakdown}"
+        for _ln in _skip_lines:
+            _body += f"\n{_ln}"
+        _body += "\n\nOpen AAVSO WebObs upload page now?"
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Export AAVSO")
+        msg.setText(_body)
+        yes = msg.addButton("Yes", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("No", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+        if msg.clickedButton() == yes:
+            webbrowser.open("https://www.aavso.org/webobs/file")
+
     def _catalog_vmags_for_members(self, members, wcs):
         """Return {member_index: (Vmag, source)} for as many ensemble members as
         we can attach a Johnson V catalog magnitude to. Tries, in order:
@@ -3046,6 +4043,20 @@ class ExoPlanetWindow(QDialog):
             return
         idx = sels[0].data(Qt.ItemDataRole.UserRole)
 
+        # Offer a multi-band (TB+TG+TR) export when color photometry is on hand.
+        if getattr(self, "raw_flux_rgb", None) is not None:
+            reply = QMessageBox.question(
+                self, "Multi-Band Export",
+                "Color (R/G/B) photometry is available for this dataset.\n\n"
+                "Export as multi-band AAVSO (TB + TG + TR)?\n"
+                "  Yes  → one file with interleaved TB/TG/TR rows\n"
+                "  No   → single-band export (choose one filter code)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                return self._export_aavso_multiband(idx)
+
         star_id = self._query_simbad_main_id()
         if star_id:
             try:
@@ -3106,9 +4117,36 @@ class ExoPlanetWindow(QDialog):
             if not ok:
                 return
 
-        filt_choices = ["V","TG","TB","TR"]
-        filt, ok = QInputDialog.getItem(self, "Filter", "Select filter code for this dataset:", filt_choices, 0, False)
+        # Full AAVSO Extended Format band table, grouped for readability.
+        # Persist the last-used code so common workflows don't have to
+        # re-scroll every export.
+        filt_choices = [
+            # Johnson–Cousins
+            "V", "B", "U", "R", "I", "RC", "IC",
+            # DSLR / OSC tri-color
+            "TG", "TB", "TR", "TI",
+            # Unfiltered CCD (reduced to a Johnson band)
+            "CV", "CR", "CBB", "CM",
+            # Sloan
+            "SU", "SG", "SR", "SI", "SZ",
+            # Near-IR / other
+            "J", "H", "K", "Y", "ZS",
+            # Narrowband / misc
+            "HA", "HAC", "MA", "MI", "MB", "O",
+        ]
+        prev_filt   = settings.value("AAVSO/last_filter", "V", type=str)
+        default_idx = filt_choices.index(prev_filt) if prev_filt in filt_choices else 0
+        filt, ok = QInputDialog.getItem(
+            self, "Filter",
+            "Select AAVSO filter code for this dataset:\n"
+            "  V/B/U/R/I — Johnson–Cousins\n"
+            "  TG/TB/TR/TI — DSLR / OSC tri-color channels\n"
+            "  CV/CR/CBB/CM — unfiltered CCD reduced to V/R\n"
+            "  SU..SZ — Sloan; HA/HAC — H-alpha; J/H/K — near-IR",
+            filt_choices, default_idx, False
+        )
         if not ok: return
+        settings.setValue("AAVSO/last_filter", filt)
 
         path, _ = QFileDialog.getSaveFileName(self, "Save AAVSO File", "", "Text files (*.txt *.dat *.csv)")
         if not path: return
@@ -3149,7 +4187,15 @@ class ExoPlanetWindow(QDialog):
         # own color, so the star-to-star scatter (hence SEM) reflects real
         # calibration spread, which is why we sigma-clip the comp set and keep a
         # systematic floor in quadrature rather than trusting SEM alone.
-        comp_members = [m for m in members if m != k_idx]
+        # Broadened comp pool (single-band): every detected star EXCEPT
+        # the target, the check star, and anything flagged as variable.
+        # See exo_v336_features.py for rationale — bigger pool → more
+        # catalog-mag comps → higher chance of clearing the ≥3 bar for
+        # ensemble ZP.
+        _all_indices = list(range(len(self.star_positions)))
+        _flagged     = getattr(self, "flagged_stars", None) or set()
+        comp_members = [m for m in _all_indices
+                        if m != idx and m != k_idx and m not in _flagged]
         vmap = self._catalog_vmags_for_members(comp_members, wcs)   # {idx: (V, source)}
         comp_idx = np.array([m for m in comp_members if m in vmap], dtype=int)
         comp_mag = np.array([vmap[m][0] for m in comp_idx], dtype=float)
@@ -3159,21 +4205,50 @@ class ExoPlanetWindow(QDialog):
         F_T    = np.asarray(self.raw_flux[idx, :],     dtype=np.float64)
         Ferr_T = np.asarray(self.raw_flux_err[idx, :], dtype=np.float64)
 
+        def _comp_radec_labels(members, maxn=10):
+            """RA/Dec (ICRS deg) labels for the comps that set the ZP, for NOTES."""
+            w = self._wcs
+            bf = getattr(self, "_wcs_bin_factor", 1)
+            out = []
+            for mi in members:
+                try:
+                    x, y = self.star_positions[int(mi)]
+                    sky = w.pixel_to_world(x * bf, y * bf)
+                    out.append(f"{sky.ra.deg:.4f}{sky.dec.deg:+.4f}")
+                except Exception:
+                    pass
+            if not out:
+                return ""
+            if len(out) > maxn:
+                return ", ".join(out[:maxn]) + f", +{len(out) - maxn} more"
+            return ", ".join(out)
+
         if comp_idx.size >= 3:
             Fi  = np.asarray(self.raw_flux[comp_idx, :], dtype=np.float64)   # (Ncomp, Nframe)
             okF = np.isfinite(Fi) & (Fi > 0)
             zi  = np.where(okF, comp_mag[:, None] + 2.5 * np.log10(np.where(okF, Fi, 1.0)), np.nan)
 
-            # choose a stable comparison set ONCE (sigma-clip on each star's run-median ZP)
+            # choose a stable comparison set ONCE — robust MAD-based
+            # sigma-clip on each star's run-median ZP. std is inflated by
+            # the outliers we're trying to catch; MAD isn't, so a comp
+            # star with a wrong catalog mag now actually gets clipped
+            # instead of masquerading as normal scatter. Floor sigma at
+            # 0.05 mag so tight ensembles don't over-clip themselves down
+            # to one star.
             z_star = np.nanmedian(zi, axis=1)
             keepC  = np.isfinite(z_star)
             for _ in range(3):
                 if not np.any(keepC):
                     break
-                med = np.nanmedian(z_star[keepC]); sd = np.nanstd(z_star[keepC])
-                if not np.isfinite(sd) or sd == 0:
+                med  = np.nanmedian(z_star[keepC])
+                mad  = np.nanmedian(np.abs(z_star[keepC] - med))
+                sd_r = max(1.4826 * float(mad), 0.05)
+                if not np.isfinite(sd_r) or sd_r == 0:
                     break
-                keepC &= np.abs(z_star - med) <= 3.0 * sd
+                prev_keep = keepC.copy()
+                keepC &= np.abs(z_star - med) <= 3.0 * sd_r
+                if np.array_equal(keepC, prev_keep):
+                    break  # converged; no point re-computing MAD
             zi = zi[keepC, :]
 
             ZP_t  = np.nanmedian(zi, axis=0)
@@ -3188,11 +4263,23 @@ class ExoPlanetWindow(QDialog):
             bad = ~np.isfinite(mags) | (F_T <= 0) | (n_t < 1)
 
             n_ens       = int(np.count_nonzero(keepC))
+            # AAVSO ENSEMBLE: KMAG is the check star standardised through the
+            # SAME ensemble ZP (not its catalog mag), so (K - catalog) is a real
+            # quality check. Compute K exactly like the target.
+            F_K = np.asarray(self.raw_flux[k_idx, :], dtype=np.float64)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                _K = -2.5 * np.log10(F_K) + ZP_t
+            _K = _K[np.isfinite(_K)]
+            _used = [int(m) for m in comp_idx[keepC]]
             cname_field = "ENSEMBLE"
             cmag_field  = "na"
             kname_field = kname
-            kmag_field  = f"{kmag:.3f}"
-            note_field  = f"ensemble ZP=median(Vcat+2.5log10 F) N={n_ens}; err incl SEM+{floor:.2f}floor"
+            kmag_field  = f"{float(np.median(_K)):.3f}" if _K.size else "na"
+            note_field  = (f"ensemble ZP=median(Vcat+2.5log10 F) N={n_ens}; "
+                           f"err incl SEM+{floor:.2f}floor")
+            _cn = _comp_radec_labels(_used)
+            if _cn:
+                note_field += f"; comps[RA/Dec]: {_cn}"
         else:
             # Fallback: single-comparison vs the check star, raw-flux ratio.
             F_C    = np.asarray(self.raw_flux[k_idx, :],     dtype=np.float64)
@@ -3203,8 +4290,12 @@ class ExoPlanetWindow(QDialog):
                 merr  = np.sqrt((LOGC ** 2) * frac2 + floor ** 2)
             bad = ~np.isfinite(mags) | (F_T <= 0) | (F_C <= 0)
 
-            cname_field = kname
-            cmag_field  = f"{kmag:.3f}"
+            # Check star doubling as the comparison → CMAG is its INSTRUMENTAL
+            # mag (classic differential); no independent check remains.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                _fc = float(np.nanmedian(F_C[F_C > 0])) if np.any(F_C > 0) else np.nan
+            cname_field = str(kname)
+            cmag_field  = f"{-2.5 * np.log10(_fc):.3f}" if np.isfinite(_fc) else "na"
             kname_field = "na"
             kmag_field  = "na"
             note_field  = f"single-comparison vs {kname}; err incl {floor:.2f} floor"
@@ -3212,6 +4303,9 @@ class ExoPlanetWindow(QDialog):
         mags = np.where(bad, np.nan, mags)
         merr = np.where(bad | ~np.isfinite(merr), np.nan, merr)
 
+        _MERR_MAX = 1.0
+        _rows_written = 0
+        _na_count     = 0
         try:
             with open(path, "w") as f:
                 for L in header_lines:
@@ -3220,7 +4314,15 @@ class ExoPlanetWindow(QDialog):
                     m = mags[j]; me = merr[j]
                     if not np.isfinite(m):
                         continue  # no valid calibrated magnitude for this frame
-                    me_str = f"{me:.3f}" if np.isfinite(me) else "na"
+                    # AAVSO Extended requires MERR ≤ 1.0 or the literal
+                    # "na". Downgrade out-of-range values to "na" (David
+                    # msg-6 request) rather than let WebObs reject the
+                    # whole file at upload.
+                    if np.isfinite(me) and me <= _MERR_MAX:
+                        me_str = f"{me:.3f}"
+                    else:
+                        me_str = "na"
+                        _na_count += 1  # single-band MERR-out-of-range → emit na
                     am = float(np.clip(self.airmasses[j] if j < len(self.airmasses) else 1.0, 1.0, 40.0))
                     fields = [
                         star_id,
@@ -3237,16 +4339,23 @@ class ExoPlanetWindow(QDialog):
                         f"{am:.1f}",
                         "na",
                         "na",
-                        note_field,
+                        note_field.replace(",", ";"),
                     ]
                     f.write(",".join(fields) + "\n")
+                    _rows_written += 1
         except Exception as e:
             QMessageBox.critical(self, "Export AAVSO", f"Failed to write file:\n{e}")
             return
 
+        _body = f"Wrote {fmt} ({_rows_written} row(s)) →\n{path}"
+        if _na_count > 0:
+            _body += (f"\n\nMERR=na for {_na_count} row(s) "
+                      f"(computed error > {_MERR_MAX:.1f}).")
+        _body += "\n\nOpen AAVSO WebObs upload page now?"
+
         msg = QMessageBox(self)
         msg.setWindowTitle("Export AAVSO")
-        msg.setText(f"Wrote {fmt} →\n{path}\n\nOpen AAVSO WebObs upload page now?")
+        msg.setText(_body)
         yes = msg.addButton("Yes", QMessageBox.ButtonRole.AcceptRole)
         msg.addButton("No", QMessageBox.ButtonRole.RejectRole)
         msg.exec()

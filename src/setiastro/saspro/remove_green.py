@@ -1,4 +1,4 @@
-# pro/remove_green.py
+#saspro/remove_green.py
 from __future__ import annotations
 import numpy as np
 
@@ -17,6 +17,7 @@ from setiastro.saspro.widgets.image_utils import (
     to_float01 as _to_float01,
     extract_mask_from_document as _active_mask_array_from_doc
 )
+from setiastro.saspro.help_support import make_help_button
 
 def _ensure_rgb(arr: np.ndarray) -> np.ndarray | None:
     """Return float32 RGB [0..1] or None if impossible."""
@@ -185,6 +186,13 @@ def remove_green_headless(
     step_label = f"SCNR (Remove {_CHANNEL_LABELS[ch]})"
     meta = {
         "step_name": step_label,
+        "command_id": "remove_green",
+        "preset": {
+            "amount": amt,
+            "mode": mode,
+            "preserve_lightness": bool(preserve_lightness),
+            "channel": ch,
+        },
         "remove_green": {
             "amount": amt,
             "mode": mode,
@@ -302,8 +310,11 @@ class RemoveGreenDialog(QDialog):
                 parent=self,
             )
             drag_row.addWidget(self.preset_drag_handle)
+            self.btn_help = make_help_button("remove_green", self)
             drag_row.addStretch(1)
+            drag_row.addWidget(self.btn_help)
             lay.addLayout(drag_row)
+            
         except Exception:
             pass
 

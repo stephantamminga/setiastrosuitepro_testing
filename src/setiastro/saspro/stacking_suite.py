@@ -1,4 +1,4 @@
-#pro.stacking_suite.py
+#saspro.stacking_suite.py
 from __future__ import annotations
 import os
 import glob
@@ -24,6 +24,7 @@ import psutil          # used in bytes_available / compute_safe_chunk
 from typing import List
 from setiastro.saspro.legacy.numba_utils import *
 from setiastro.saspro.debayer import debayer_array
+from setiastro.saspro.help_support import make_help_button
 
 # Memory management utilities
 from setiastro.saspro.memory_utils import (
@@ -35,10 +36,10 @@ from setiastro.saspro.bayer_utils import effective_bayer_from_header
 
 from PyQt6.QtCore import Qt, QTimer, QSettings, pyqtSignal, QObject, pyqtSlot, QThread, QEvent, QPoint, QSize, QEventLoop, QCoreApplication, QRectF, QPointF, QMetaObject
 from PyQt6.QtGui import QIcon, QImage, QPixmap, QAction, QIntValidator, QDoubleValidator, QFontMetrics, QTextCursor, QPalette, QPainter, QPen, QTransform, QColor, QBrush, QCursor
-from PyQt6.QtWidgets import (QDialog, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QLineEdit, QTreeWidget, QHeaderView, QTreeWidgetItem, QProgressBar, QProgressDialog,
+from PyQt6.QtWidgets import (QDialog, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QLineEdit, QTreeWidget, QHeaderView, QTreeWidgetItem, QProgressBar, QProgressDialog,
                              QFormLayout, QDialogButtonBox, QToolBar, QToolButton, QFileDialog, QTabWidget, QAbstractItemView, QSpinBox, QDoubleSpinBox, QGroupBox,QRadioButton,
                              QSizePolicy, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QApplication, QScrollArea, QTextEdit, QMenu, QPlainTextEdit, QGraphicsEllipseItem,
-                             QMessageBox, QSlider, QCheckBox, QInputDialog, QComboBox, QFrame, QSplitter)
+                             QMessageBox, QSlider, QCheckBox, QInputDialog, QComboBox, QFrame, QSplitter, QInputDialog)
 
 
 
@@ -97,8 +98,19 @@ from setiastro.saspro.legacy.numba_utils import (
     gradient_descent_to_dim_spot_numba
 )
 from setiastro.saspro.legacy.image_manager import load_image, save_image, get_valid_header
+from setiastro.saspro.calibration_io import write_calibrated_fast, MasterCache, StageTimer
 from setiastro.saspro.star_alignment import StarRegistrationWorker, StarRegistrationThread, IDENTITY_2x3
 from setiastro.saspro.log_bus import LogBus
+from setiastro.saspro.stacking_calibrated_scan import (
+    CALIBRATED_EXTS,
+    CalibratedMeta,
+    CalibratedMetaCache,
+    list_folder_entries,
+    read_calibrated_metas,
+    read_fits_headers,
+    start_background_read,
+    stat_entry,
+)
 from setiastro.saspro import comet_stacking as CS
 #from setiastro.saspro.remove_stars import starnet_starless_from_array, darkstar_starless_from_array
 from setiastro.saspro.mfdeconv import MultiFrameDeconvWorker
@@ -108,13 +120,118 @@ from setiastro.saspro.accel_installer import current_backend
 from setiastro.saspro.accel_workers import AccelInstallWorker
 from setiastro.saspro.runtime_torch import add_runtime_to_sys_path
 from setiastro.saspro.free_torch_memory import _free_torch_memory
+from setiastro.saspro.stacking_gpu_mem import (
+    gpu_flat_cache_key,
+    is_cuda_oom,
+    is_master_flat_key,
+    reap_completed,
+    session_from_manual_keyword,
+    set_name_from_filename_keyword,
+    submit_bounded,
+)
 from setiastro.saspro.torch_rejection import (
     torch_available as _torch_ok,
     gpu_algo_supported as _gpu_algo_supported,
     torch_reduce_tile as _torch_reduce_tile,
+    release_flat_group_ctx as _release_flat_group_ctx,
     _get_torch,
     _safe_inference_ctx as _safe_inference_ctx_impl,
+    # Single-sourced so the numpy reducers below reject identically to the GPU
+    # ones. _rejection_gpu_ok() cross-checks the two paths element for element
+    # and silently demotes the whole integration to CPU on any mismatch, so a
+    # duplicated critical-value table or a different convergence rule is not a
+    # cosmetic difference — it costs the user the GPU.
+    esd_critical_values as _esd_critical_values,
+    _CONVERGENCE_MIN_ITERS,
+    _WINSOR_CONV_TOL,
 )
+
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+class _FramePrefetcher:
+    """Bounded look-ahead loader. Reads the next `lookahead` frames on background
+    threads so disk I/O overlaps the deposit running on the main thread."""
+    def __init__(self, paths, loader, lookahead=3, workers=4):
+        self._loader = loader
+        self._paths = list(paths)
+        self._lookahead = max(1, int(lookahead))
+        self._ex = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+        self._futs = {}
+        self._lock = threading.Lock()
+        self._next = 0
+        for _ in range(self._lookahead):
+            self._submit_next()
+
+    def _submit_next(self):
+        with self._lock:
+            i = self._next
+            if i >= len(self._paths):
+                return
+            self._next += 1
+            p = self._paths[i]
+        if p is not None and p not in self._futs:
+            self._futs[p] = self._ex.submit(self._loader, p)
+
+    def get(self, path):
+        self._submit_next()            # keep the window full
+        if path is None:
+            return None
+        fut = self._futs.pop(path, None)
+        return fut.result() if fut is not None else self._loader(path)
+
+    def close(self):
+        self._ex.shutdown(wait=False, cancel_futures=True)
+
+# --- Rejection-backend correctness gate -----------------------------------
+# Rejection statistics need exact nan-reductions and NaN-preserving device
+# round-trips. CUDA/MPS are reliable; torch-directml is not — its nan reducers
+# and NaN device copies can return wrong-but-nonempty results, which the
+# numel()==0 guard in torch_rejection cannot catch. When that happens a lone
+# satellite trail is mathematically un-rejectable on short stacks and survives
+# into the master. So we probe the REAL reducer against the numpy reference
+# once per session and demote rejection to the (math-identical) CPU kernels on
+# any disagreement. Cached; set _REJ_GPU_VERIFIED = None to force a re-probe.
+_REJ_GPU_VERIFIED = None
+
+def _rejection_gpu_ok(status_cb=None) -> bool:
+    global _REJ_GPU_VERIFIED
+    if _REJ_GPU_VERIFIED is not None:
+        return _REJ_GPU_VERIFIED
+    ok = False
+    try:
+        ts = np.array([100., 101., 99., 100., 5000.], np.float32).reshape(5, 1, 1, 1)
+        w  = np.ones(5, np.float32)
+        out, rej = _torch_reduce_tile(
+            ts, w, algo_name="Weighted Windsorized Sigma Clipping",
+            sigma_low=2.5, sigma_high=2.5, iterations=3,
+        )
+        if hasattr(out, "detach"): out = out.detach().cpu().numpy()
+        if hasattr(rej, "detach"): rej = rej.detach().cpu().numpy()
+        out = np.asarray(out, np.float32).reshape(-1)
+        rej = np.asarray(rej, bool).reshape(5)
+        ref, _ = windsorized_sigma_clip_weighted_np(
+            ts, w, lower=2.5, upper=2.5, iterations=3)
+        ref = np.asarray(ref, np.float32).reshape(-1)
+        # clean survivors -> ~100 (NOT ~1080), and the 5000 MUST be rejected
+        ok = bool(np.isfinite(out).all() and abs(out[0] - ref[0]) < 1.0 and rej[4])
+    except Exception:
+        ok = False
+    _REJ_GPU_VERIFIED = ok
+    if status_cb is not None:
+        try:
+            if ok:
+                status_cb("🧪 Rejection GPU backend passed self-test.")
+            else:
+                be = ""
+                try: be = f" ({current_backend()})"
+                except Exception: pass
+                status_cb(f"⚠️ Rejection GPU backend failed self-test{be} — using CPU "
+                          f"rejection kernels so satellite trails clip correctly.")
+        except Exception:
+            pass
+    return ok
+# --------------------------------------------------------------------------
 
 # Darks are session/date-agnostic. Master darks bucket only by exposure,
 # image size, temperature, gain and offset — never by capture date/session.
@@ -441,7 +558,7 @@ def xisf_fits_header(path: str, image_index: int = 0) -> fits.Header:
 
     return hdr
 
-def get_valid_header(path: str):
+def _get_valid_header_impl(path: str):
     """
     Fast header-only peek with targeted fallback.
 
@@ -584,6 +701,92 @@ def get_valid_header(path: str):
         return None, False
 
 
+def _dwarf_dark_meta_from_name(name):
+    """If `name` looks like a DWARF Labs auto-dark
+    (e.g. 'dark_exp_30.000000_gain_60_bin_1_21C_stack_20.fits'), return the
+    metadata encoded in the filename: {'exptime','gain','binning','temp'}.
+    DWARF auto-darks ship minimal headers, so this is what SASpro backfills to
+    key and match them. Returns {} if it doesn't look like a DWARF dark.
+    Tolerant of '_' / '.' / '-' separators (dark_exp_30 or dark_exp.30)."""
+    import os, re
+    stem = os.path.splitext(os.path.basename(str(name or "")))[0]
+    low = stem.lower()
+    if not low.startswith("dark"):
+        return {}
+    m_exp  = re.search(r"exp[_.\- ]?(\d+(?:\.\d+)?)", low)
+    m_gain = re.search(r"gain[_.\- ]?(\d+)", low)
+    m_bin  = re.search(r"bin[_.\- ]?(\d+)", low)
+    m_temp = re.search(r"[_.\- ](-?\d+(?:\.\d+)?)\s*c(?=[_.\- ]|$)", low)
+    # Require exposure + gain + bin to treat it as a DWARF auto-dark.
+    if not (m_exp and m_gain and m_bin):
+        return {}
+    meta = {}
+    try:
+        meta["exptime"] = float(m_exp.group(1))
+    except Exception:
+        pass
+    try:
+        meta["gain"] = int(m_gain.group(1))
+    except Exception:
+        pass
+    try:
+        meta["binning"] = int(m_bin.group(1))
+    except Exception:
+        pass
+    if m_temp:
+        try:
+            meta["temp"] = float(m_temp.group(1))
+        except Exception:
+            pass
+    return meta
+
+
+def _backfill_dwarf_dark_header(hdr, path):
+    """Fill exposure/gain/binning/temperature on a DWARF auto-dark from its
+    filename when the header omits them. Mutates ONLY the in-memory header
+    (never the file). No-op for anything that isn't a DWARF auto-dark."""
+    dm = _dwarf_dark_meta_from_name(path)
+    if not dm:
+        return
+
+    def _missing(*keys):
+        for k in keys:
+            try:
+                v = hdr.get(k, None)
+            except Exception:
+                v = None
+            if v not in (None, "", "Unknown"):
+                return False
+        return True
+
+    if "exptime" in dm and _missing("EXPTIME", "EXPOSURE"):
+        hdr["EXPTIME"] = dm["exptime"]
+        hdr["EXPOSURE"] = dm["exptime"]
+    if "gain" in dm and _missing("GAIN"):
+        hdr["GAIN"] = dm["gain"]
+    if "binning" in dm:
+        if _missing("XBINNING"):
+            hdr["XBINNING"] = dm["binning"]
+        if _missing("YBINNING"):
+            hdr["YBINNING"] = dm["binning"]
+    if "temp" in dm and _missing("CCD-TEMP", "SET-TEMP", "DET-TEMP"):
+        hdr["CCD-TEMP"] = dm["temp"]
+
+
+def get_valid_header(path: str):
+    """Header-only peek (see _get_valid_header_impl) plus a NON-DESTRUCTIVE
+    backfill for DWARF Labs auto-darks, whose filenames encode exposure / gain /
+    binning / temperature but whose headers are minimal. Only missing keys are
+    filled, and only in the returned in-memory header — the file is untouched."""
+    hdr, ok = _get_valid_header_impl(path)
+    if ok and hdr is not None:
+        try:
+            _backfill_dwarf_dark_header(hdr, path)
+        except Exception:
+            pass
+    return hdr, ok
+
+
 def _read_tile_stack(file_list, y0, y1, x0, x1, channels, out_buf):
     """
     Fill `out_buf` with the tile stack for (y0:y1, x0:x1).
@@ -632,7 +835,7 @@ def _read_tile_stack(file_list, y0, y1, x0, x1, channels, out_buf):
 
         a = np.asarray(a, dtype=np.float32, order="C")
         if not np.isfinite(a).all():
-            np.nan_to_num(a, copy=False, posinf=0.0, neginf=0.0)
+            np.nan_to_num(a, copy=False, nan=np.nan, posinf=0.0, neginf=0.0)  # keep NaN (satellite no-data); scrub only +/-inf
         return a
 
     max_workers = min(N, max(1, (os.cpu_count() or 4)))
@@ -1018,6 +1221,49 @@ def _Luma(img: np.ndarray) -> np.ndarray:
         r, g, b = a[..., 0], a[..., 1], a[..., 2]
         return 0.2126 * r + 0.7152 * g + 0.0722 * b
     return np.squeeze(a, axis=-1).astype(np.float32, copy=False)
+
+# ---------------------------------------------------------------------------
+# NaN carry-through probe (debug). Satellite-trail no-data travels as NaN from
+# calibration through registration into integration; it is invisible unless it
+# silently turns back into 0. Flip NAN_PROBE = True (below) to print
+# per-checkpoint NaN counts to the stacking log.
+# ---------------------------------------------------------------------------
+NAN_PROBE = False   # <-- set True to enable the NaN carry-through probes
+DEBUG_INTEGRATION_ONLY = False   # <-- set True: skip ALL rejection bookkeeping and dump the raw integrated buffer
+
+def _nan_probe_enabled() -> bool:
+    return bool(NAN_PROBE)
+
+def _probe_load_first(path):
+    from setiastro.saspro.legacy.image_manager import _load_nan_ctx
+    _prev = getattr(_load_nan_ctx, "preserve", False)
+    _load_nan_ctx.preserve = True   # read true file contents (NaN no-data)
+    try:
+        d = load_image(path)
+    finally:
+        _load_nan_ctx.preserve = _prev
+    return d[0] if isinstance(d, (list, tuple)) else d
+
+def _nan_probe(tag, arr, log_fn=None, *, force: bool = False) -> None:
+    if not (force or _nan_probe_enabled()):
+        return
+    try:
+        a = np.asarray(arr)
+        n = int(a.size)
+        if a.dtype.kind == "f":
+            nan = int(np.isnan(a).sum()); inf = int(np.isinf(a).sum())
+        else:
+            nan = inf = 0
+        pct = (100.0 * nan / n) if n else 0.0
+        msg = (f"🔎 NaN-probe [{tag}] shape={tuple(a.shape)} dtype={a.dtype} "
+               f"NaN={nan} ({pct:.4f}%) inf={inf}")
+    except Exception as e:
+        msg = f"🔎 NaN-probe [{tag}] error: {e}"
+    try:
+        (log_fn or print)(msg)
+    except Exception:
+        pass
+
 
 def normalize_images(stack: np.ndarray,
                      target_median: float,
@@ -1470,7 +1716,19 @@ def _fit_poly2_on_small(img_small: np.ndarray, pts_small: np.ndarray, patch_size
     for i, (x, y) in enumerate(zip(xs, ys)):
         x0, x1 = max(0, x - half), min(Ws, x + half + 1)
         y0, y1 = max(0, y - half), min(Hs, y + half + 1)
-        z[i] = float(np.median(gray[y0:y1, x0:x1]))
+        _patch = gray[y0:y1, x0:x1]
+        _fin = _patch[np.isfinite(_patch)]
+        z[i] = float(np.median(_fin)) if _fin.size else np.nan
+
+    # Drop samples whose patch was all no-data (NaN). Forced border/corner
+    # anchors bypass the sampler's finite check, so a trail on an edge can still
+    # place a NaN sample here -- if it reached lstsq it would make the entire
+    # polynomial NaN and poison the whole frame. Fit on finite samples only.
+    _good = np.isfinite(z)
+    xs, ys, z = xs[_good], ys[_good], z[_good]
+    if z.size < 6:
+        _fa = gray[np.isfinite(gray)]
+        return np.full((Hs, Ws), float(np.median(_fa)) if _fa.size else 0.0, dtype=np.float32)
 
     A = _build_poly_terms_deg2(xs.astype(np.float32), ys.astype(np.float32))
     coef, *_ = np.linalg.lstsq(A, z, rcond=None)
@@ -1520,10 +1778,15 @@ def remove_poly2_gradient_abe(
 
     # --- Downsample image & optional mask
     img_small = _downsample_area(work, max(1, int(downsample)))
-    mask_small = None
+    # Satellite-trail no-data arrives as NaN (there is no separate exclusion
+    # mask anymore -- the NaN *is* the exclusion). Build a 'keep' mask of finite
+    # pixels so sample points never land in a trail; block-mean downsampling has
+    # already spread each NaN across its block, so this covers the footprint.
+    _lum_small = _to_Luma(img_small) if img_small.ndim == 3 else img_small
+    mask_small = np.isfinite(_lum_small)
     if exclusion_mask is not None:
         em  = _asarray(exclusion_mask, dtype=np.float32)
-        mask_small = _downsample_area(em, max(1, int(downsample))) >= 0.5
+        mask_small &= (_downsample_area(em, max(1, int(downsample))) >= 0.5)
 
     # --- Sample & fit
     ds = max(1, int(downsample))
@@ -1539,31 +1802,47 @@ def remove_poly2_gradient_abe(
     bg_small = _fit_poly2_on_small(img_small, pts_small, patch_size=int(patch_size))
     bg = _upscale_bg(bg_small, H, W)
 
-    # --- Strength check
-    bg_med = float(np.nanmedian(bg)) or 1e-6
-    p5, p95 = np.nanpercentile(bg, 5), np.nanpercentile(bg, 95)
+    # --- Strength check (robust stats on the SMALL background model). bg is a
+    #     smooth poly2 surface upscaled from bg_small, so its median/percentiles
+    #     match -- but a full-res nanpercentile sorts ~61 Mpx per frame. bg_med
+    #     is reused by the divide path below. No processEvents() here: this runs
+    #     in worker threads (Qt-unsafe) and blocks a process-pool move.
+    _bs = np.asarray(bg_small, dtype=np.float32).ravel()
+    _bs = _bs[np.isfinite(_bs)]
+    if _bs.size:
+        bg_med = float(np.median(_bs)) or 1e-6
+        p5, p95 = float(np.percentile(_bs, 5)), float(np.percentile(_bs, 95))
+    else:
+        bg_med, p5, p95 = 1e-6, 0.0, 0.0
     rel_amp = float((p95 - p5) / max(bg_med, 1e-6))
     if log_fn:
         log_fn(f"ABE poly2: samples={num_samples}, ds={downsample}, patch={patch_size} | "
                f"bg_med={bg_med:.6f}, rel_amp={rel_amp*100:.2f}%")
-    QApplication.processEvents()    
     if rel_amp < float(min_strength):
         # Return original image in original layout
         return img
 
     # --- Apply (luma-only fit, channel-consistent apply)
+    # Re-centering medians on a strided subsample: a background median is
+    # statistically identical from every 4th pixel but ~16x cheaper than a
+    # full-res nanmedian sort (the dominant per-frame cost). NaN-safe.
+    def _bg_med_sub(a):
+        s = a[::4, ::4]
+        s = s[np.isfinite(s)]
+        return (float(np.median(s)) if s.size else 0.0) or 1e-6
+
     def _apply_sub(ch):  # re-center to preserve median
-        med0 = float(np.nanmedian(ch)) or 1e-6
+        med0 = _bg_med_sub(ch)
         out = ch - bg
-        med1 = float(np.nanmedian(out)) or 1e-6
+        med1 = _bg_med_sub(out)
         out += (med0 - med1)
         return out
 
     def _apply_div(ch):
-        med0 = float(np.nanmedian(ch)) or 1e-6
+        med0 = _bg_med_sub(ch)
         norm_bg = np.clip(bg / bg_med, gain_clip[0], gain_clip[1])
         out = ch / norm_bg
-        med1 = float(np.nanmedian(out)) or 1e-6
+        med1 = _bg_med_sub(out)
         out *= (med0 / med1)
         return out
 
@@ -1705,7 +1984,19 @@ def remove_gradient_stack_abe(stack, target_hw: tuple[int,int] | None = None, **
     ref = arr[0]
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as ex:
+    # Physical-cores-minus-2 workers (headroom for GUI + I/O), capped at N. The
+    # per-frame work releases the GIL (cv2 / numpy / numba) so threads scale;
+    # pin cv2 to 1 thread per call so N workers don't each fan out and thrash.
+    try:
+        import psutil as _ps
+        _phys = int(_ps.cpu_count(logical=False) or (os.cpu_count() or 4))
+    except Exception:
+        _phys = int(os.cpu_count() or 4)
+    _n_workers = max(1, min(int(N), _phys - 2))
+    import cv2 as _cv2abe
+    _prev_cv2_threads = _cv2abe.getNumThreads()
+    _cv2abe.setNumThreads(1)
+    with ThreadPoolExecutor(max_workers=_n_workers) as ex:
         futs = {}
         for i in range(N):
             img = arr[i]
@@ -1735,6 +2026,7 @@ def remove_gradient_stack_abe(stack, target_hw: tuple[int,int] | None = None, **
 
             out[i_] = res.astype(out.dtype, copy=False)
 
+    _cv2abe.setNumThreads(_prev_cv2_threads)   # restore global cv2 thread count
     return out
 
 def load_fits_tile(filepath, y_start, y_end, x_start, x_end):
@@ -2387,69 +2679,148 @@ def bytes_available():
     return int(vm.available * 0.9)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# ROW-BAND PROCESSING
+# ──────────────────────────────────────────────────────────────────────────
+# Integration no longer walks a 2D tile grid. A narrow (e.g. 256-wide) tile is
+# scattered on disk: one image row is contiguous, so a 256-wide tile is 256
+# discontiguous ~1 KB fragments per frame. That scatter is invisible on a slow
+# GPU (compute hides it) but starves a fast one — it drains the prefetch queue
+# and idles waiting on the reads. Instead we process FULL-WIDTH horizontal
+# bands (band_rows × image_width). A band is one contiguous run per frame, so
+# reads are sequential and OS read-ahead keeps even a 4090 fed.
+#
+# The only user knob is the band height ("Rows" in Settings); width is always
+# the image width. _BAND_MAX_PIXELS bounds band AREA so a very wide sensor (or
+# a large Rows value) can't build a band big enough to bog down the per-pixel
+# sort kernels in the rejection reducers — empirically bands past a few MPx
+# choke every GPU, the same way 2048×2048 tiles did.
+_BAND_MAX_PIXELS = 2_000_000          # safety ceiling on band_rows * width
+_PREFETCH_POOL_GUESS = 8              # ~PREFETCH_DEPTH+1 buffers in flight
+# Default band height (full-width rows). 16 keeps per-band pixel load close to
+# the old, proven 256x256 tile (~65 KPx), so it won't regress any GPU; raise to
+# 32/64 to trade more per-band GPU work for fewer, fatter passes. One knob.
+_DEFAULT_BAND_ROWS = 16
+# One-time settings migrations. Bump this when a stored value needs a forced
+# reset on next launch; the current bump (0 -> 1) re-homes the pre-band
+# chunk_height (a TILE height like 256/512/2048) onto a safe band height.
+_STACKING_SCHEMA_VERSION = 1
+
+def _band_shape(pref_rows, height, width):
+    """Resolve a full-width band shape.
+
+    Bands are ALWAYS the full image width; only the row count is tunable. The
+    requested pref_rows is clamped to the image height and to the compute-safety
+    pixel cap (_BAND_MAX_PIXELS). Returns (band_rows, image_width) so it is a
+    drop-in for the old (chunk_h, chunk_w) tuple — every downstream
+    `for x0 in range(0, width, chunk_w)` then yields a single full-width column.
+    """
+    width  = int(max(1, width))
+    height = int(max(1, height))
+    rows   = int(max(1, pref_rows))
+    cap_rows = max(1, _BAND_MAX_PIXELS // width)   # keep rows*width <= cap
+    rows = max(1, min(rows, height, cap_rows))
+    return rows, width
+
 def compute_safe_chunk(height, width, N, channels, dtype, pref_h, pref_w):
-    vm    = psutil.virtual_memory()
-    avail = vm.free * 0.9
-    bpe64 = np.dtype(dtype).itemsize      # 8 bytes
-    workers = os.cpu_count() or 1
+    """ROW-BAND MODE. pref_w is ignored — the band is always the full image
+    width. pref_h is the requested band height (the "Rows" setting); we shrink
+    it to fit host RAM for the prefetch buffer pool, then clamp via _band_shape
+    (image height + compute pixel cap). Returns (band_rows, image_width)."""
+    vm       = psutil.virtual_memory()
+    avail    = vm.free * 0.9
+    itemsize = np.dtype(dtype).itemsize
+    workers  = os.cpu_count() or 1
 
-    # budget *all* float64 copies (master + per-thread)
-    bytes_per_pixel = (N + workers) * channels * bpe64 / 2
-    max_pixels      = int(avail // bytes_per_pixel)
-    if max_pixels < 1:
-        raise MemoryError("Not enough RAM for even a 1×1 tile")
+    # Host-RAM cost of ONE full-width row across the working set: a handful of
+    # prefetch buffers (N frames each) plus per-thread scratch, counted at the
+    # integration dtype so we stay safe even when callers use float64.
+    pool          = N * _PREFETCH_POOL_GUESS + workers
+    bytes_per_row = max(1, pool * channels * itemsize * int(max(1, width)))
 
-    raw_side = int(math.sqrt(max_pixels))
-    # **shrink by √workers to be super-safe**
-    fudge    = int(math.sqrt(workers)) or 1
-    safe_side = max(1, raw_side // fudge)
+    ram_rows = int(avail // bytes_per_row)
+    if ram_rows < 1:
+        ram_rows = 1                      # _band_shape floors to 1 full-width row
 
-    # clamp to user prefs and image dims
-    ch = min(pref_h, height, safe_side)
-    cw = min(pref_w, width,  safe_side)
-
-    # final area clamp
-    if ch * cw > max_pixels // fudge**2:
-        # extra safety: adjust cw so area ≤ max_pixels/fudge²
-        cw = max(1, (max_pixels // (fudge**2)) // ch)
-
-    if ch < 1 or cw < 1:
-        raise MemoryError(f"Chunk too small after fudge: {ch}×{cw}")
-
-    return ch, cw
+    rows = min(int(pref_h), ram_rows)
+    return _band_shape(rows, height, width)
 
 def compute_safe_chunk_low_ram(height, width, N, channels, dtype, pref_h, pref_w):
-    """
-    Chunk budget for low-RAM seek mode.
-    Only needs to fit (N, th, tw, C) × 4 bytes in available RAM —
-    no full-file mappings held simultaneously.
-    """
+    """ROW-BAND MODE, low-RAM seek reader.
+
+    Same full-width-band contract as compute_safe_chunk. The seek reader holds
+    only a single (N, rows, width, C) stack buffer plus a little output headroom
+    (no simultaneous full-file mappings), so the row budget is looser. pref_w is
+    ignored; the band is always the full image width. Returns
+    (band_rows, image_width)."""
     vm    = psutil.virtual_memory()
     avail = int(vm.available * 0.75)
-    bpe   = 4  # float32 always
+    bpe   = 4  # float32 always in the seek path
 
-    # Stack buffer: N frames × th × tw × C × 4 bytes
-    # Plus 2× output headroom
-    bytes_per_tile_pixel = (N * channels + 2 * channels) * bpe
-    max_pixels = max(1, avail // bytes_per_tile_pixel)
+    bytes_per_row = max(1, (N * channels + 2 * channels) * bpe * int(max(1, width)))
+    ram_rows      = max(1, int(avail // bytes_per_row))
 
-    ch = min(pref_h, height)
-    cw = min(pref_w, width)
+    rows = min(int(pref_h), ram_rows)
+    return _band_shape(rows, height, width)
 
-    while ch > 1 and cw > 1 and ch * cw > max_pixels:
-        if ch >= cw:
-            ch = max(1, ch // 2)
-        else:
-            cw = max(1, cw // 2)
+# ──────────────────────────────────────────────────────────────────────────
+# Disk-space estimation helpers (pre-flight checks for calibration / register /
+# integrate so the user is warned before a run is likely to fill the drive).
+# ──────────────────────────────────────────────────────────────────────────
 
-    ch = max(1, min(ch, height))
-    cw = max(1, min(cw, width))
+# Padding added per output file to cover the FITS header + 2880-byte block
+# rounding + any small sidecars. Negligible per frame, but keeps the estimate
+# from being systematically low on large frame counts.
+_FITS_HEADER_PAD_BYTES = 16 * 1024
 
-    if ch * cw < 1:
-        raise MemoryError(
-            f"Not enough RAM for even a 1×1 tile (N={N}, C={channels})"
-        )
-    return ch, cw
+
+def _human_bytes(n) -> str:
+    """Human-readable base-1024 byte count, e.g. 1536 -> '1.50 KB'."""
+    try:
+        n = float(n)
+    except Exception:
+        return "?"
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if n < 1024.0 or unit == "PB":
+            if unit == "B":
+                return f"{sign}{int(n)} {unit}"
+            return f"{sign}{n:.2f} {unit}"
+        n /= 1024.0
+    return f"{sign}{n:.2f} PB"
+
+
+def _disk_free_bytes(path):
+    """
+    Free bytes on the volume that will hold `path`.
+
+    Walks up to the nearest existing directory so it works even when the
+    output subfolder hasn't been created yet. Returns None if it can't be
+    determined (never raises).
+    """
+    try:
+        p = os.path.abspath(path or ".")
+        while p and not os.path.isdir(p):
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        if not p or not os.path.isdir(p):
+            return None
+        return int(shutil.disk_usage(p).free)
+    except Exception:
+        return None
+
+
+def _frame_out_bytes(h, w, channels, itemsize=4) -> int:
+    """Estimated on-disk size of one float32 FITS frame of the given geometry."""
+    try:
+        px = max(0, int(round(h))) * max(0, int(round(w))) * max(1, int(channels))
+        return px * int(itemsize) + _FITS_HEADER_PAD_BYTES
+    except Exception:
+        return 0
+
 
 _DIM_RE = re.compile(r"\s*\(\d+\s*x\s*\d+\)\s*")
 
@@ -3041,14 +3412,31 @@ def _np_winsorized_center_scale(ts, valid, iterations=3, winsor_k=1.5):
         med = _np_nanmedian_low(x)
         sigma = np.maximum(1.4826 * _np_nanmedian_low(np.abs(x - med[None])), 1e-10)
         cnt = np.maximum(valid.sum(axis=0), 1).astype(np.float32)
-        for _ in range(max(1, int(iterations))):
+        n_it = max(1, int(iterations))
+        # Same convergence rule and gate as the GPU path (see
+        # torch_rejection._winsorized_center_scale): stop once sigma moves by
+        # less than 0.05% relative, but only arm the check for deep iteration
+        # counts. The gate exists for the GPU's sake -- the test needs a device
+        # sync that stalls the tile pipeline -- and is applied here too so the
+        # two reducers iterate exactly the same number of times and
+        # _rejection_gpu_ok() cannot see a spurious mismatch.
+        check_conv = n_it >= _CONVERGENCE_MIN_ITERS
+        for it in range(n_it):
             lo = med - winsor_k * sigma
             hi = med + winsor_k * sigma
             xw = np.clip(x, lo[None], hi[None])       # NaN stays NaN
             med = _np_nanmedian_low(xw)
             mean_w = np.where(valid, xw, 0.0).sum(axis=0) / cnt
             var = np.where(valid, (xw - mean_w[None]) ** 2, 0.0).sum(axis=0) / cnt
-            sigma = np.maximum(1.134 * np.sqrt(np.maximum(var, 0.0)), 1e-10)
+            sigma_new = np.maximum(1.134 * np.sqrt(np.maximum(var, 0.0)), 1e-10)
+
+            if check_conv and it + 1 < n_it:
+                rel = np.max(np.abs(sigma_new - sigma) / np.maximum(sigma, 1e-10))
+                sigma = sigma_new
+                if float(rel) < _WINSOR_CONV_TOL:
+                    break
+            else:
+                sigma = sigma_new
     return med, sigma
 
 
@@ -3070,50 +3458,63 @@ def kappa_sigma_clip_weighted_np(ts, weights, kappa=2.5, iterations=3):
     ts, w, valid, was_3d = _rej_prepare(ts, weights)
     keep = valid.copy()
     with np.errstate(all="ignore"):
-        for _ in range(max(1, int(iterations))):
+        # `var` is measured about the MEDIAN, not the mean of the kept sample.
+        # Deliberate, and matches PixInsight: center and scale stay anchored to
+        # the same robust statistic, so a surviving outlier cannot pull the
+        # center and shrink the apparent spread at once. Mirrored in the GPU
+        # branch -- do not "fix" one without the other.
+        n_it = max(1, int(iterations))
+        check_conv = n_it >= _CONVERGENCE_MIN_ITERS
+        for it in range(n_it):
             x_iter = np.where(keep, ts, np.nan)
             med = _np_nanmedian_low(x_iter)
             n = np.maximum(keep.sum(axis=0), 1).astype(np.float32)
             var = np.where(keep, (ts - med[None]) ** 2, 0.0).sum(axis=0) / n
             std = np.maximum(np.sqrt(np.maximum(var, 0.0)), 1e-12)
-            keep &= (ts >= (med - float(kappa) * std)[None]) \
-                  & (ts <= (med + float(kappa) * std)[None])
+            keep_new = keep & (ts >= (med - float(kappa) * std)[None]) \
+                            & (ts <= (med + float(kappa) * std)[None])
+
+            # Exact fixed-point exit: an iteration that rejects nothing leaves
+            # the kept set, and therefore med/std and the bounds, unchanged --
+            # every later iteration would also reject nothing. Gated identically
+            # to the GPU branch so both run the same number of passes.
+            if check_conv and it + 1 < n_it:
+                changed = bool(np.any(keep_new != keep))
+                keep = keep_new
+                if not changed:
+                    break
+            else:
+                keep = keep_new
         x = np.where(valid, ts, np.nan)
         fallback = np.nan_to_num(_np_nanmedian_low(x), nan=0.0)
         out = _np_weighted_mean_or(ts, keep, w, fallback)
     return _rej_finish(out, ~keep, was_3d)
 
 
-def esd_clip_weighted_np(ts, weights, threshold=3.0):
+def esd_clip_weighted_np(ts, weights, threshold=3.0, esd_bonferroni=False):
     """
     Generalized ESD (Rosner), externally studentized, vectorized per pixel.
     Sequentially removes the most extreme remaining value and tests it
     against the leave-one-out mean/std of the remaining sample (defeats
     masking); no early stop — the outlier count is the largest step whose
-    test passed. Critical values are t-quantiles at df = n-2 mapped from the
-    user's z-style threshold, so 'threshold' keeps its literal 'sigmas'
-    meaning on large stacks and inflates automatically on small ones
-    (controls the false-rejection cascade a fixed cutoff would cause).
+    test passed.
+
+    Critical values come from torch_rejection.esd_critical_values so this and
+    the GPU reducer cannot drift apart; see that function for what `threshold`
+    and `esd_bonferroni` mean.
     """
     ts, w, valid, was_3d = _rej_prepare(ts, weights)
     F = ts.shape[0]
     thr = float(threshold)
+    # Half the stack, matching the GPU branch (a tighter cap was measured to
+    # start suppressing real rejections on short stacks — see that comment).
     max_out = int(max(1, min(F - 2, round(0.5 * F))))
 
-    crit_by_n = np.full(F + 1, np.inf, dtype=np.float32)
-    try:
-        from scipy import stats as _sstats
-        p_two = float(_sstats.norm.sf(thr))          # one-sided tail
-        for nn in range(3, F + 1):
-            crit_by_n[nn] = float(_sstats.t.ppf(1.0 - p_two, nn - 2))
-    except Exception:
-        for nn in range(3, F + 1):
-            df = nn - 2
-            infl = (df / (df - 2.0)) ** 0.5 if df > 2 else 3.0
-            crit_by_n[nn] = thr * infl
+    crit_by_n = _esd_critical_values(F, thr, bonferroni=bool(esd_bonferroni))
 
     active = valid.copy()
-    removed_step = np.full(ts.shape, -1, dtype=np.int32)
+    # int16 mirrors the GPU branch; step indices <= F/2 cannot overflow a short.
+    removed_step = np.full(ts.shape, -1, dtype=np.int16)
     passed = np.zeros((max_out,) + ts.shape[1:], dtype=bool)
 
     with np.errstate(all="ignore"):
@@ -3129,24 +3530,30 @@ def esd_clip_weighted_np(ts, weights, threshold=3.0):
             dmax = np.take_along_axis(zabs, idx[None], axis=0)[0]
             dmax = np.where(np.isfinite(dmax), dmax, 0.0)
 
-            # leave-one-out identities (no catastrophic cancellation):
-            #   ss_loo = ss_all - dmax^2 * n/(n-1);  R = dmax * n/(n-1) / s_loo
+            # Leave-one-out identities (no catastrophic cancellation):
+            #   ss_loo = ss_all - dmax^2 * n/(n-1)
+            # The candidate sits dmax*n/(n-1) from the LOO mean with standard
+            # error s_loo*sqrt(1 + 1/(n-1)), so the externally studentized
+            # deviate is dmax*sqrt(n/(n-1))/s_loo ~ t_{n-2}. The sqrt is what
+            # makes it an exact t; the old code used the raw n/(n-1) ratio and
+            # therefore ran every test hot.
             n_loo = np.maximum(n - 1.0, 1.0)
             ss_loo = np.maximum(ss_all - dmax * dmax * (n / n_loo), 0.0)
             var_loo = ss_loo / np.maximum(n_loo - 1.0, 1.0)
             std_loo = np.maximum(np.sqrt(var_loo), 1e-12)
-            R = dmax * (n / n_loo) / std_loo
+            R = dmax * np.sqrt(n / n_loo) / std_loo
 
-            lam = crit_by_n[np.clip(active.sum(axis=0), 0, F)]
+            # indexed by the PRE-removal active count, which is exactly `n`
+            lam = crit_by_n[np.clip(n.astype(np.int64), 0, F)]
             passed[j] = can & (R > lam)
 
             hit = np.zeros_like(active)
             np.put_along_axis(hit, idx[None], can[None], axis=0)
             active &= ~hit
-            removed_step = np.where(hit, j, removed_step)
+            removed_step = np.where(hit, np.int16(j), removed_step)
 
-        steps = np.arange(max_out, dtype=np.int32).reshape((max_out,) + (1,) * (ts.ndim - 1))
-        jstar = np.where(passed, steps, -1).max(axis=0)
+        steps = np.arange(max_out, dtype=np.int16).reshape((max_out,) + (1,) * (ts.ndim - 1))
+        jstar = np.where(passed, steps, np.int16(-1)).max(axis=0)
         keep = valid & ((removed_step < 0) | (removed_step > jstar[None]))
 
         x = np.where(valid, ts, np.nan)
@@ -3156,13 +3563,48 @@ def esd_clip_weighted_np(ts, weights, threshold=3.0):
 
 
 def trimmed_mean_weighted_np(ts, weights, trim_fraction=0.1):
+    """
+    True symmetric order-statistic trimmed mean: drop max(floor(f*n), 1) from
+    each end of the sorted sample, then take the weighted mean of what is left.
+    That is the textbook / scipy.stats.trim_mean estimator for any n >= 1/f,
+    with a minimum of one frame per tail so that picking a trimming rejection
+    method never silently degrades to a plain average on a short stack.
+
+    The old implementation thresholded on interpolated quantiles instead, which
+    is a different estimator: on a 5-frame stack at f=0.1 a true trim drops
+    floor(0.5)=0 frames, but q_0.1 interpolates strictly above the minimum, so
+    both the min and the max were thrown away -- a 40% trim labelled 10%. It
+    also under-trimmed whenever values tied at the cut, and the number kept
+    drifted with each pixel's value distribution instead of being fixed by n.
+    Mirrors the GPU branch exactly.
+    """
     ts, w, valid, was_3d = _rej_prepare(ts, weights)
+    F = ts.shape[0]
     with np.errstate(all="ignore"):
-        x = np.where(valid, ts, np.nan)
-        qlo = np.nanquantile(x, float(trim_fraction), axis=0)
-        qhi = np.nanquantile(x, 1.0 - float(trim_fraction), axis=0)
-        keep = valid & (ts >= qlo[None]) & (ts <= qhi[None])
-        fallback = np.nan_to_num(_np_nanmedian_low(x), nan=0.0)
+        x_sort = np.where(valid, ts, np.inf)
+        idx = np.argsort(x_sort, axis=0, kind="stable")
+        vals = np.take_along_axis(x_sort, idx, axis=0)
+
+        n = valid.sum(axis=0)
+        f = min(max(float(trim_fraction), 0.0), 0.5)
+        k = np.floor(n.astype(np.float32) * f).astype(np.int64)
+        if f > 0.0:
+            # Minimum one per tail — the one deliberate departure from
+            # scipy.stats.trim_mean's exact floor; see the GPU branch for why.
+            # Never fires once n >= 1/f.
+            k = np.maximum(k, 1)
+        # never trim the sample away entirely: leave at least one survivor
+        k = np.clip(np.minimum(k, np.maximum((n - 1) // 2, 0)), 0, None)
+
+        rank = np.arange(F, dtype=np.int64).reshape((F,) + (1,) * (ts.ndim - 1))
+        keep_sorted = (rank >= k[None]) & (rank < (n - k)[None]) & np.isfinite(vals)
+
+        # back to original frame order so weights and the rejection map line up
+        keep = np.zeros_like(keep_sorted)
+        np.put_along_axis(keep, idx, keep_sorted, axis=0)
+        keep &= valid
+
+        fallback = np.nan_to_num(_np_nanmedian_low(np.where(valid, ts, np.nan)), nan=0.0)
         out = _np_weighted_mean_or(ts, keep, w, fallback)
     return _rej_finish(out, ~keep, was_3d)
 
@@ -3380,7 +3822,7 @@ def _median_fast_sample(img: np.ndarray, stride: int = 8) -> float:
     else:
         sample = img[::stride, ::stride]
     sample = sample - float(np.nanmin(sample))
-    return float(np.median(sample))
+    return float(np.nanmedian(sample))   # ignore NaN no-data (satellite trails)
 
 def _luma_view(img: np.ndarray) -> np.ndarray:
     """Return a float32 2D luma view (no copy if mono)."""
@@ -3404,7 +3846,7 @@ def _median_fast_sample(img: np.ndarray, stride: int = 8) -> float:
     v = v[::stride, ::stride]
     # subtract a tiny pedestal so transparency/G gain differences dominate
     vmin = float(np.nanmin(v))
-    return float(np.median(v - vmin)) if v.size else 0.0
+    return float(np.nanmedian(v - vmin)) if v.size else 0.0   # ignore NaN no-data
 
 
 def _compute_scale(ref_target_median: float,
@@ -4218,6 +4660,26 @@ class _MMImageSeek:
         plane_offset = data_start + channel_plane * full_height * full_width * bpp
         out = np.empty((th, tw), dtype=np.float32)
 
+        # Fast path: a full-width band is ONE contiguous run on disk, so pull
+        # the whole (th x full_width) block in a single seek + read instead of
+        # th per-row syscalls. (Consecutive rows are already back-to-back, so
+        # the per-row seeks below never move the head — but each still costs a
+        # syscall + allocation + byteswap.) The per-row loop stays for the
+        # legacy narrow-tile case, which really is strided on disk.
+        if x0 == 0 and tw == full_width:
+            fh.seek(plane_offset + y0 * full_width * bpp)
+            raw = fh.read(th * full_width * bpp)
+            usable = len(raw) - (len(raw) % bpp)
+            flat = np.frombuffer(raw[:usable], dtype=dtype).astype(np.float32)
+            n = flat.size
+            if n >= th * full_width:
+                return flat[:th * full_width].reshape(th, full_width)
+            # short read at EOF: fill what we got, zero-pad the remainder
+            flat_out = out.reshape(-1)          # view into out (C-contiguous)
+            flat_out[:n] = flat
+            flat_out[n:] = 0.0
+            return out
+
         for ri in range(th):
             row_idx = y0 + ri
             row_offset = plane_offset + row_idx * full_width * bpp + x0 * bpp
@@ -4388,7 +4850,7 @@ class _MMImage:
     Exposes: .shape, .ndim, .read_tile(y0,y1,x0,x1), .read_full(), .close()
 
     For FITS:
-      - Try memmap=True first.
+      - Try memmap=True first, mapped read-only (see _open_fits).
       - If that fails, retry with memmap=False.
       - We let Astropy apply BZERO/BSCALE.
       - Then we apply a **fixed** normalization based on BITPIX:
@@ -4439,6 +4901,7 @@ class _MMImage:
         """
         Try memmap=True first; if anything fails while opening or accessing data,
         fall back to memmap=False for this file.
+        The memmap is read-only ('denywrite'): this class only copies data out.
         Astropy is allowed to apply BZERO/BSCALE, then we normalize to 0..1 for
         8/16-bit images.
         """
@@ -4446,7 +4909,12 @@ class _MMImage:
         from astropy.io import fits
 
         def _do_open(memmap_flag: bool):
-            hdul = fits.open(path, memmap=memmap_flag)
+            # 'denywrite' maps read-only (mmap.ACCESS_READ). astropy's default
+            # 'readonly' maps copy-on-write, which Windows charges against the
+            # commit limit for the whole file at open; integration holds every
+            # frame open, so thousands of frames exhausted RAM + pagefile.
+            extra = {"mode": "denywrite"} if memmap_flag else {}
+            hdul = fits.open(path, memmap=memmap_flag, **extra)
             try:
                 hdu = None
                 for h in hdul:
@@ -4727,9 +5195,19 @@ class _MMImage:
             out = np.squeeze(out, axis=-1)
         return out
 
-    def close(self):
-        """Release any open handles / buffers associated with this image."""
+    def close(self, collect: bool = True):
+        """Release any open handles / buffers associated with this image.
+
+        collect=False skips the gc.collect() below, for callers that close
+        many sources and collect once afterwards (_close_mmimages).
+        """
         import gc
+
+        released = any(
+            v is not None
+            for v in (self._fits_hdul, self._fits_data, self._xisf,
+                      self._xisf_memmap, self._xisf_arr)
+        )
 
         # Null all references BEFORE closing so GC finalizers on other threads
         # cannot race against an open handle during the close sequence.
@@ -4750,13 +5228,27 @@ class _MMImage:
         # Force immediate reclamation of the mmap file handle on Windows.
         # Without this, CPython defers finalization and the handle stays open
         # long enough for a concurrent GC sweep to fault on it.
-        gc.collect()
+        # Skipped when nothing was open: __del__ closes every source again.
+        if collect and released:
+            gc.collect()
 
     def __del__(self):
         try:
             self.close()
         except Exception:
             pass
+
+
+def _close_mmimages(sources):
+    """Close many _MMImage sources with one gc.collect() at the end.
+
+    A full collection walks every tracked object in the process; one per
+    source held the GIL for ~20 min after integrating 3,318 frames.
+    """
+    for s in sources:
+        try: s.close(collect=False)
+        except Exception: pass
+    gc.collect()
 
 
 def _open_sources_for_mfdeconv(paths, log):
@@ -5769,6 +6261,790 @@ class SplitPreviewWidget(QWidget):
 # Updated FlatStrengthPreviewDialog  — uses SplitPreviewWidget
 # =============================================================================
 
+class SubRejectionDialog(QDialog):
+    """
+    Interactive sub-rejection review — one scatter plot of weighted frame
+    scores (Simple) or a 2×3 grid of per-metric plots (Advanced), switched
+    with the Advanced ▸ / ◂ Simple toggle. Subs
+    whose score falls below the draggable red threshold line are rejected
+    (soft reject: weight = 0) in the subsequent integration pass.
+
+    Why per-filter: an OIII group almost always scores lower than an Hα
+    group under the same sky (fewer detectable stars, lower photon rate),
+    so lumping both into one distribution would flag "OIII" as "outliers
+    of Hα". Each filter has its own median, MAD-σ, and threshold line;
+    switching filters in the dropdown just swaps the plot — the user's
+    threshold for each filter is remembered as they navigate. Pressing
+    Apply commits every filter's current threshold.
+
+    Visual vocabulary mirrors Blink Comparator Pro's Weighted Score panel:
+      • dashed gray line at the median
+      • dashed yellow / orange / red lines at ±1σ / ±2σ / ±3σ (robust)
+      • solid red line = movable rejection threshold
+      • blue dots = kept, red dots = rejected (recolour live as the line moves)
+      • click a dot to see which sub it is
+
+    Caller supplies ``groups``: ``{filter_name: {filepath: score}}``.
+    After ``exec()`` returns ``Accepted``, call ``rejected_paths()`` for the
+    flat list of files to zero out.
+    """
+
+    # Metric specifications — single source of truth for the dialog's
+    # per-metric panels. Order drives the Advanced-mode grid layout; the
+    # 2×3 layout places entries 0..5 at (row, col) = (idx // 3, idx % 3).
+    #
+    #   key          — stable identifier used in state dicts
+    #   display_name — panel title (translated at render time)
+    #   higher_worse — True → threshold flags values ABOVE the line (FWHM,
+    #                   Ecc, Background, Noise). False → flags values BELOW
+    #                   (Star Count, Weighted Score).
+    #   default      — "sigma": seed the line at median − k·σ (Score only).
+    #                 float frac: seed the line at (max/min) ± frac·span so
+    #                 nothing is rejected on open (user has to drag to flag).
+    _METRIC_SPECS = (
+        ("fwhm",  "FWHM (px)",       True,  0.05),
+        ("ecc",   "Eccentricity",    True,  0.05),
+        ("bg",    "Background",      True,  0.05),
+        ("count", "Star Count",      False, 0.05),
+        ("noise", "Noise",           True,  0.05),
+        ("score", "Weighted Score",  False, "sigma"),
+    )
+
+    # Physical lower/upper bounds on each metric — thresholds are clamped
+    # to these on both the default/park computations AND on the user's
+    # drag (via InfiniteLine ``bounds=``). ``None`` means unbounded on
+    # that side.
+    #
+    # Why: on a wide-spread Score distribution med − k·σ can land at a
+    # negative number, which parks the red threshold bar at y < 0 — off
+    # the visible plot — and the user has to scroll down to find it.
+    # Scores (and star counts, FWHM, noise) can't physically be negative,
+    # so clamping the bar to the physical floor keeps it visible AND
+    # preserves the "nothing is actually below this threshold" semantics:
+    # reject(value < 0) is just as unachievable as reject(value < −∞).
+    # Eccentricity and background are additionally bounded above (1.0).
+    _METRIC_BOUNDS = {
+        "fwhm":  (0.0, None),
+        "ecc":   (0.0, 1.0),
+        # Background has no fixed upper bound — the preview median comes
+        # out in whatever units the input data lives in (normalized
+        # [0..1] FITS, ADU-scaled, calibrated e⁻, etc.). An earlier
+        # (0, 1) ceiling collapsed the "park above max" default for a
+        # 30–34-range distribution down to 1.0, which with higher-worse
+        # semantics flagged every sub (bg > 1 == true for all of them).
+        # Only the floor at 0 is actually physical.
+        "bg":    (0.0, None),
+        "count": (0.0, None),
+        "noise": (0.0, None),
+        "score": (0.0, None),
+    }
+
+    @classmethod
+    def _bounds_for(cls, mk):
+        return cls._METRIC_BOUNDS.get(mk, (None, None))
+
+    @staticmethod
+    def _clamp(x, lo, hi):
+        x = float(x)
+        if lo is not None and x < float(lo):
+            x = float(lo)
+        if hi is not None and x > float(hi):
+            x = float(hi)
+        return x
+
+    def __init__(self, parent, groups: dict, metrics_data: dict = None,
+                 sigma_k: float = 3.5, start_in_advanced: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle(self.tr("Review Subs — Interactive Rejection"))
+
+        import numpy as _np
+
+        self._sigma_k = float(sigma_k)
+
+        # Advanced mode is only offered when the caller passed per-metric
+        # data for every filter AND every expected metric (fwhm, ecc, bg,
+        # count, noise). Partial data would make the toggle enabled but
+        # some panels empty, which is worse than hiding the toggle.
+        required_metrics = tuple(k for k, _n, _hw, _d in self._METRIC_SPECS
+                                  if k != "score")
+        self._has_advanced = bool(metrics_data) and all(
+            all(k in (metrics_data.get(fname) or {}) for k in required_metrics)
+            for fname in groups
+        )
+
+        # Build the per-filter cache. For every metric the dialog knows
+        # about we precompute: values array, sort order (ascending), robust
+        # median + σ, and the "default" threshold (sigma-seeded for Score,
+        # park-above-max / park-below-min for everything else). The user's
+        # live-adjusted threshold lives alongside in ``thresholds[key]``.
+        self._per_filter: dict = {}
+        for fname, scores_map in (groups or {}).items():
+            if not scores_map:
+                continue
+            fps = list(scores_map.keys())
+            scores = _np.asarray(
+                [float(scores_map[fp]) for fp in fps], dtype=_np.float32
+            )
+            entry: dict = {"fps": fps, "metrics": {}, "thresholds": {}}
+
+            # ── Weighted Score (always present) ─────────────────────────
+            med, sig = self._robust_stats(scores)
+            if _np.isfinite(med) and _np.isfinite(sig) and sig > 0:
+                default_score_th = float(med - self._sigma_k * sig)
+            else:
+                default_score_th = float(_np.nanmin(scores)) - 1e-6
+            # Keep the default threshold at or above the metric's
+            # physical floor (0 for Score) so a wide-spread σ doesn't
+            # park the red bar off the bottom of the plot. Semantics are
+            # unchanged — reject(score < 0) is unreachable, same as
+            # reject(score < −∞) — but the line is visible on open.
+            _slo, _shi = self._bounds_for("score")
+            default_score_th = self._clamp(default_score_th, _slo, _shi)
+            entry["metrics"]["score"] = {
+                "values":     scores,
+                "order":      _np.argsort(scores, kind="stable"),
+                "med":        med,
+                "sig":        sig,
+                "default_th": default_score_th,
+            }
+            entry["thresholds"]["score"] = default_score_th
+
+            # ── Other metrics for Advanced mode (optional) ─────────────
+            if self._has_advanced:
+                mdata = (metrics_data or {}).get(fname) or {}
+                for mk, _display, higher_worse, dflt in self._METRIC_SPECS:
+                    if mk == "score":
+                        continue
+                    values_map = mdata.get(mk) or {}
+                    vals = _np.asarray(
+                        [float(values_map.get(fp, _np.nan)) for fp in fps],
+                        dtype=_np.float32,
+                    )
+                    order = _np.argsort(vals, kind="stable")
+                    m_med, m_sig = self._robust_stats(vals)
+                    finite = vals[_np.isfinite(vals)]
+                    if finite.size:
+                        vmin = float(finite.min())
+                        vmax = float(finite.max())
+                        span = (vmax - vmin) if vmax > vmin else 1.0
+                        default_th = (
+                            vmax + float(dflt) * span
+                            if higher_worse
+                            else vmin - float(dflt) * span
+                        )
+                    else:
+                        default_th = 0.0
+                    # Clamp default to physical bounds so e.g. the
+                    # "park above max" seed for Ecc caps at 1.0 and the
+                    # "park below min" seed for Star Count caps at 0.
+                    _mlo, _mhi = self._bounds_for(mk)
+                    default_th = self._clamp(default_th, _mlo, _mhi)
+                    entry["metrics"][mk] = {
+                        "values":     vals,
+                        "order":      order,
+                        "med":        m_med,
+                        "sig":        m_sig,
+                        "default_th": default_th,
+                    }
+                    entry["thresholds"][mk] = default_th
+
+            self._per_filter[str(fname)] = entry
+
+        self._filter_names = sorted(self._per_filter.keys())
+        self._current_filter = self._filter_names[0] if self._filter_names else None
+
+        # Mode: "simple" (one Weighted Score plot) or "advanced" (2×3 grid).
+        self._mode = "advanced" if (self._has_advanced and start_in_advanced) else "simple"
+
+        # Live widget registries — repopulated on every filter/mode render.
+        # Keyed by metric key: PlotWidget, ScatterPlotItem, and the movable
+        # threshold InfiniteLine.
+        self._active_plots: dict = {}
+        self._active_scatters: dict = {}
+        self._active_lines: dict = {}
+
+        # Resize now that we know whether Advanced is available.
+        self.resize(1080, 760 if self._has_advanced else 680)
+
+        self._build_ui()
+        if self._current_filter:
+            self._load_filter(self._current_filter)
+
+    # ──────────────────────────────────────────────────────────────────
+    # UI build
+    # ──────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        v = QVBoxLayout(self)
+        self._v = v   # kept for replaceWidget on filter/mode changes
+
+        # Filter dropdown
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel(self.tr("Filter:")))
+        self._filter_combo = QComboBox()
+        for fname in self._filter_names:
+            n = len(self._per_filter[fname]["fps"])
+            self._filter_combo.addItem(
+                self.tr("{0}  ({1} subs)").format(fname, n), userData=fname
+            )
+        self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
+        self._filter_combo.setMinimumWidth(240)
+        filter_row.addWidget(self._filter_combo)
+        filter_row.addStretch(1)
+        v.addLayout(filter_row)
+
+        # Instructions (text swapped per mode)
+        self._instr_label = QLabel()
+        self._instr_label.setWordWrap(True)
+        v.addWidget(self._instr_label)
+
+        # Status
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("font-weight: bold;")
+        v.addWidget(self.status_label)
+
+        # Plot area — a placeholder widget we .replaceWidget on each
+        # filter / mode change. Keeps layout logic trivial (no clearing
+        # nested layouts) and gives pyqtgraph a clean slate every time.
+        self._plot_area = QWidget()
+        v.addWidget(self._plot_area, 1)
+
+        # Button row
+        btn_row = QHBoxLayout()
+        self._reset_btn = QPushButton()
+        self._reset_btn.clicked.connect(self._reset_threshold)
+        btn_row.addWidget(self._reset_btn)
+
+        self._keepall_btn = QPushButton()
+        self._keepall_btn.clicked.connect(self._park_below_min)
+        btn_row.addWidget(self._keepall_btn)
+
+        btn_row.addStretch(1)
+
+        if self._has_advanced:
+            self._mode_btn = QPushButton()
+            self._mode_btn.clicked.connect(self._toggle_mode)
+            btn_row.addWidget(self._mode_btn)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText(self.tr("Apply"))
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        btn_row.addWidget(bb)
+        v.addLayout(btn_row)
+
+        self._update_mode_chrome()
+
+    def _update_mode_chrome(self):
+        """Refresh the instructions + button labels for the current mode."""
+        if self._mode == "simple":
+            self._instr_label.setText(self.tr(
+                "Each dot is one sub in the selected filter (x-axis = rank, "
+                "lowest-scored on the left). Drag the solid red line to set a "
+                "rejection threshold — subs below the line are excluded from "
+                "the integration (weight = 0, file untouched on disk). The "
+                "dashed guides are the median and ±1σ / ±2σ / ±3σ (robust MAD). "
+                "Thresholds are remembered per filter; switch filters in the "
+                "dropdown above. Click a dot to see which sub it is."
+            ))
+            self._reset_btn.setText(self.tr("Reset to Default"))
+            self._reset_btn.setToolTip(self.tr(
+                "Return THIS filter's Weighted-Score threshold to median − k·σ."
+            ))
+            self._keepall_btn.setText(self.tr("Keep All (this filter)"))
+            self._keepall_btn.setToolTip(self.tr(
+                "Park THIS filter's threshold below its lowest score so nothing "
+                "is rejected in this filter."
+            ))
+            if hasattr(self, "_mode_btn"):
+                self._mode_btn.setText(self.tr("Advanced ▸"))
+                self._mode_btn.setToolTip(self.tr(
+                    "Switch to the 2×3 grid showing FWHM, Eccentricity, "
+                    "Background, Star Count, Noise, and Weighted Score. "
+                    "Each panel gets its own draggable threshold — a sub is "
+                    "rejected if it fails ANY panel's threshold."
+                ))
+        else:
+            self._instr_label.setText(self.tr(
+                "Six scatter plots per filter: FWHM, Eccentricity, Background, "
+                "Star Count, Noise, and Weighted Score. Each panel's dots are "
+                "sorted by THAT panel's metric and get their own draggable red "
+                "threshold line. A sub is rejected if it crosses the threshold "
+                "on ANY panel (OR). Rejected subs show red on every panel so "
+                "you can trace WHY. Click a dot for its full metric read-out."
+            ))
+            self._reset_btn.setText(self.tr("Reset All (this filter)"))
+            self._reset_btn.setToolTip(self.tr(
+                "Return THIS filter's thresholds on EVERY panel to their "
+                "defaults — Score at median − k·σ, every other metric parked "
+                "so nothing is rejected on that metric."
+            ))
+            self._keepall_btn.setText(self.tr("Keep All (this filter)"))
+            self._keepall_btn.setToolTip(self.tr(
+                "Park every panel's threshold out of reach so nothing is "
+                "rejected in this filter."
+            ))
+            if hasattr(self, "_mode_btn"):
+                self._mode_btn.setText(self.tr("◂ Simple"))
+                self._mode_btn.setToolTip(self.tr(
+                    "Return to the single Weighted Score plot. Other panels' "
+                    "thresholds are remembered but do not contribute to "
+                    "rejection while in Simple mode."
+                ))
+
+    # ──────────────────────────────────────────────────────────────────
+    # Filter + mode switching
+    # ──────────────────────────────────────────────────────────────────
+    def _snapshot_live_thresholds(self):
+        """Copy every active threshold line's current position back into
+        ``_per_filter[current]['thresholds']``. Called on every filter
+        change, mode toggle, and before producing ``rejected_paths()``."""
+        if not self._current_filter:
+            return
+        thresholds = self._per_filter[self._current_filter]["thresholds"]
+        for mk, ln in list(self._active_lines.items()):
+            try:
+                thresholds[mk] = float(ln.value())
+            except Exception:
+                pass
+
+    def _on_filter_changed(self, idx: int):
+        self._snapshot_live_thresholds()
+        if idx < 0:
+            return
+        new_filter = self._filter_combo.itemData(idx)
+        if new_filter and new_filter != self._current_filter:
+            self._current_filter = str(new_filter)
+            self._load_filter(self._current_filter)
+
+    def _toggle_mode(self):
+        if not self._has_advanced:
+            return
+        self._snapshot_live_thresholds()
+        self._mode = "advanced" if self._mode == "simple" else "simple"
+        self._update_mode_chrome()
+        if self._current_filter:
+            self._load_filter(self._current_filter)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Rendering
+    # ──────────────────────────────────────────────────────────────────
+    def _load_filter(self, fname: str):
+        """Build a fresh plot-area widget for this filter + current mode
+        and swap it into the main layout."""
+        self._active_plots.clear()
+        self._active_scatters.clear()
+        self._active_lines.clear()
+
+        new_area = self._render_simple(fname) if self._mode == "simple" \
+                   else self._render_advanced(fname)
+
+        self._v.replaceWidget(self._plot_area, new_area)
+        self._plot_area.setParent(None)
+        self._plot_area.deleteLater()
+        self._plot_area = new_area
+        self._refresh_colors()
+
+    def _render_simple(self, fname: str) -> QWidget:
+        """Single Weighted Score plot — the classic one-metric view."""
+        area = QWidget()
+        inner = QVBoxLayout(area)
+        inner.setContentsMargins(0, 0, 0, 0)
+        plot = self._build_metric_panel(fname, "score", short_title=False)
+        inner.addWidget(plot)
+        return area
+
+    def _render_advanced(self, fname: str) -> QWidget:
+        """2×3 grid: FWHM | Ecc | Bg / Count | Noise | Score."""
+        area = QWidget()
+        grid = QGridLayout(area)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+        for idx, (mk, _display, _hw, _d) in enumerate(self._METRIC_SPECS):
+            r, c = idx // 3, idx % 3
+            grid.addWidget(self._build_metric_panel(fname, mk, short_title=True), r, c)
+        # Even stretch so panels resize together
+        for c in range(3): grid.setColumnStretch(c, 1)
+        for r in range(2): grid.setRowStretch(r, 1)
+        return area
+
+    def _build_metric_panel(self, fname: str, mk: str,
+                            short_title: bool = False) -> pg.PlotWidget:
+        """One scatter plot (dots sorted by this metric's value ascending)
+        with median + ±1σ/±2σ/±3σ dashed guides and a draggable red
+        threshold line. Registers itself in ``_active_*`` so refresh and
+        snapshot can find it."""
+        import numpy as _np
+
+        data = self._per_filter[fname]
+        if mk not in data["metrics"]:
+            return pg.PlotWidget()      # defensive — nothing to show
+
+        m = data["metrics"][mk]
+        values = m["values"]; order = m["order"]
+        med = m["med"]; sig = m["sig"]
+        th = data["thresholds"].get(mk, m["default_th"])
+
+        spec = next((s for s in self._METRIC_SPECS if s[0] == mk), None)
+        display = spec[1] if spec else mk
+        higher_worse = spec[2] if spec else False
+
+        plot = pg.PlotWidget()
+        title = display if short_title else (
+            self.tr("{0} (sorted)").format(display)
+        )
+        plot.setTitle(title)
+        plot.setLabel("left", display)
+        plot.setLabel("bottom",
+                      self.tr("Sub") if short_title
+                      else self.tr("Sub (ascending)"))
+        plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.getPlotItem().getViewBox().setBackgroundColor(
+            self.palette().color(self.backgroundRole())
+        )
+
+        y = values[order]
+        x = _np.arange(len(y), dtype=_np.float32)
+
+        scat = pg.ScatterPlotItem(
+            pen=pg.mkPen(None),
+            brush=pg.mkBrush(100, 100, 255, 200),
+            size=7 if short_title else 8,
+        )
+        scat.setData(x=x, y=y)
+        # pyqtgraph's sigClicked signature changed from (plot, points) to
+        # (plot, points, ev) somewhere around 0.13 — a lambda that took
+        # two positional args + a default-captured _mk would see the mouse
+        # event overwrite _mk when pyqtgraph emits three, and the click
+        # handler would silently exit on the metric_key-not-in-dict guard.
+        # The *_args splat ignores whatever positional count pyqtgraph
+        # emits, and _mk= stays the keyword default we actually set.
+        scat.sigClicked.connect(
+            lambda *_args, _mk=mk: self._on_point_click(_mk, _args[1])
+            if len(_args) >= 2 else None
+        )
+        plot.addItem(scat)
+
+        if _np.isfinite(med):
+            med_line = pg.InfiniteLine(
+                pos=med, angle=0, movable=False,
+                pen=pg.mkPen((220, 220, 220, 170), width=1,
+                             style=Qt.PenStyle.DashLine),
+            )
+            med_line.setZValue(-10)
+            plot.addItem(med_line)
+
+        if _np.isfinite(sig) and sig > 0:
+            for k, color in ((1, (255, 220,  50, 120)),
+                             (2, (255, 140,   0, 120)),
+                             (3, (220,  50,  50, 120))):
+                for sign in (-1, +1):
+                    ln = pg.InfiniteLine(
+                        pos=med + sign * k * sig, angle=0, movable=False,
+                        pen=pg.mkPen(color, width=1,
+                                     style=Qt.PenStyle.DashLine),
+                    )
+                    ln.setZValue(-10)
+                    plot.addItem(ln)
+
+        # Constrain the drag range so the user can't park the threshold
+        # at physically impossible values (e.g. Score < 0 or Ecc > 1).
+        _plo, _phi = self._bounds_for(mk)
+        thresh_line = pg.InfiniteLine(
+            pos=self._clamp(th, _plo, _phi),
+            angle=0, movable=True,
+            pen=pg.mkPen((235, 60, 60, 230), width=2),
+            bounds=[_plo, _phi],
+        )
+        thresh_line.sigPositionChanged.connect(self._refresh_colors)
+        plot.addItem(thresh_line)
+
+        # Fit view with padding so default-position lines don't sit flush
+        finite_y = y[_np.isfinite(y)]
+        if finite_y.size:
+            vmin = float(finite_y.min())
+            vmax = float(finite_y.max())
+            span = (vmax - vmin) if vmax > vmin else 1.0
+            # Include the threshold position so the user can SEE where it's
+            # parked (otherwise a default-parked line can be off-screen).
+            lo = min(vmin, float(th)) - 0.1 * span
+            hi = max(vmax, float(th)) + 0.1 * span
+            plot.getPlotItem().getViewBox().setYRange(lo, hi)
+
+        self._active_plots[mk] = plot
+        self._active_scatters[mk] = scat
+        self._active_lines[mk] = thresh_line
+        return plot
+
+    # ──────────────────────────────────────────────────────────────────
+    # Live updates
+    # ──────────────────────────────────────────────────────────────────
+    def _rejected_mask_for(self, fname: str, use_live_for_current: bool = True):
+        """Boolean mask over this filter's fps: True ⇔ sub would be
+        rejected by the CURRENT thresholds. In Simple mode only Score
+        counts; in Advanced mode every metric's threshold contributes
+        (OR). ``use_live_for_current`` reads from the active InfiniteLine
+        for the currently-displayed filter (so a live drag updates the
+        count without clicking away first); any other filter reads from
+        saved thresholds."""
+        import numpy as _np
+        data = self._per_filter[fname]
+        n = len(data["fps"])
+        mask = _np.zeros(n, dtype=bool)
+
+        is_current = (fname == self._current_filter)
+        active_metrics = ("score",) if self._mode == "simple" else \
+                         tuple(s[0] for s in self._METRIC_SPECS
+                               if s[0] in data["metrics"])
+
+        for mk in active_metrics:
+            spec = next((s for s in self._METRIC_SPECS if s[0] == mk), None)
+            if spec is None:
+                continue
+            higher_worse = spec[2]
+            if is_current and use_live_for_current and mk in self._active_lines:
+                try:
+                    th = float(self._active_lines[mk].value())
+                except Exception:
+                    th = data["thresholds"].get(mk, data["metrics"][mk]["default_th"])
+            else:
+                th = data["thresholds"].get(mk, data["metrics"][mk]["default_th"])
+            values = data["metrics"][mk]["values"]
+            if higher_worse:
+                mask |= (values > th)
+            else:
+                mask |= (values < th)
+        return mask
+
+    def _refresh_colors(self):
+        """Repaint dots across every active panel using the overall-
+        rejected mask (so a sub is red on every panel if it's rejected
+        on any), and update the status line."""
+        import numpy as _np
+        if not self._current_filter:
+            return
+        data = self._per_filter[self._current_filter]
+        mask = self._rejected_mask_for(self._current_filter)
+
+        rej_brush = pg.mkBrush(235, 60, 60, 220)
+        keep_brush = pg.mkBrush(100, 100, 255, 200)
+
+        for mk, scat in self._active_scatters.items():
+            m = data["metrics"][mk]
+            values = m["values"]; order = m["order"]
+            y = values[order]
+            x = _np.arange(len(y), dtype=_np.float32)
+            brushes = [
+                rej_brush if bool(mask[int(gi)]) else keep_brush
+                for gi in order
+            ]
+            scat.setData(x=x, y=y, brush=brushes)
+
+        # Status: this-filter + cross-filter totals.
+        n_rej_this = int(mask.sum())
+        n_tot_this = int(len(mask))
+
+        total_rej = 0
+        total_subs = 0
+        for fname in self._per_filter:
+            total_rej += int(self._rejected_mask_for(fname).sum())
+            total_subs += len(self._per_filter[fname]["fps"])
+
+        if self._mode == "simple":
+            score_m = data["metrics"]["score"]
+            med = score_m["med"]; sig = score_m["sig"]
+            th = float(self._active_lines["score"].value()) \
+                 if "score" in self._active_lines \
+                 else data["thresholds"]["score"]
+            if _np.isfinite(sig) and sig > 1e-12:
+                sigma_note = self.tr(" — threshold at median − {0:.2f}σ").format(
+                    (med - th) / sig
+                )
+            else:
+                sigma_note = ""
+            self.status_label.setText(self.tr(
+                "[{0}] Rejecting {1} / {2} subs (threshold = {3:.4f}, "
+                "median = {4:.4f}, robust σ = {5:.4f}){6}\n"
+                "All filters: {7} / {8} subs rejected"
+            ).format(self._current_filter, n_rej_this, n_tot_this, th, med, sig,
+                     sigma_note, total_rej, total_subs))
+        else:
+            # Advanced: break down by metric so the user can see which
+            # dimension is doing the work.
+            parts = []
+            for mk, _display, higher_worse, _d in self._METRIC_SPECS:
+                if mk not in data["metrics"]:
+                    continue
+                if mk in self._active_lines:
+                    th = float(self._active_lines[mk].value())
+                else:
+                    th = data["thresholds"].get(mk, data["metrics"][mk]["default_th"])
+                values = data["metrics"][mk]["values"]
+                n_m = int(((values > th) if higher_worse else (values < th)).sum())
+                parts.append(self.tr("{0}: {1}").format(mk, n_m))
+            per_metric = "  ·  ".join(parts)
+            self.status_label.setText(self.tr(
+                "[{0}] Rejecting {1} / {2} subs (OR across metrics)  "
+                "— {3}\nAll filters: {4} / {5} subs rejected"
+            ).format(self._current_filter, n_rej_this, n_tot_this,
+                     per_metric, total_rej, total_subs))
+
+    # ──────────────────────────────────────────────────────────────────
+    # Buttons
+    # ──────────────────────────────────────────────────────────────────
+    def _reset_threshold(self):
+        """Reset-to-default — in Simple mode resets only Score; in
+        Advanced mode resets every metric this filter has."""
+        if not self._current_filter:
+            return
+        data = self._per_filter[self._current_filter]
+        targets = ("score",) if self._mode == "simple" else \
+                  tuple(s[0] for s in self._METRIC_SPECS
+                        if s[0] in self._active_lines)
+        for mk in targets:
+            ln = self._active_lines.get(mk)
+            if ln is None:
+                continue
+            m = data["metrics"][mk]
+            try:
+                ln.setPos(float(m["default_th"]))
+            except Exception:
+                pass
+        self._refresh_colors()
+
+    def _park_below_min(self):
+        """Keep-all — park every active threshold so this filter rejects
+        nothing. For a lower-worse metric that means "below min"; for a
+        higher-worse metric, "above max"."""
+        import numpy as _np
+        if not self._current_filter:
+            return
+        data = self._per_filter[self._current_filter]
+        for mk, ln in self._active_lines.items():
+            spec = next((s for s in self._METRIC_SPECS if s[0] == mk), None)
+            if spec is None:
+                continue
+            higher_worse = spec[2]
+            values = data["metrics"][mk]["values"]
+            finite = values[_np.isfinite(values)]
+            if not finite.size:
+                continue
+            vmin, vmax = float(finite.min()), float(finite.max())
+            span = (vmax - vmin) if vmax > vmin else 1.0
+            new_pos = (vmax + 0.05 * span) if higher_worse else (vmin - 0.05 * span)
+            # Clamp to physical bounds — Keep-All for Star Count must not
+            # park at a negative value (invisible below y=0), and for Ecc
+            # must not go above 1.
+            _lo, _hi = self._bounds_for(mk)
+            new_pos = self._clamp(new_pos, _lo, _hi)
+            try:
+                ln.setPos(float(new_pos))
+            except Exception:
+                pass
+        self._refresh_colors()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Dot-click info popup
+    # ──────────────────────────────────────────────────────────────────
+    def _on_point_click(self, metric_key: str, points):
+        import os as _os
+        if not self._current_filter:
+            return
+        data = self._per_filter[self._current_filter]
+        if metric_key not in data["metrics"]:
+            return
+        order = data["metrics"][metric_key]["order"]
+        for pt in points:
+            li = int(round(pt.pos().x()))
+            if not (0 <= li < len(order)):
+                continue
+            gi = int(order[li])
+            fp = data["fps"][gi]
+            overall_mask = self._rejected_mask_for(self._current_filter)
+            overall_rej = bool(overall_mask[gi])
+
+            # Per-metric read-out (same lines in both modes; just more
+            # metrics in Advanced since more are populated).
+            lines = [self.tr("{0}").format(_os.path.basename(fp)),
+                     self.tr("Filter: {0}").format(self._current_filter)]
+            for mk, display, higher_worse, _d in self._METRIC_SPECS:
+                if mk not in data["metrics"]:
+                    continue
+                m = data["metrics"][mk]
+                v = float(m["values"][gi])
+                if mk in self._active_lines:
+                    th = float(self._active_lines[mk].value())
+                else:
+                    th = data["thresholds"].get(mk, m["default_th"])
+                cuts = (v > th) if higher_worse else (v < th)
+                flag = "✕" if cuts else "·"
+                lines.append(self.tr(
+                    "  {0}  {1} = {2:.4f}  (threshold {3:.4f})"
+                ).format(flag, display, v, th))
+            lines.append("")
+            lines.append(self.tr("Overall: {0}").format(
+                self.tr("REJECTED") if overall_rej else self.tr("KEPT")
+            ))
+            QMessageBox.information(
+                self, self.tr("Sub info"), "\n".join(lines)
+            )
+            return   # one popup per click, even if multiple dots coincide
+
+    # ──────────────────────────────────────────────────────────────────
+    # Public API
+    # ──────────────────────────────────────────────────────────────────
+    def rejected_paths(self) -> list:
+        """Flat list of filepaths rejected across every filter. Commits
+        the live thresholds first so a drag the user never 'confirmed'
+        by clicking off still counts when they press Apply."""
+        self._snapshot_live_thresholds()
+        result = []
+        for fname in self._per_filter:
+            mask = self._rejected_mask_for(fname, use_live_for_current=False)
+            fps = self._per_filter[fname]["fps"]
+            for i, fp in enumerate(fps):
+                if bool(mask[i]):
+                    result.append(fp)
+        return result
+
+    def threshold(self, filter_name: str = None,
+                  metric_key: str = "score") -> float:
+        """Current threshold for (filter, metric). Defaults to the active
+        filter's Weighted-Score threshold (used by auto-path logging)."""
+        if filter_name is None:
+            filter_name = self._current_filter
+        if filter_name not in self._per_filter:
+            return 0.0
+        data = self._per_filter[filter_name]
+        if (filter_name == self._current_filter
+                and metric_key in self._active_lines):
+            try:
+                return float(self._active_lines[metric_key].value())
+            except Exception:
+                pass
+        return float(data["thresholds"].get(metric_key, 0.0))
+
+    def mode(self) -> str:
+        """``"simple"`` or ``"advanced"`` — the dialog's current view."""
+        return self._mode
+
+    # ──────────────────────────────────────────────────────────────────
+    # Robust stats (same formulation as the auto-reject code path)
+    # ──────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _robust_stats(scores):
+        import numpy as _np
+        s = scores[_np.isfinite(scores)]
+        if s.size < 2:
+            return (float(_np.median(s)) if s.size else 0.0, 0.0)
+        med = float(_np.median(s))
+        mad = float(_np.median(_np.abs(s - med)))
+        sig = 1.4826 * mad
+        return med, sig
+
+
 class FlatStrengthPreviewDialog(QDialog):
     """
     Interactive flat-strength tuning with an in-image split before/after view.
@@ -5994,6 +7270,8 @@ class StackingSuiteDialog(QDialog):
     requestRelaunch = pyqtSignal(str, str)  # old_dir, new_dir
     status_signal = pyqtSignal(str)
     _platesolve_signal = pyqtSignal(object, object, str, dict) 
+    _cal_scan_progress = pyqtSignal(int, int, int)  # generation, done, total
+    _cal_scan_done = pyqtSignal(int)                # generation
 
     def __init__(self, parent=None, wrench_path=None, spinner_path=None, **_ignored):
         super().__init__(parent)
@@ -6056,7 +7334,41 @@ class StackingSuiteDialog(QDialog):
         self._align_prog_pending = None      # tuple[int, int] (done, total)
         self._align_prog_in_slot = False
         self._align_prog_last = None
-
+        # Registration Sets — orthogonal partition above filter/exp grouping.
+        # Each mosaic panel / distinct target becomes its own set with its own reference.
+        self.reg_sets: dict[str, dict] = {}          # set_name -> {"reference": str|None, "locked": bool}
+        self.frame_set_of: dict[str, str] = {}       # normcase(abspath) -> set_name  (unassigned => "Default")
+        self._active_set_name = "Default"
+        # Registration-set run queue (multi-panel / multi-target)
+        self._reg_queue = None            # None => no multi-set run in flight
+        self._reg_queue_pos = 0
+        self._reg_current_set = None
+        self._reg_current_set_slug = None
+        self._reg_summary_buffer = []     # per-set results, flushed as one summary at run end
+        # Already-registered pre-check decision, reused across every set in a
+        # single multi-set run so the user is only prompted once. Canonical
+        # values: "reuse" (skip/short-circuit existing registrations),
+        # "register_all" (re-register everything), "cancel". None => ask.
+        self._reg_precheck_choice = None
+        # One-shot "auto-reuse" flags set by Quick-tab Full Pipeline so both
+        # calibration and registration prechecks silently reuse existing
+        # calibrated / aligned frames instead of prompting. Each precheck
+        # consumes (clears) its own flag on first read; this is why we keep
+        # two independent latches instead of one shared bool — the register
+        # stage runs much later (after calibration completes + auto-register
+        # fires), and we want the calibration consumer not to turn the
+        # register side off before it gets its turn.
+        self._pipeline_auto_reuse_cal = False
+        self._pipeline_auto_reuse_reg = False
+        # One-shot "force clean slate" flags — the inverse of the auto-reuse
+        # latches above. Set by Quick-tab Full Pipeline when the user ticks
+        # the "Force clean slate" checkbox, these tell each precheck to
+        # silently take the full-rebuild path ("calibrate_all" / "register_all")
+        # regardless of what's already on disk. Mutually exclusive with the
+        # auto-reuse flags per Full-Pipeline invocation.
+        self._pipeline_force_recal = False
+        self._pipeline_force_rereg = False
+        self._reg_queue_master_paths = []  # masters accumulated across sets for the final popup
         self.reference_frame = None
         # Set by the register-only-new shortcut so the completion handler
         # integrates the full tree (old twins + freshly registered) instead of
@@ -6068,6 +7380,14 @@ class StackingSuiteDialog(QDialog):
 
         self.manual_light_files = []
         self._reg_excluded_files = set()
+
+        # Image Integration tree: header cache and background load state
+        self._cal_meta_cache = CalibratedMetaCache()
+        self._cal_scan_gen = 0            # bumped to invalidate an in-flight scan
+        self._cal_scan_stop = None        # threading.Event while a background load runs
+        self._reg_drizzle_seed = None     # drizzle defaults for the first tree build
+        self._cal_scan_progress.connect(self._on_cal_scan_progress, Qt.ConnectionType.QueuedConnection)
+        self._cal_scan_done.connect(self._on_cal_scan_done, Qt.ConnectionType.QueuedConnection)
 
         # Show docking log window (if main window created it)
         self._ensure_log_visible_once()
@@ -6093,11 +7413,30 @@ class StackingSuiteDialog(QDialog):
         self.kappa = self.settings.value("stacking/kappa", 2.5, type=float)
         self.iterations = self.settings.value("stacking/iterations", 3, type=int)
         self.esd_threshold = self.settings.value("stacking/esd_threshold", 3.0, type=float)
+        # Rosner's family-wise multiplicity correction for ESD. OFF by default:
+        # with it on, the threshold controls the per-PIXEL error rate instead of
+        # the per-FRAME rate the "sigma" control advertises, and detection of a
+        # 4-sigma outlier on a 245-frame stack drops from ~100% to ~1%. On is the
+        # literature test and is available for anyone who wants it. No UI
+        # control — expert escape hatch, set it in the INI.
+        self.esd_bonferroni = self.settings.value("stacking/esd_bonferroni", False, type=bool)
         self.biweight_constant = self.settings.value("stacking/biweight_constant", 6.0, type=float)
         self.trim_fraction = self.settings.value("stacking/trim_fraction", 0.1, type=float)
         self.modz_threshold = self.settings.value("stacking/modz_threshold", 3.5, type=float)
-        self.chunk_height = self.settings.value("stacking/chunk_height", 2048, type=int)
-        self.chunk_width = self.settings.value("stacking/chunk_width", 2048, type=int)
+        # ── One-time migration to row-band processing ──────────────────────
+        # Pre-band builds stored chunk_height as a TILE height (256/512/2048 were
+        # fine as 2D tiles). In band mode the same number means FULL-WIDTH rows,
+        # so a stale 256 builds a 256xWidth band that hammers the GPU. Reset the
+        # stored height ONCE to a safe band default; the schema flag stops it from
+        # re-running, so a user's later choice is preserved.
+        if int(self.settings.value("stacking/settings_schema_version", 0, type=int)) < _STACKING_SCHEMA_VERSION:
+            self.settings.setValue("stacking/chunk_height", _DEFAULT_BAND_ROWS)
+            self.settings.setValue("stacking/chunk_width", 0)  # ignored (full width)
+            self.settings.setValue("stacking/settings_schema_version", _STACKING_SCHEMA_VERSION)
+            try: self.settings.sync()
+            except Exception: pass
+        self.chunk_height = self.settings.value("stacking/chunk_height", _DEFAULT_BAND_ROWS, type=int)
+        self.chunk_width = self.settings.value("stacking/chunk_width", 0, type=int)  # ignored: bands are always full image width
 
         # Dictionaries to store file paths
         self.conversion_files = {}
@@ -6186,6 +7525,12 @@ class StackingSuiteDialog(QDialog):
         self.stacking_path_display.setToolTip(self.stacking_directory or self.tr("No stacking folder selected"))
         header_row.addWidget(self.stacking_path_display, 1)
 
+        self.change_dir_btn = QToolButton(self)
+        self.change_dir_btn.setText(self.tr("Change…"))
+        self.change_dir_btn.setToolTip(self.tr("Choose a different stacking directory"))
+        self.change_dir_btn.clicked.connect(self.select_stacking_directory)
+        header_row.addWidget(self.change_dir_btn)
+
         layout.addLayout(header_row)
 
         self.log_btn = QToolButton(self)
@@ -6193,6 +7538,10 @@ class StackingSuiteDialog(QDialog):
         self.log_btn.setToolTip(self.tr("Show the Stacking Suite log window"))
         self.log_btn.clicked.connect(self._show_log_window)
         header_row.addWidget(self.log_btn)
+
+        # In-tool documentation button, flush right of Open Log
+        self.btn_help = make_help_button("stacking_suite", self)
+        header_row.addWidget(self.btn_help)
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.tabs.currentChanged.connect(lambda *_: self._refresh_quick_stack_summary_later())
@@ -6285,6 +7634,19 @@ class StackingSuiteDialog(QDialog):
             )
         except Exception as e:
             print(f"[CANCEL] _start_exec_monitor: CONNECT FAILED: {e!r}")
+        # A queued multi-set run already started the monitor on set 1; don't
+        # wipe rows / restart the elapsed timer when set 2+ re-enters.
+        if getattr(self, "_reg_queue", None) and getattr(self, "_reg_queue_pos", 0) > 0:
+            try:
+                if not m._tick_timer.isActive():
+                    m._tick_timer.start()
+                m._set_stop_available(True)
+                self._exec_monitor_pipeline_active = True
+            except Exception:
+                pass
+            m.show()
+            m.raise_()
+            return
         if m._run_start is not None and m._tick_timer.isActive():
             m.show()
             m.raise_()
@@ -6313,6 +7675,8 @@ class StackingSuiteDialog(QDialog):
             return
 
         if target == "integration":
+            # A background load would rebuild the tree over these rows later.
+            self._ensure_reg_tree_loaded()
             # treat them as calibrated lights you want to integrate
             self._ingest_paths_with_progress(
                 paths=paths,
@@ -6368,9 +7732,9 @@ class StackingSuiteDialog(QDialog):
             return
         self._align_prog_in_slot = True
         try:
+            done, total = self._align_prog_pending
             dlg = getattr(self, "align_progress", None)
             if dlg is not None:
-                done, total = self._align_prog_pending
                 if total > 0:
                     done = max(0, min(int(done), int(total)))
                     dlg.setRange(0, int(total))
@@ -6380,6 +7744,18 @@ class StackingSuiteDialog(QDialog):
                     # unknown total: keep it as a pulsing dialog
                     dlg.setRange(0, 0)
                     dlg.setLabelText(self.tr("Aligning stars…"))
+            # Throttled LogBus post so the Execution Monitor Note updates
+            # (~20 updates max), matching Measurements cadence.
+            if total > 0:
+                done = max(0, min(int(done), int(total)))
+                report_every = max(1, int(total) // 20)
+                if done == 1 or done == int(total) or (done % report_every == 0):
+                    tup = (done, int(total))
+                    if getattr(self, "_align_prog_status_last", None) != tup:
+                        self._align_prog_status_last = tup
+                        self.update_status(
+                            self.tr("📐 Aligning stars… ({0}/{1})").format(done, int(total))
+                        )
         finally:
             self._align_prog_in_slot = False
             self._align_prog_pending = None
@@ -6628,7 +8004,7 @@ class StackingSuiteDialog(QDialog):
 
         root.addLayout(bottom_row)
 
-        cleanup_btn = QPushButton(self.tr("🗑️ Clean Up Temp Files"))
+        cleanup_btn = QPushButton(self.tr("🗑️ Clean Up Intermediate Files"))
         cleanup_btn.setStyleSheet("""
             QPushButton {
                 background-color: #3a3a3a;
@@ -6643,8 +8019,37 @@ class StackingSuiteDialog(QDialog):
         cleanup_btn.clicked.connect(self._cleanup_temp_files)
         root.addWidget(cleanup_btn)
 
+        # ── Full Pipeline force-clean-slate toggle ───────────────────────────
+        # Default-off opt-in override: when checked, the Full Pipeline button
+        # ignores any existing calibrated / aligned frames in the stacking
+        # directory and runs calibration + registration from scratch. The
+        # default resume-on-top-of-what's-there behavior is still what the
+        # user gets if they don't check this. State is persisted in QSettings
+        # so a user who leaves it checked keeps that behavior across sessions.
+        self.pipeline_force_clean_slate_cb = QCheckBox(self.tr(
+            "Force clean slate — recalibrate & re-register all frames"
+        ))
+        self.pipeline_force_clean_slate_cb.setToolTip(self.tr(
+            "By default, Run Full Pipeline reuses any calibrated frames in "
+            "the Calibrated folder and any aligned frames in Aligned_Images "
+            "that match the selected lights, and only processes the new "
+            "ones. Check this to force a full recalibration and full "
+            "re-registration regardless of what's already on disk."
+        ))
+        self.pipeline_force_clean_slate_cb.setChecked(
+            self.settings.value(
+                "stacking/pipeline_force_clean_slate", False, type=bool
+            )
+        )
+        self.pipeline_force_clean_slate_cb.toggled.connect(
+            lambda v: self.settings.setValue(
+                "stacking/pipeline_force_clean_slate", bool(v)
+            )
+        )
+        root.addWidget(self.pipeline_force_clean_slate_cb)
+
         # ── Full Pipeline button ─────────────────────────────────────────────
-        pipeline_btn = QPushButton(self.tr("🚀 Run Full Pipeline (Darks → Flats → Calibrate → Register & Integrate)"))
+        pipeline_btn = QPushButton(self.tr("🚀 Run Full Pipeline (Darks → Flats → Calibrate → Register → Integrate)"))
         pipeline_btn.setStyleSheet("""
             QPushButton {
                 background-color: #FF4500;
@@ -6740,7 +8145,49 @@ class StackingSuiteDialog(QDialog):
                 return
 
         # Step 3: calibrate lights — auto_register_after_calibration_cb
-        # will fire registration automatically when calibration finishes
+        # will fire registration automatically when calibration finishes.
+        #
+        # Full-Pipeline UX contract: if the stacking directory already holds
+        # calibrated and/or aligned twins of the selected lights, reuse them
+        # silently instead of prompting. Users running Full Pipeline want a
+        # single-click resume on top of yesterday's run, not two modal boxes.
+        # Each precheck consumes its own flag on first read, so these latches
+        # auto-clear even if the user cancels mid-pipeline (next manual run
+        # of either stage will prompt normally).
+        #
+        # The "Force clean slate" checkbox inverts the contract: when checked
+        # we pre-seed the opposite set of flags so both prechecks silently
+        # take the full-rebuild path ("calibrate_all" / "register_all")
+        # instead of reusing existing frames.
+        force_clean_slate = False
+        try:
+            if getattr(self, "pipeline_force_clean_slate_cb", None) is not None:
+                force_clean_slate = bool(
+                    self.pipeline_force_clean_slate_cb.isChecked()
+                )
+            else:
+                force_clean_slate = self.settings.value(
+                    "stacking/pipeline_force_clean_slate", False, type=bool
+                )
+        except Exception:
+            force_clean_slate = False
+
+        if force_clean_slate:
+            self._pipeline_auto_reuse_cal = False
+            self._pipeline_auto_reuse_reg = False
+            self._pipeline_force_recal = True
+            self._pipeline_force_rereg = True
+            self.update_status(self.tr(
+                "🧹 Full Pipeline: clean slate mode — forcing full "
+                "recalibration & full re-registration of every selected "
+                "light."
+            ))
+        else:
+            self._pipeline_auto_reuse_cal = True
+            self._pipeline_auto_reuse_reg = True
+            self._pipeline_force_recal = False
+            self._pipeline_force_rereg = False
+
         self.update_status(self.tr(
             "🚀 Full Pipeline: calibrating lights "
             "→ will auto-register & integrate on completion…"
@@ -6903,6 +8350,39 @@ class StackingSuiteDialog(QDialog):
             self._quick_build_master_flat()
 
         elif stage == "calibrate":
+            # Full-Pipeline UX contract (see _run_full_pipeline for the long
+            # version): by default silently reuse any existing calibrated /
+            # aligned twins; when the "Force clean slate" checkbox is on,
+            # silently force full recalibration + full re-registration
+            # instead. Each precheck consumes its own latch on first read.
+            force_clean_slate = False
+            try:
+                if getattr(self, "pipeline_force_clean_slate_cb", None) is not None:
+                    force_clean_slate = bool(
+                        self.pipeline_force_clean_slate_cb.isChecked()
+                    )
+                else:
+                    force_clean_slate = self.settings.value(
+                        "stacking/pipeline_force_clean_slate", False, type=bool
+                    )
+            except Exception:
+                force_clean_slate = False
+
+            if force_clean_slate:
+                self._pipeline_auto_reuse_cal = False
+                self._pipeline_auto_reuse_reg = False
+                self._pipeline_force_recal = True
+                self._pipeline_force_rereg = True
+                self.update_status(self.tr(
+                    "🧹 Full Pipeline: clean slate mode — forcing full "
+                    "recalibration & full re-registration."
+                ))
+            else:
+                self._pipeline_auto_reuse_cal = True
+                self._pipeline_auto_reuse_reg = True
+                self._pipeline_force_recal = False
+                self._pipeline_force_rereg = False
+
             self.update_status(self.tr(
                 "🚀 Full Pipeline: calibrating lights "
                 "→ will auto-register & integrate on completion…"
@@ -7392,9 +8872,12 @@ class StackingSuiteDialog(QDialog):
         if getattr(self, "_debayer_method_for_this_run", None) is not None:
             dmethod = str(self._debayer_method_for_this_run).lower()
         else:
-            dmethod = str(self.settings.value("stacking/debayer_method", "vng")).lower()
-        if dmethod not in ("vng", "edge", "bilinear", "strict_cfa"):
-            dmethod = "vng"
+            dmethod = str(self.settings.value("stacking/debayer_method", "rcd")).lower()
+        # Accept "rcd" and default-sanitise unknown values to RCD too — the
+        # dropdown-first default so a user who never touched the setting
+        # gets ratio-corrected demosaic on their first OSC stack.
+        if dmethod not in ("rcd", "ahd", "vng", "edge", "bilinear", "strict_cfa"):
+            dmethod = "rcd"
 
         ext = file_path.lower()
         is_raw = ext.endswith(('.cr2','.cr3','.nef','.arw','.dng','.raf','.orf','.rw2','.pef'))
@@ -7490,6 +8973,28 @@ class StackingSuiteDialog(QDialog):
 
                 # Single shared implementation — flip-in/flip-out lives in
                 # debayer_array, so the pipeline can never drift from the dialog.
+                #
+                # NaN-safe demosaic: satellite-trail no-data arrives here as NaN in
+                # the bayered frame. The (numba) demosaic isn't NaN-aware, so fill
+                # NaN->0 for it, then re-impose NaN on the RGB output over a small
+                # dilation of the CFA no-data sites (covers the demosaic footprint).
+                # Dense path only; the sparse CFA-drizzle frame is handled elsewhere.
+                _nan2d = ~np.isfinite(img)
+                if (not cfa) and bool(_nan2d.any()):
+                    _img_fill = np.where(_nan2d, np.float32(0.0), img).astype(np.float32, copy=False)
+                    _rgb = np.asarray(debayer_array(
+                        _img_fill, pattern=eff_bp, roworder=roworder,
+                        method=dmethod, cfa_drizzle=cfa,
+                    ))
+                    _grow = cv2.dilate(_nan2d.astype(np.uint8),
+                                       np.ones((7, 7), np.uint8)).astype(bool)
+                    if _rgb.ndim == 3 and _rgb.shape[-1] in (1, 3):     # HWC
+                        _rgb[_grow, :] = np.nan
+                    elif _rgb.ndim == 3 and _rgb.shape[0] in (1, 3):    # CHW
+                        _rgb[:, _grow] = np.nan
+                    else:
+                        _rgb[_grow] = np.nan
+                    return _rgb
                 return debayer_array(
                     img,
                     pattern=eff_bp,
@@ -7730,8 +9235,8 @@ class StackingSuiteDialog(QDialog):
         kv = {
             # General
             "internal_dtype": "float32",
-            "chunk_height": 256,
-            "chunk_width": 256,
+            "chunk_height": _DEFAULT_BAND_ROWS,
+            "chunk_width": 0,
             "temp_group_step": 5.0,
 
             # Distortion / Transform
@@ -8095,19 +9600,28 @@ class StackingSuiteDialog(QDialog):
         fl_general.addRow(self.tr("Internal Precision:"), self.precision_combo)
 
 
-        # Chunk sizes
+        # Row-band height ("Rows"): integration runs in full-width horizontal
+        # bands, so only the band height is user-tunable. The old width control
+        # is forced to the image width at run time and hidden.
         self.chunkHeightSpinBox = QSpinBox()
-        self.chunkHeightSpinBox.setRange(32, 8192)
-        self.chunkHeightSpinBox.setValue(self.settings.value("stacking/chunk_height", 512, type=int))
+        self.chunkHeightSpinBox.setRange(8, 8192)
+        self.chunkHeightSpinBox.setValue(self.settings.value("stacking/chunk_height", _DEFAULT_BAND_ROWS, type=int))
+        self.chunkHeightSpinBox.setToolTip(self.tr(
+            "Number of image rows processed per pass. Each band spans the full "
+            "image width and is read contiguously from disk, which keeps fast "
+            "GPUs fed. Larger = fewer, bigger passes; very large bands are "
+            "capped internally so they don't overload the rejection kernels."
+        ))
+        # Width is always the full image width now. Keep the control for
+        # settings back-compat, but it is hidden and its value is never used.
         self.chunkWidthSpinBox = QSpinBox()
-        self.chunkWidthSpinBox.setRange(32, 8192)
-        self.chunkWidthSpinBox.setValue(self.settings.value("stacking/chunk_width", 512, type=int))
+        self.chunkWidthSpinBox.setRange(0, 65536)
+        self.chunkWidthSpinBox.setValue(self.settings.value("stacking/chunk_width", 0, type=int))
+        self.chunkWidthSpinBox.setVisible(False)
         hw_row = QHBoxLayout()
-        hw_row.addWidget(QLabel(self.tr("H:"))); hw_row.addWidget(self.chunkHeightSpinBox)
-        hw_row.addSpacing(8)
-        hw_row.addWidget(QLabel(self.tr("W:"))); hw_row.addWidget(self.chunkWidthSpinBox)
+        hw_row.addWidget(self.chunkHeightSpinBox)
         w_hw = QWidget(); w_hw.setLayout(hw_row)
-        fl_general.addRow(self.tr("Chunk Size:"), w_hw)
+        fl_general.addRow(self.tr("Rows per pass:"), w_hw)
 
         self.low_ram_safe_mode_cb = QCheckBox(self.tr("Low RAM Safe Mode"))
         self.low_ram_safe_mode_cb.setToolTip(self.tr(
@@ -8122,6 +9636,83 @@ class StackingSuiteDialog(QDialog):
             self.settings.value("stacking/low_ram_safe_mode", False, type=bool)
         )
         fl_general.addRow(self.low_ram_safe_mode_cb)
+
+        self.completion_sound_cb = QCheckBox(self.tr("Play a sound when stacking finishes"))
+        self.completion_sound_cb.setToolTip(self.tr(
+            "Chime when the completion summary appears, so a long stack you\n"
+            "walked away from doesn't sit unnoticed."
+        ))
+        self.completion_sound_cb.setChecked(
+            self.settings.value("stacking/completion_sound", True, type=bool)
+        )
+        fl_general.addRow(self.completion_sound_cb)
+
+        # Optional custom chime. Left blank, the system notification sound is
+        # used, so this row is purely opt-in.
+        self.completion_sound_edit = QLineEdit()
+        self.completion_sound_edit.setReadOnly(True)
+        self.completion_sound_edit.setPlaceholderText(self.tr("System chime"))
+        self.completion_sound_edit.setText(
+            self.settings.value("stacking/completion_sound_file", "", type=str) or ""
+        )
+        self.completion_sound_edit.setToolTip(self.tr(
+            "Uncompressed .wav only — compressed files will not play."
+        ))
+
+        _snd_browse = QPushButton(self.tr("Browse…"))
+        _snd_test   = QPushButton(self.tr("▶ Test"))
+        _snd_clear  = QPushButton(self.tr("Clear"))
+        for _b in (_snd_browse, _snd_test, _snd_clear):
+            _b.setAutoDefault(False)
+
+        def _pick_completion_sound():
+            start = self.completion_sound_edit.text().strip() or ""
+            p, _ = QFileDialog.getOpenFileName(
+                dialog, self.tr("Choose completion sound"),
+                os.path.dirname(start) if start else "",
+                self.tr("Wave audio (*.wav);;All files (*)")
+            )
+            if p:
+                self.completion_sound_edit.setText(p)
+
+        def _test_completion_sound():
+            # force=True: the checkbox value isn't committed until OK, so a
+            # freshly-ticked box would otherwise test silently.
+            self._play_completion_chime(
+                success=True,
+                path_override=(self.completion_sound_edit.text().strip() or None),
+                force=True,
+            )
+
+        _snd_browse.clicked.connect(_pick_completion_sound)
+        _snd_test.clicked.connect(_test_completion_sound)
+        _snd_clear.clicked.connect(lambda: self.completion_sound_edit.clear())
+
+        _snd_row = QHBoxLayout()
+        _snd_row.setContentsMargins(0, 0, 0, 0)
+        _snd_row.addWidget(self.completion_sound_edit, 1)
+        _snd_row.addWidget(_snd_browse)
+        _snd_row.addWidget(_snd_test)
+        _snd_row.addWidget(_snd_clear)
+        _snd_w = QWidget(); _snd_w.setLayout(_snd_row)
+        fl_general.addRow(self.tr("Custom sound:"), _snd_w)
+
+        _snd_note = QLabel(self.tr(
+            "Leave blank to use the system chime. A custom .wav is used instead when set."
+        ))
+        _snd_note.setWordWrap(True)
+        try:
+            _f = _snd_note.font(); _f.setPointSizeF(max(7.0, _f.pointSizeF() - 1.0)); _snd_note.setFont(_f)
+            _snd_note.setStyleSheet("color: palette(mid);")
+        except Exception:
+            pass
+        fl_general.addRow("", _snd_note)
+
+        def _sync_completion_sound_enabled(on: bool):
+            for _w in (self.completion_sound_edit, _snd_browse, _snd_test, _snd_clear, _snd_note):
+                _w.setEnabled(bool(on))
+        _sync_completion_sound_enabled(self.completion_sound_cb.isChecked())
+        self.completion_sound_cb.toggled.connect(_sync_completion_sound_enabled)
 
         left_col.addWidget(gb_general)
 
@@ -8180,10 +9771,8 @@ class StackingSuiteDialog(QDialog):
         self.align_downsample.setValue(self.settings.value("stacking/align/downsample", 3, type=int))
         self.align_downsample.setToolTip(
             self.tr("Solve grid downsample factor (source size / N).\n"
-            "Default 3 works for most setups. Lower (e.g. 2) gives a finer "
-            "solve grid — try this if you see double stars / a bimodal "
-            "registration error on high-resolution sensors, especially "
-            "with meridian-flipped frames. Higher values are faster but "
+            "Default 3 works for most setups. Lower gives a finer "
+            "solve grid but is slower. Higher values are faster but "
             "coarser.")
         )
         disto_form.addRow(self.tr("Solve grid downsample:"), self.align_downsample)
@@ -8227,7 +9816,29 @@ class StackingSuiteDialog(QDialog):
         self.shift_tol_spin.setDecimals(2)
         self.shift_tol_spin.setSingleStep(0.05)
         self.shift_tol_spin.setValue(self.settings.value("stacking/shift_tolerance", 0.2, type=float))
-        fl_align.addRow(self.tr("Accept tolerance (px):"), self.shift_tol_spin)
+        self.shift_tol_spin.setToolTip(self.tr(
+            "Accurate mode only. The 3-pass refinement stops when the median "
+            "per-star shift between passes falls below this value, meaning "
+            "alignment has converged.\n\n"
+            "Smaller = tighter convergence, more work per frame. Larger = "
+            "stops sooner, less precise.\n\n"
+            "Has no effect in Fast mode, which runs a single pass and accepts "
+            "whatever transformation astroalign returns. To let more frames "
+            "pass alignment, raise 'Accept max shift (px)' below instead."
+        ))
+        self._shift_tol_label = QLabel(self.tr("Convergence tolerance (px):"))
+        fl_align.addRow(self._shift_tol_label, self.shift_tol_spin)
+
+        def _toggle_tol_enable():
+            # Fast mode (index 0) = single pass, no convergence loop, this
+            # value is literally never consulted. Grey it out so users don't
+            # think bumping it will relax alignment.
+            is_accurate = (self.align_passes_combo.currentIndex() >= 1)
+            self._shift_tol_label.setEnabled(is_accurate)
+            self.shift_tol_spin.setEnabled(is_accurate)
+
+        _toggle_tol_enable()
+        self.align_passes_combo.currentIndexChanged.connect(lambda _: _toggle_tol_enable())
 
         self.accept_shift_spin = QDoubleSpinBox()
         self.accept_shift_spin.setRange(0.0, 50.0)
@@ -8316,6 +9927,38 @@ class StackingSuiteDialog(QDialog):
         )
         fl_align.addRow(self.tr("Max stars:"), self.align_limit_stars_spin)
 
+        # Warp interpolation kernel — the final full-resolution resample.
+        # Shared QSettings key `stacking/align/kernel` is read AND written by
+        # the Star Alignment dialog's Advanced panel too, so a user who
+        # changes it in either place sees the change reflected in the other.
+        # `_warp_hi_interp()` in star_alignment.py reads this key live on
+        # every warp — no restart needed.
+        self.align_kernel_combo = QComboBox()
+        self.align_kernel_combo.addItems([
+            self.tr("Lanczos4 (sharpest; rings on bright stars)"),
+            self.tr("Bicubic / Mitchell (less ringy; recommended)"),
+            self.tr("Bilinear (softest; no ringing)"),
+        ])
+        _KERNEL_TO_IDX = {"lanczos": 0, "cubic": 1, "linear": 2}
+        _saved_kernel = str(
+            self.settings.value("stacking/align/kernel", "lanczos") or "lanczos"
+        ).strip().lower()
+        self.align_kernel_combo.setCurrentIndex(_KERNEL_TO_IDX.get(_saved_kernel, 0))
+        self.align_kernel_combo.setToolTip(self.tr(
+            "Resampling kernel used for the final full-resolution warp "
+            "(applies to Register and Integrate, Skip Registration, and the "
+            "Star Alignment dialog).\n\n"
+            "• Lanczos4: sharpest, but its negative lobes cause dark halos\n"
+            "  around bright narrowband stars (what the anti-ring guard is\n"
+            "  there to catch).\n"
+            "• Bicubic / Mitchell: shorter negative lobes — noticeably less\n"
+            "  ringy, slightly softer on well-aligned frames. Recommended\n"
+            "  if dark rings persist (OSC narrowband data in particular).\n"
+            "• Bilinear: no sharpening and no ringing at all; the softest\n"
+            "  result. Keep for ring-sensitive diagnostics only."
+        ))
+        fl_align.addRow(self.tr("Warp interpolation:"), self.align_kernel_combo)
+
         # Timeout spinbox kept for QSettings back-compat but hidden from UI
         self.align_timeout_spin = QSpinBox()
         self.align_timeout_spin.setValue(
@@ -8333,6 +9976,9 @@ class StackingSuiteDialog(QDialog):
         self.hw_accel_cb.setToolTip(self.tr("Enable GPU/MPS via PyTorch when supported; falls back to CPU automatically."))
         self.hw_accel_cb.setChecked(self.settings.value("stacking/use_hardware_accel", True, type=bool))
         fl_perf.addRow(self.hw_accel_cb)
+        self.hw_accel_cb.toggled.connect(
+            lambda v: self.settings.setValue("stacking/use_hardware_accel", bool(v))
+        )
 
         # NEW: MFDeconv engine choice (radio buttons)
         eng_box = QGroupBox(self.tr("MFDeconv Engine"))
@@ -8669,6 +10315,110 @@ class StackingSuiteDialog(QDialog):
         wmode_row.addWidget(wmode_label); wmode_row.addWidget(self.weight_mode_combo, 1)
         rej_layout.addLayout(wmode_row)
 
+        # Exposure-time weighting. Scales each frame's quality score by
+        # exp/max(exp) so a 120s sub in a 300s-dominated stack carries 120/300
+        # of a comparable 300s sub's weight (regardless of weight mode). This
+        # is the correct weighting in the photon-shot-noise-dominated regime
+        # that modern CMOS sensors sit in; see the long-form note in the
+        # per-frame debug log. Default ON — mixed-exposure stacks were
+        # previously weighted as if all frames were equal exposure, which is
+        # only correct when they actually are.
+        self.exposure_weighted_cb = QCheckBox(self.tr("Scale weights by exposure time"))
+        self.exposure_weighted_cb.setToolTip(self.tr(
+            "When mixed-exposure subs are stacked together (e.g. 120s and 300s\n"
+            "frames in the same group — usually because the exposure tolerance\n"
+            "is set high enough to merge them), scales each frame's weight by\n"
+            "its exposure time relative to the longest exposure in the group.\n"
+            "\n"
+            "• 300s sub (longest) → ×1.00 of its quality score\n"
+            "• 120s sub           → ×0.40 of its quality score\n"
+            "\n"
+            "Without this, a 120s sub would carry equal weight to a 300s sub\n"
+            "of similar quality — overweighting the shorter-exposure data.\n"
+            "Linear scaling is correct in the photon-shot-noise-dominated\n"
+            "regime of modern CMOS sensors (read noise is sqrt-scaled and\n"
+            "~1-2 electrons, so the linear-exposure benefit dominates).\n"
+            "\n"
+            "No effect when every frame in a group has the same exposure."
+        ))
+        self.exposure_weighted_cb.setChecked(
+            self.settings.value("stacking/exposure_weighted", True, type=bool)
+        )
+        self.exposure_weighted_cb.toggled.connect(
+            lambda v: self.settings.setValue("stacking/exposure_weighted", bool(v))
+        )
+        rej_layout.addWidget(self.exposure_weighted_cb)
+
+        # ─────────────────────────────────────────────────────────────
+        # Score-outlier sub rejection — soft reject (weight = 0) applied
+        # after measurement and before integration. The per-run checkbox
+        # on the integration tab decides whether the threshold is reviewed
+        # in a dialog or auto-applied from this setting.
+        # ─────────────────────────────────────────────────────────────
+        reject_row = QHBoxLayout()
+        self.reject_outliers_cb = QCheckBox(self.tr("Reject score outliers below median − k·σ"))
+        self.reject_outliers_cb.setToolTip(self.tr(
+            "After measurement, compute median and robust MAD-σ of all frames'\n"
+            "weighted scores. Any sub whose score falls below median − k·σ is\n"
+            "soft-rejected: its weight is set to 0 so integration treats it as\n"
+            "absent, but the file itself is untouched.\n"
+            "\n"
+            "Skipped automatically when there are fewer than 10 subs (MAD\n"
+            "is too noisy) or when the score distribution is tight (σ < 0.02,\n"
+            "nothing genuinely stands out).\n"
+            "\n"
+            "Use the 'Review subs interactively' checkbox on the Image\n"
+            "Registration tab to confirm/adjust the threshold per run."
+        ))
+        self.reject_outliers_cb.setChecked(
+            self.settings.value("stacking/reject_outliers_enabled", True, type=bool)
+        )
+        reject_row.addWidget(self.reject_outliers_cb)
+
+        reject_row.addSpacing(8)
+        reject_row.addWidget(QLabel(self.tr("k:")))
+        self.reject_outliers_k_spin = QDoubleSpinBox()
+        self.reject_outliers_k_spin.setRange(1.5, 10.0)
+        self.reject_outliers_k_spin.setDecimals(2)
+        self.reject_outliers_k_spin.setSingleStep(0.1)
+        self.reject_outliers_k_spin.setValue(
+            self.settings.value("stacking/reject_outliers_sigma_k", 3.5, type=float)
+        )
+        self.reject_outliers_k_spin.setToolTip(self.tr(
+            "Rejection threshold = median − k·σ (robust).\n"
+            "• 3.0 — more aggressive (clips the lower tail sooner)\n"
+            "• 3.5 — balanced (default)\n"
+            "• 4.0+ — only cull dramatic outliers"
+        ))
+        reject_row.addWidget(self.reject_outliers_k_spin)
+
+        reject_row.addSpacing(16)
+        self.reject_outliers_interactive_cb = QCheckBox(self.tr("Default to interactive review"))
+        self.reject_outliers_interactive_cb.setToolTip(self.tr(
+            "When on, newly opened sessions initialize the Image Registration\n"
+            "tab's 'Review subs interactively before stacking' checkbox to on.\n"
+            "The per-run checkbox on that tab always wins for the current run."
+        ))
+        self.reject_outliers_interactive_cb.setChecked(
+            self.settings.value("stacking/reject_outliers_interactive", False, type=bool)
+        )
+        reject_row.addWidget(self.reject_outliers_interactive_cb)
+
+        self.reject_outliers_advanced_cb = QCheckBox(self.tr("Start review in Advanced mode"))
+        self.reject_outliers_advanced_cb.setToolTip(self.tr(
+            "When on, the interactive-review dialog opens in Advanced mode —\n"
+            "the 2×3 grid of FWHM, Eccentricity, Background, Star Count,\n"
+            "Noise, and Weighted Score. Toggle inside the dialog switches back\n"
+            "and forth; the setting is updated to match the view you last used."
+        ))
+        self.reject_outliers_advanced_cb.setChecked(
+            self.settings.value("stacking/reject_outliers_advanced", False, type=bool)
+        )
+        reject_row.addWidget(self.reject_outliers_advanced_cb)
+
+        reject_row.addStretch(1)
+        rej_layout.addLayout(reject_row)
+
         # Param rows as small containers we can show/hide
         def _mini_row(label_text, widget, help_text=None):
             row = QWidget()
@@ -8810,6 +10560,22 @@ class StackingSuiteDialog(QDialog):
         row_sig_h.addWidget(QLabel(self.tr("Cold σ:"))); row_sig_h.addWidget(self.cosm_cold_sigma)
         fl_cosm.addRow(self.tr("Sigma thresholds:"), row_sig)
 
+        # Structure-protection threshold — applies to the GPU cosmetic pass
+        # regardless of the advanced toggle (it's the star/nebula-core guard).
+        self.cosm_protect_sigma = _mk_fspin(2.0, 50.0, 0.5, 1,
+            "stacking/cosmetic/protect_sigma", 5.0)
+        self.cosm_protect_sigma.setToolTip(self.tr(
+            "Patches whose local median sits this many σ above background are\n"
+            "treated as real signal (star / nebula cores) and left untouched by\n"
+            "the hot pass. A lone hot pixel can't move a median, so it is still\n"
+            "corrected. Lower = protect more (safer for tight stars); higher =\n"
+            "correct more aggressively. Set very high to disable protection."
+        ))
+        row_prot = QWidget(); row_prot_h = QHBoxLayout(row_prot); row_prot_h.setContentsMargins(0,0,0,0)
+        row_prot_h.addWidget(QLabel(self.tr("Protect σ:"))); row_prot_h.addWidget(self.cosm_protect_sigma)
+        row_prot_h.addStretch(1)
+        fl_cosm.addRow(self.tr("Structure protection:"), row_prot)
+
         # Legacy profile compatibility: read-but-don't-show star guard / sat quantile values
         # so old profiles don't error on load. These are never written back.
         self.cosm_star_mean_ratio = _mk_fspin(0.05, 0.60, 0.01, 3,
@@ -8826,6 +10592,7 @@ class StackingSuiteDialog(QDialog):
         def _restore_defaults():
             self.cosm_hot_sigma.setValue(5.0)
             self.cosm_cold_sigma.setValue(5.0)
+            self.cosm_protect_sigma.setValue(5.0)
         btn_defaults.clicked.connect(_restore_defaults)
         fl_cosm.addRow(btn_defaults)
 
@@ -8986,16 +10753,48 @@ class StackingSuiteDialog(QDialog):
         self.settings.setValue("stacking/rejection_algorithm",  self.rejection_algorithm)
         if hasattr(self, "weight_mode"):
             self.settings.setValue("stacking/weight_mode",       self.weight_mode)
+
+        # Score-outlier sub rejection (soft reject; applied in
+        # _apply_sub_rejection after measurement, before integration).
+        if hasattr(self, "reject_outliers_cb"):
+            self.settings.setValue(
+                "stacking/reject_outliers_enabled",
+                bool(self.reject_outliers_cb.isChecked()),
+            )
+        if hasattr(self, "reject_outliers_k_spin"):
+            self.settings.setValue(
+                "stacking/reject_outliers_sigma_k",
+                float(self.reject_outliers_k_spin.value()),
+            )
+        if hasattr(self, "reject_outliers_interactive_cb"):
+            self.settings.setValue(
+                "stacking/reject_outliers_interactive",
+                bool(self.reject_outliers_interactive_cb.isChecked()),
+            )
+        if hasattr(self, "reject_outliers_advanced_cb"):
+            self.settings.setValue(
+                "stacking/reject_outliers_advanced",
+                bool(self.reject_outliers_advanced_cb.isChecked()),
+            )
+
         self.settings.setValue("stacking/kappa",                self.kappa)
         self.settings.setValue("stacking/iterations",           self.iterations)
         self.settings.setValue("stacking/esd_threshold",        self.esd_threshold)
+        # Round-trip the INI-only ESD escape hatch so saving settings from the
+        # dialog doesn't quietly reset it (there is no widget backing it).
+        self.settings.setValue("stacking/esd_bonferroni",
+                               bool(getattr(self, "esd_bonferroni", False)))
         self.settings.setValue("stacking/biweight_constant",    self.biweight_constant)
         self.settings.setValue("stacking/trim_fraction",        self.trim_fraction)
         self.settings.setValue("stacking/modz_threshold",       self.modz_threshold)
         self.settings.setValue("stacking/chunk_height",         self.chunk_height)
         self.settings.setValue("stacking/chunk_width",          self.chunk_width)
         self.settings.setValue("stacking/low_ram_safe_mode",
-                               bool(self.low_ram_safe_mode_cb.isChecked()))        
+                               bool(self.low_ram_safe_mode_cb.isChecked()))
+        self.settings.setValue("stacking/completion_sound",
+                               bool(self.completion_sound_cb.isChecked()))
+        self.settings.setValue("stacking/completion_sound_file",
+                               self.completion_sound_edit.text().strip())
         self.settings.setValue("stacking/autocrop_enabled",     self.autocrop_cb.isChecked())
         self.settings.setValue("stacking/autocrop_pct",         float(self.autocrop_pct.value()))
         self.temp_group_step = float(self.temp_group_step_spin.value())
@@ -9052,6 +10851,7 @@ class StackingSuiteDialog(QDialog):
         self.settings.setValue("stacking/cosmetic/custom_enable",  self.cosm_enable_cb.isChecked())
         self.settings.setValue("stacking/cosmetic/hot_sigma",      float(self.cosm_hot_sigma.value()))
         self.settings.setValue("stacking/cosmetic/cold_sigma",     float(self.cosm_cold_sigma.value()))
+        self.settings.setValue("stacking/cosmetic/protect_sigma",  float(self.cosm_protect_sigma.value()))
         self.settings.setValue("stacking/cosmetic/star_mean_ratio",float(self.cosm_star_mean_ratio.value()))
         self.settings.setValue("stacking/cosmetic/star_max_ratio", float(self.cosm_star_max_ratio.value()))
         self.settings.setValue("stacking/cosmetic/sat_quantile",   float(self.cosm_sat_quantile.value()))
@@ -9077,6 +10877,14 @@ class StackingSuiteDialog(QDialog):
         self.settings.setValue("stacking/align/auto_threshold",        bool(self.align_auto_thresh_cb.isChecked()))
         self.settings.setValue("stacking/align/limit_stars",           int(self.align_limit_stars_spin.value()))
         self.settings.setValue("stacking/align/timeout_per_job_sec",   int(self.align_timeout_spin.value()))
+        # Warp interpolation kernel — shared with the Star Alignment dialog's
+        # Advanced-panel dropdown. Canonical strings: "lanczos"|"cubic"|"linear".
+        _IDX_TO_KERNEL = ("lanczos", "cubic", "linear")
+        _kidx = self.align_kernel_combo.currentIndex()
+        self.settings.setValue(
+            "stacking/align/kernel",
+            _IDX_TO_KERNEL[max(0, min(_kidx, len(_IDX_TO_KERNEL) - 1))],
+        )
         self.settings.setValue("stacking/drop_shrink",                 float(self.drop_shrink_spin.value()))
 
         kidx = self.drizzle_kernel_combo.currentIndex()
@@ -9130,7 +10938,7 @@ class StackingSuiteDialog(QDialog):
             self._refresh_comet_starless_enable()
         except Exception:
             pass
-
+        
     # --- Drizzle config: single source of truth ---
     def _get_drizzle_pixfrac(self) -> float:
         s = self.settings
@@ -9271,6 +11079,11 @@ class StackingSuiteDialog(QDialog):
                 self.alignment_thread.wait(1500)
         except Exception:
             pass
+
+        # A dialog deleted on close drops its background header scan; one that
+        # is only hidden keeps loading so its tree is complete when shown again.
+        if self.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose):
+            self._cancel_calibrated_scan()
 
         # Flush and close the stacking log file
         try:
@@ -9855,6 +11668,62 @@ class StackingSuiteDialog(QDialog):
         if "light" in s or "object" in s: return "LIGHT"
         return None
 
+    # Folder-name → frame-type hints. Checked LEAF-TO-ROOT so the closest
+    # ancestor wins. Prefix match on the casefolded folder name:
+    # "Darks_2024-10", "DarkFlat_subs", "biasframes" all land in DARK;
+    # "Flats_Lum", "FlatField/" land in FLAT; "Lights", "LIGHT_curves/"
+    # land in LIGHT. Bias and darkflat frames are routed to DARK on
+    # purpose — modern CMOS has no useful bias/offset signal distinct
+    # from a short dark, and dark flats calibrate flats via the darks
+    # pipeline. "offset" is included because some older captures use it
+    # as a synonym for bias. Patterns are checked in order; the first
+    # match wins (so "darkflat" and "biasflat" hit the DARK rule before
+    # "flat").
+    _FRAME_FOLDER_PATTERNS = (
+        (re.compile(r"^(darkflat|dark_flat|biasflat|bias_flat)", re.I), "DARK"),
+        (re.compile(r"^(bias|offset)",                           re.I), "DARK"),
+        (re.compile(r"^dark",                                    re.I), "DARK"),
+        (re.compile(r"^flat",                                    re.I), "FLAT"),
+        (re.compile(r"^light",                                   re.I), "LIGHT"),
+    )
+
+    def _guess_type_from_path(self, path: str) -> str | None:
+        """Infer a frame type from folder names in `path`. Walks parent
+        directories leaf-to-root and returns the first match. Returns
+        None if nothing matches. Pure string work — never touches disk."""
+        try:
+            parts = Path(path).parts[:-1]
+        except Exception:
+            return None
+        for name in reversed(parts):
+            n = (name or "").strip()
+            if not n:
+                continue
+            for rx, kind in self._FRAME_FOLDER_PATTERNS:
+                if rx.match(n):
+                    return kind
+        return None
+
+    def _guess_frame_type(self, header, path: str) -> str | None:
+        """Preferred classifier: header first, folder-name fallback.
+
+        Lots of acquisition tools don't write IMAGETYP (SharpCap in some
+        modes, raw ASCOM dumps, decades-old FITS, user-converted files).
+        If the user organized by folder — Darks/, Flats/, Bias/, Lights/
+        — honor that so a mixed-type Add Directory doesn't dump
+        everything into whichever tab the user clicked from.
+        """
+        actual = None
+        try:
+            actual = self._guess_type_from_imagetyp(
+                header.get("IMAGETYP") if header is not None else None
+            )
+        except Exception:
+            actual = None
+        if actual is not None:
+            return actual
+        return self._guess_type_from_path(path)
+
     def _parse_exposure_from_groupkey(self, group_key: str) -> float | None:
         # expects "... - 300s (WxH)" → 300
 
@@ -10400,7 +12269,22 @@ class StackingSuiteDialog(QDialog):
         correction_layout.addWidget(self.pedestal_checkbox)
         correction_layout.addWidget(self.bias_checkbox)
 
-        layout.addLayout(correction_layout)        
+        layout.addLayout(correction_layout)     
+        # Interactive cosmetic-correction tuning button
+        tune_row = QHBoxLayout()
+        self.tune_cosmetic_btn = QPushButton(self.tr("🔬 Tune Cosmetic Correction σ…"))
+        self.tune_cosmetic_btn.setToolTip(self.tr(
+            "Opens the Cosmetic Correction dialog on the light frame selected in your\n"
+            "list (or the first one if nothing is selected).  Use the ◀ / picker / ▶ bar\n"
+            "at the top of the dialog to bounce between frames.\n"
+            "Adjust Hot σ and Cold σ with the live preview until you're happy with how it\n"
+            "handles hot pixels without eating star cores.  Clicking “Save σ Settings”\n"
+            "writes the values back to Stacking Suite so calibration uses them."
+        ))
+        self.tune_cosmetic_btn.clicked.connect(self._open_tune_cosmetic_dialog)
+        tune_row.addWidget(self.tune_cosmetic_btn)
+        tune_row.addStretch(1)
+        layout.addLayout(tune_row)           
         # ---------- Satellite Trail Masking (post-calibration, for integration) ----------
         sat_layout = QHBoxLayout()
 
@@ -10449,6 +12333,47 @@ class StackingSuiteDialog(QDialog):
         sat_layout.addWidget(self.cal_satellite_clip_checkbox)
         sat_layout.addStretch(1)
 
+        # Concurrent workers for the Phase 2 satellite trail pass. Each
+        # worker holds one calibrated frame in RAM and allocates its own
+        # GPU activations; 2 overlaps I/O and CPU work with GPU inference
+        # for a solid speedup, higher costs memory. Set to 1 for serial
+        # behavior if VRAM is tight.
+        sat_workers_lbl = QLabel(self.tr("Workers:"))
+        sat_workers_lbl.setStyleSheet("font-size: 11px; color: palette(mid);")
+        sat_workers_lbl.setToolTip(self.tr(
+            "Number of frames processed in parallel during the satellite "
+            "trail pass. Higher values overlap file I/O and CPU work with "
+            "GPU inference. Default 2. Drop to 1 if you hit VRAM OOM; raise "
+            "if your GPU and RAM can take it."
+        ))
+
+        self.cal_satellite_workers_spin = QSpinBox()
+        self.cal_satellite_workers_spin.setRange(1, 8)
+        self.cal_satellite_workers_spin.setFixedWidth(60)
+        self.cal_satellite_workers_spin.setToolTip(sat_workers_lbl.toolTip())
+        self.cal_satellite_workers_spin.setValue(
+            int(self.settings.value(
+                "stacking/calibration_satellite_workers", 2, type=int
+            ))
+        )
+        self.cal_satellite_workers_spin.valueChanged.connect(
+            lambda v: self.settings.setValue(
+                "stacking/calibration_satellite_workers", int(v)
+            )
+        )
+
+        # Gray out the Workers control when satellite removal is disabled,
+        # so the knob only lights up when it will actually be used.
+        def _sync_sat_workers_enabled(checked: bool):
+            self.cal_satellite_workers_spin.setEnabled(bool(checked))
+            sat_workers_lbl.setEnabled(bool(checked))
+
+        _sync_sat_workers_enabled(self.cal_satellite_checkbox.isChecked())
+        self.cal_satellite_checkbox.toggled.connect(_sync_sat_workers_enabled)
+
+        sat_layout.addWidget(sat_workers_lbl)
+        sat_layout.addWidget(self.cal_satellite_workers_spin)
+
         layout.addLayout(sat_layout)
         # --- RIGHT SIDE CONTROLS: Override Dark & Flat ---
         override_layout = QHBoxLayout()
@@ -10487,6 +12412,111 @@ class StackingSuiteDialog(QDialog):
 
         return tab
     
+    def _first_light_path(self) -> str | None:
+        """Return the path of the first usable light frame in the tree.
+
+        Falls back to self.light_files if the tree hasn't been populated
+        yet.  Returns None if there's genuinely nothing to load.
+        """
+        import os
+        try:
+            for i in range(self.light_tree.topLevelItemCount()):
+                top = self.light_tree.topLevelItem(i)
+                for j in range(top.childCount()):
+                    mid = top.child(j)
+                    for k in range(mid.childCount()):
+                        leaf = mid.child(k)
+                        path = leaf.data(0, Qt.ItemDataRole.UserRole)
+                        if path and os.path.isfile(path):
+                            return path
+        except Exception:
+            pass
+        # Fallback: any light in the flat dict
+        try:
+            for paths in (self.light_files or {}).values():
+                for p in paths:
+                    if p and os.path.isfile(p):
+                        return p
+        except Exception:
+            pass
+        return None
+
+    def _selected_light_path(self) -> str | None:
+        """Path of the light frame currently selected in the tree.
+
+        If a group node is selected, use the first light beneath it.
+        Falls back to the first light overall.
+        """
+        import os
+        try:
+            sel = self.light_tree.selectedItems()
+            if sel:
+                queue = [sel[0]]
+                while queue:
+                    node = queue.pop(0)
+                    p = node.data(0, Qt.ItemDataRole.UserRole)
+                    if p and os.path.isfile(p):
+                        return p
+                    queue.extend(node.child(c) for c in range(node.childCount()))
+        except Exception:
+            pass
+        return self._first_light_path()
+
+    def _all_light_paths(self) -> list[str]:
+        """Ordered, de-duplicated list of every light-frame path in the tree
+        (used by the tuning dialog's Prev/Next navigation)."""
+        import os
+        out, seen = [], set()
+        try:
+            for i in range(self.light_tree.topLevelItemCount()):
+                top = self.light_tree.topLevelItem(i)
+                for j in range(top.childCount()):
+                    mid = top.child(j)
+                    for k in range(mid.childCount()):
+                        leaf = mid.child(k)
+                        p = leaf.data(0, Qt.ItemDataRole.UserRole)
+                        if p and os.path.isfile(p) and p not in seen:
+                            seen.add(p); out.append(p)
+        except Exception:
+            pass
+        if not out:
+            try:
+                for paths in (self.light_files or {}).values():
+                    for p in paths:
+                        if p and os.path.isfile(p) and p not in seen:
+                            seen.add(p); out.append(p)
+            except Exception:
+                pass
+        return out
+
+    def _open_tune_cosmetic_dialog(self):
+        """Open Cosmetic Correction in tuning mode on the selected light
+        (falls back to the first), with Prev/Next to check other frames."""
+        all_paths = self._all_light_paths()
+        path = self._selected_light_path() or (all_paths[0] if all_paths else None)
+        if not path:
+            QMessageBox.information(
+                self, self.tr("Tune Cosmetic Correction"),
+                self.tr("Add at least one light frame to the list first.")
+            )
+            return
+        try:
+            from setiastro.saspro.cosmetic_correction import open_cosmetic_correction_tune
+        except Exception as e:
+            QMessageBox.critical(
+                self, self.tr("Tune Cosmetic Correction"),
+                self.tr(f"Could not open the tuning dialog:\n{e}")
+            )
+            return
+        # Log which sample is being used so the user isn't confused later
+        try:
+            self.update_status(
+                self.tr("🔬 Tuning cosmetic σ on: {0}").format(os.path.basename(path))
+            )
+        except Exception:
+            pass
+        open_cosmetic_correction_tune(self, path, all_paths=all_paths)
+
     def _manual_session_keyword(self) -> str:
         try:
             s = (self.session_keyword_edit.text() or "").strip()
@@ -10630,27 +12660,10 @@ class StackingSuiteDialog(QDialog):
         When auto-session is OFF, build a session tag from the folder names
         using a user-provided keyword.
         Example: keyword='NIGHT' and path contains .../NIGHT2/... => session 'NIGHT2'
+        The filename is ignored so a keyword that also appears in light names
+        does not create one session per file.
         """
-        kw = (keyword or "").strip()
-        if not kw or kw.lower() == "default":
-            return "Default"
-
-        parts = os.path.normpath(path).split(os.sep)
-
-        # Prefer folders like NIGHT1 / NIGHT_2 / NIGHT-3 etc.
-        pat = re.compile(rf"^{re.escape(kw)}\s*[_-]?\s*\d+$", re.IGNORECASE)
-        for part in reversed(parts):
-            if pat.match(part):
-                return part
-
-        # Fallback: any folder containing the keyword
-        kw_low = kw.lower()
-        for part in reversed(parts):
-            if kw_low in part.lower():
-                return part
-
-        # Last resort: just use the keyword
-        return kw
+        return session_from_manual_keyword(path, keyword)
 
     def prompt_set_session(self, item, frame_type):
         text, ok = QInputDialog.getText(
@@ -11373,6 +13386,7 @@ class StackingSuiteDialog(QDialog):
 
         for i in range(tree.topLevelItemCount()):
             _summarize_item(tree.topLevelItem(i))
+        self._refresh_set_column()           
 
     def _find_or_make_exposure_group_key(self, grouped: dict, filt: str, exp: float, size: str,
                                           gain: float | None = None) -> str:
@@ -11388,7 +13402,10 @@ class StackingSuiteDialog(QDialog):
 
             if filt != f2 or s2 != size:
                 continue
-            if abs(float(exp) - float(e2)) > exp_tol:
+            # +0.5s epsilon absorbs sub-second EXPTIME jitter from drivers
+            # (e.g. 89.999 vs 120.001) and .1f rounding of the seed key, so
+            # files you'd call "exactly 30s apart" still land in one group.
+            if abs(float(exp) - float(e2)) > exp_tol + 0.5:
                 continue
 
             # Gain check — extract gain from key if present
@@ -11411,6 +13428,194 @@ class StackingSuiteDialog(QDialog):
         gain_suffix = f" [G{int(gain)}]" if gain is not None else ""
         return f"{filt} - {float(exp):.1f}s ({size}){gain_suffix}"
 
+    def _set_key(self, path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    def _set_of_frame(self, path: str) -> str:
+        return self.frame_set_of.get(self._set_key(path), "Default")
+
+    def _ensure_default_set(self):
+        # Always re-sync "Default" with the current global reference state.
+        #
+        # The per-set registration loop (see _run_registration_set / line
+        # ~24574) treats reg_sets["Default"]["locked"] as the single source
+        # of truth for whether to honor a user-picked reference. If we only
+        # synced on first creation, the common flow — Default set existed
+        # already (created at UI init via _rebuild_set_combo), THEN the user
+        # clicked "Select Reference" to pick a bin 1 frame — would leave
+        # reg_sets["Default"]["locked"] = False even though _user_ref_locked
+        # is True globally, and the queue loop would silently discard the
+        # user's pick and auto-select within the set (often a bin 2 frame).
+        # Re-syncing every call keeps global and Default-set state unified,
+        # so a user ref picked at any point before registration starts is
+        # honored, and reset_reference_to_auto() propagates too. Named sets
+        # (anything other than "Default") are never touched here — their
+        # per-set reference picker owns their state.
+        _locked = bool(getattr(self, "_user_ref_locked", False))
+        _ref = self.reference_frame if _locked else None
+        self.reg_sets["Default"] = {"reference": _ref, "locked": _locked}
+
+    def _rebuild_set_combo(self):
+        self._ensure_default_set()
+        cur = self._active_set_name
+        self.reg_set_combo.blockSignals(True)
+        self.reg_set_combo.clear()
+        self.reg_set_combo.addItems(list(self.reg_sets.keys()))
+        if cur in self.reg_sets:
+            self.reg_set_combo.setCurrentText(cur)
+        self.reg_set_combo.blockSignals(False)
+        self._refresh_active_set_ref_label()
+
+    def _on_active_set_changed(self, name: str):
+        if name:
+            self._active_set_name = name
+            self._refresh_active_set_ref_label()
+
+    def _new_reg_set(self):
+        name, ok = QInputDialog.getText(self, self.tr("New Registration Set"),
+                                        self.tr("Set name (e.g. Panel 1, M31, OIII-mosaic):"))
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if name in self.reg_sets:
+            QMessageBox.information(self, self.tr("Set exists"),
+                                    self.tr("A set named '{0}' already exists.").format(name))
+        else:
+            self.reg_sets[name] = {"reference": None, "locked": False}
+        self._active_set_name = name
+        self._rebuild_set_combo()
+        # If frames are selected, assign them immediately — the common case.
+        if self.reg_tree.selectedItems():
+            self._assign_selected_to_set()
+
+    def _selected_leaf_paths(self) -> list[str]:
+        """All frame paths under the current selection (selecting a group == selecting its leaves)."""
+        paths, seen = [], set()
+        for it in self.reg_tree.selectedItems():
+            leaves = [it] if it.childCount() == 0 else [it.child(j) for j in range(it.childCount())]
+            for leaf in leaves:
+                fp = leaf.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(fp, str) and fp and fp not in seen:
+                    seen.add(fp); paths.append(fp)
+        return paths
+
+    def _assign_selected_to_set(self, target: str | None = None):
+        target = target or self._active_set_name
+        self._ensure_default_set()
+        if target not in self.reg_sets:
+            self.reg_sets[target] = {"reference": None, "locked": False}
+        paths = self._selected_leaf_paths()
+        if not paths:
+            self.update_status(self.tr("ℹ️ Select frames or a group first, then assign to a set."))
+            return
+        for fp in paths:
+            if target == "Default":
+                self.frame_set_of.pop(self._set_key(fp), None)
+            else:
+                self.frame_set_of[self._set_key(fp)] = target
+        self.update_status(self.tr("🧩 Assigned {0} frame(s) → set '{1}'.").format(len(paths), target))
+        self._refresh_set_column()
+
+    def _all_reg_tree_paths(self) -> list[str]:
+        """Every frame path currently shown in the registration tree."""
+        paths, seen = [], set()
+        for i in range(self.reg_tree.topLevelItemCount()):
+            top = self.reg_tree.topLevelItem(i)
+            leaves = [top] if top.childCount() == 0 else [
+                top.child(j) for j in range(top.childCount())
+            ]
+            for leaf in leaves:
+                fp = leaf.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(fp, str) and fp and fp not in seen:
+                    seen.add(fp)
+                    paths.append(fp)
+        return paths
+
+    def _assign_sets_from_filename_keyword(self):
+        """Create sets and assign every loaded frame from Keyword + separator + tag."""
+        kw = (self.reg_set_keyword_edit.text() or "").strip()
+        self.settings.setValue("stacking/reg_set_filename_keyword", kw)
+        if not kw:
+            self.update_status(self.tr("ℹ️ Enter a filename keyword (e.g. Panel) first."))
+            return
+        self._ensure_reg_tree_loaded()
+        paths = self._all_reg_tree_paths()
+        if not paths:
+            self.update_status(self.tr("ℹ️ No frames in the registration tree to assign."))
+            return
+        self._ensure_default_set()
+        counts: dict[str, int] = {}
+        n_default = 0
+        for fp in paths:
+            name = set_name_from_filename_keyword(fp, kw)
+            if not name:
+                self.frame_set_of.pop(self._set_key(fp), None)
+                n_default += 1
+                continue
+            if name not in self.reg_sets:
+                self.reg_sets[name] = {"reference": None, "locked": False}
+            self.frame_set_of[self._set_key(fp)] = name
+            counts[name] = counts.get(name, 0) + 1
+        self._rebuild_set_combo()
+        self._refresh_set_column()
+        if counts:
+            summary = ", ".join(f"'{n}'×{c}" for n, c in counts.items())
+            self.update_status(self.tr(
+                "🧩 Assigned {0} frame(s) from keyword '{1}' ({2}; {3} unmatched → Default)."
+            ).format(sum(counts.values()), kw, summary, n_default))
+        else:
+            self.update_status(self.tr(
+                "ℹ️ No filenames contained '{0}' followed by a separator and a tag."
+            ).format(kw))
+
+    def _set_reference_for_active_set(self, auto: bool = False):
+        name = self._active_set_name
+        self._ensure_default_set()
+        self.reg_sets.setdefault(name, {"reference": None, "locked": False})
+        if auto:
+            self.reg_sets[name]["reference"] = None
+            self.reg_sets[name]["locked"] = False
+        else:
+            start = self.stacking_directory or ""
+            fp, _ = QFileDialog.getOpenFileName(
+                self, self.tr("Select Reference for set '{0}'").format(name), start,
+                self.tr("Images (*.fit *.fits *.xisf *.tif *.tiff *.png);;All files (*)"))
+            if not fp:
+                return
+            # Enforce set membership: a reference must belong to the set it anchors.
+            if name != "Default" and self._set_of_frame(fp) != name:
+                self.frame_set_of[self._set_key(fp)] = name
+                self.update_status(self.tr("🧩 Reference added to set '{0}'.").format(name))
+            self.reg_sets[name]["reference"] = os.path.normpath(fp)
+            self.reg_sets[name]["locked"] = True
+        # Keep the Default set wired to the existing global reference machinery.
+        if name == "Default":
+            if auto:
+                self.reset_reference_to_auto()
+            else:
+                self._set_user_reference(self.reg_sets[name]["reference"])
+        self._refresh_active_set_ref_label()
+        self._refresh_set_column()
+
+    def _refresh_active_set_ref_label(self):
+        cfg = self.reg_sets.get(self._active_set_name, {})
+        ref = cfg.get("reference")
+        self.set_ref_label.setText(os.path.basename(ref) if ref else self.tr("Auto (best in set)"))
+
+    def _refresh_set_column(self):
+        """Paint each leaf's set name in column 3 and summarize sets on each group header."""
+        for i in range(self.reg_tree.topLevelItemCount()):
+            top = self.reg_tree.topLevelItem(i)
+            sets_here = set()
+            for j in range(top.childCount()):
+                leaf = top.child(j)
+                fp = leaf.data(0, Qt.ItemDataRole.UserRole)
+                s = self._set_of_frame(fp) if isinstance(fp, str) else "Default"
+                leaf.setText(3, "" if s == "Default" else s)
+                sets_here.add(s)
+            top.setText(3, self.tr("mixed") if len(sets_here) > 1 else
+                            ("" if sets_here == {"Default"} else next(iter(sets_here))))
+
     def create_image_registration_tab(self):
         """
         Image Registration tab with:
@@ -11430,24 +13635,32 @@ class StackingSuiteDialog(QDialog):
         # 1) QTreeWidget
         # ─────────────────────────────────────────
         self.reg_tree = QTreeWidget()
-        self.reg_tree.setColumnCount(3)
+        self.reg_tree.setColumnCount(4)
         self.reg_tree.setHeaderLabels([
             self.tr("Filter - Exposure - Size"),
             self.tr("Metadata"),
-            self.tr("Drizzle")
+            self.tr("Drizzle"),
+            self.tr("Set"),
         ])
         self.reg_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         header = self.reg_tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
 
         layout.addWidget(QLabel(self.tr("Calibrated Light Frames")))
         layout.addWidget(self.reg_tree)
 
+        # One refresh per batch of row changes: the model signals once per row,
+        # and a full-tree refresh per row made loading N frames cost O(N²).
+        self._reg_summary_timer = QTimer(self)
+        self._reg_summary_timer.setSingleShot(True)
+        self._reg_summary_timer.setInterval(0)
+        self._reg_summary_timer.timeout.connect(self._refresh_reg_tree_summaries)
         model = self.reg_tree.model()
-        model.rowsInserted.connect(lambda *_: QTimer.singleShot(0, self._refresh_reg_tree_summaries))
-        model.rowsRemoved.connect(lambda *_: QTimer.singleShot(0, self._refresh_reg_tree_summaries))
+        model.rowsInserted.connect(lambda *_: self._reg_summary_timer.start())
+        model.rowsRemoved.connect(lambda *_: self._reg_summary_timer.start())
 
         # ─────────────────────────────────────────
         # 2) Exposure tolerance + Auto-crop + Split dual-band (same row)
@@ -11515,6 +13728,21 @@ class StackingSuiteDialog(QDialog):
         self.split_dualband_cb.setToolTip(self.tr("For OSC dual-band data: SII/OIII → R=SII, G=OIII; Ha/OIII → R=Ha, G=OIII"))
         tol_layout.addWidget(self.split_dualband_cb)
 
+        self.adv_nb_split_cb = QCheckBox(self.tr("Advanced Dual NB Split (matrix)"))
+        self.adv_nb_split_cb.setToolTip(self.tr(
+            "Plate-solve a few subs per dual-band filter, fit the empirical NBExtract "
+            "mixing matrix, and apply it per-frame instead of the naive R->Ha / G->OIII "
+            "assignment. Requires 'Split dual-band OSC before integration'. "
+            "Applies to non-drizzle groups only; drizzle groups keep the raw R/G split."
+        ))
+        self.adv_nb_split_cb.setChecked(
+            self.settings.value("stacking/adv_nb_split_enabled", False, type=bool)
+        )
+        self.adv_nb_split_cb.toggled.connect(
+            lambda v: self.settings.setValue("stacking/adv_nb_split_enabled", bool(v))
+        )
+        tol_layout.addWidget(self.adv_nb_split_cb)
+
         layout.addLayout(tol_layout)
         self.exposure_tolerance_spin.valueChanged.connect(
                 lambda _ : (self.populate_calibrated_lights(), self._refresh_reg_tree_summaries())
@@ -11566,22 +13794,40 @@ class StackingSuiteDialog(QDialog):
         # Debayer method for OSC/Bayer integration (same options as the Debayer dialog).
         drizzle_layout.addWidget(QLabel(self.tr("Debayer:")))
         self.debayer_method_combo = QComboBox()
+        # RCD first + default. On OSC narrowband data VNG's first-order
+        # gradient test gets randomized by shot noise and sprays chrominance
+        # speckles across the dim regions (the "VNG vs bilinear" artefact
+        # we chased). RCD's second-order color gradient makes direction
+        # selection noise-robust and ratio-corrected R/B preserves faint
+        # color — the right default for astro stacking.
         for _dm_label, _dm_tok in (
+            ("RCD", "rcd"),
+            ("Edge-aware", "edge"),            
+            ("AHD", "ahd"),
             ("VNG",        "vng"),
-            ("Edge-aware", "edge"),
             ("Bilinear",   "bilinear"),
             ("Strict CFA", "strict_cfa"),
         ):
             self.debayer_method_combo.addItem(self.tr(_dm_label), _dm_tok)
-        _saved_dm = str(self.settings.value("stacking/debayer_method", "vng")).lower()
+        # Default changed from "vng" to "rcd" — pre-existing user installs
+        # that already have "vng" saved keep it (QSettings.value returns
+        # the stored string); only brand-new installs get the new default.
+        _saved_dm = str(self.settings.value("stacking/debayer_method", "rcd")).lower()
         _dm_idx = next((
             i for i in range(self.debayer_method_combo.count())
             if self.debayer_method_combo.itemData(i) == _saved_dm
         ), 0)
         self.debayer_method_combo.setCurrentIndex(_dm_idx)
         self.debayer_method_combo.setToolTip(self.tr(
-            "Demosaic used when integrating OSC/Bayer frames. VNG = highest quality "
-            "(slower); Edge/Bilinear = faster; Strict CFA = no interpolation. "
+            "Demosaic used when integrating OSC/Bayer frames.\n"
+            "• RCD: ratio-corrected, noise-robust direction detection — best\n"
+            "  for OSC narrowband; preserves faint color without the colour\n"
+            "  speckling VNG produces in dim regions.\n"
+            "• AHD: adaptive homogeneity-directed; slower, better for daylight\n"
+            "• VNG: variable number of gradients; sharper on daylight-subject\n"
+            "  broadband data but speckles under noise on dim astro frames.\n"
+            "• Edge-aware / Bilinear: faster, lower quality fallbacks.\n"
+            "• Strict CFA: no interpolation (used for drizzle prep).\n"
             "Ignored when CFA Drizzle is on."
         ))
         self.debayer_method_combo.currentIndexChanged.connect(
@@ -11622,7 +13868,88 @@ class StackingSuiteDialog(QDialog):
         # Disable Select button when auto-accept is on
         self.auto_accept_ref_cb.toggled.connect(self.select_ref_frame_btn.setDisabled)
         self.select_ref_frame_btn.setDisabled(self.auto_accept_ref_cb.isChecked())
+        # ─────────────────────────────────────────
+        # 5b) Registration Sets (mosaic panels / multiple targets)
+        # ─────────────────────────────────────────
+        self._ensure_default_set()
+        set_box = QGroupBox(self.tr("Registration Sets — per-panel / per-target references"))
+        set_box.setToolTip(self.tr(
+            "Assign frames to independent sets. Each set registers to its own reference and "
+            "integrates separately — use this for mosaic panels or completely different targets "
+            "loaded in one run. Unassigned frames use the 'Default' set and the global reference above."
+        ))
+        set_v = QVBoxLayout(set_box)
 
+        set_row = QHBoxLayout()
+        set_row.addWidget(QLabel(self.tr("Active set:")))
+        self.reg_set_combo = QComboBox()
+        self.reg_set_combo.setEditable(False)
+        self.reg_set_combo.setMinimumWidth(160)
+        self.reg_set_combo.currentTextChanged.connect(self._on_active_set_changed)
+        set_row.addWidget(self.reg_set_combo)
+
+        self.new_set_btn = QPushButton(self.tr("New Set…"))
+        self.new_set_btn.clicked.connect(self._new_reg_set)
+        set_row.addWidget(self.new_set_btn)
+
+        self.assign_set_btn = QPushButton(self.tr("Assign Selected → Set"))
+        self.assign_set_btn.setToolTip(self.tr("Move the selected frames (or whole groups) into the active set."))
+        self.assign_set_btn.clicked.connect(self._assign_selected_to_set)
+        set_row.addWidget(self.assign_set_btn)
+
+        self.unassign_set_btn = QPushButton(self.tr("Reset Selected → Default"))
+        self.unassign_set_btn.clicked.connect(lambda: self._assign_selected_to_set(target="Default"))
+        set_row.addWidget(self.unassign_set_btn)
+        set_row.addStretch(1)
+        set_v.addLayout(set_row)
+
+        kw_row = QHBoxLayout()
+        kw_row.addWidget(QLabel(self.tr("Filename keyword:")))
+        self.reg_set_keyword_edit = QLineEdit()
+        self.reg_set_keyword_edit.setPlaceholderText(self.tr("e.g. Panel"))
+        self.reg_set_keyword_edit.setText(
+            self.settings.value("stacking/reg_set_filename_keyword", "Panel", type=str)
+        )
+        self.reg_set_keyword_edit.setToolTip(self.tr(
+            "Looks in each filename for this word followed by a separator "
+            "(space, underscore, hyphen, or dot) and a tag — "
+            "e.g. 'Panel 1', 'Panel_2', 'Panel-3'. Matching frames are assigned "
+            "to sets named like 'Panel 1'. Unmatched frames stay in Default."
+        ))
+        self.reg_set_keyword_edit.textChanged.connect(
+            lambda txt: self.settings.setValue(
+                "stacking/reg_set_filename_keyword", (txt or "").strip()
+            )
+        )
+        kw_row.addWidget(self.reg_set_keyword_edit, 1)
+        self.assign_from_filename_btn = QPushButton(self.tr("Assign from filenames"))
+        self.assign_from_filename_btn.setToolTip(self.tr(
+            "Create registration sets from the keyword in every loaded filename "
+            "and assign the matching frames."
+        ))
+        self.assign_from_filename_btn.clicked.connect(self._assign_sets_from_filename_keyword)
+        kw_row.addWidget(self.assign_from_filename_btn)
+        set_v.addLayout(kw_row)
+
+        ref_set_row = QHBoxLayout()
+        ref_set_row.addWidget(QLabel(self.tr("Reference for active set:")))
+        self.set_ref_label = QLabel(self.tr("Auto (best in set)"))
+        self.set_ref_label.setWordWrap(True)
+        ref_set_row.addWidget(self.set_ref_label, 1)
+
+        self.set_ref_pick_btn = QPushButton(self.tr("Pick…"))
+        self.set_ref_pick_btn.clicked.connect(self._set_reference_for_active_set)
+        ref_set_row.addWidget(self.set_ref_pick_btn)
+
+        self.set_ref_auto_btn = QPushButton(self.tr("Auto"))
+        self.set_ref_auto_btn.setToolTip(self.tr("Let the best-scoring frame in this set be the reference."))
+        self.set_ref_auto_btn.clicked.connect(lambda: self._set_reference_for_active_set(auto=True))
+        ref_set_row.addWidget(self.set_ref_auto_btn)
+        ref_set_row.addStretch(1)
+        set_v.addLayout(ref_set_row)
+
+        layout.addWidget(set_box)
+        self._rebuild_set_combo()
         # ─────────────────────────────────────────
         # 6) MFDeconv (title cleaned; no “beta”)
         # ─────────────────────────────────────────
@@ -11851,6 +14178,31 @@ class StackingSuiteDialog(QDialog):
             )
         )
         output_opts_row.addWidget(self.save_rejection_layers_cb)
+
+        # ─────────────────────────────────────────────────────────────
+        # Interactive sub rejection (per-run toggle; initial state comes
+        # from the sticky "default to interactive" setting, mirroring the
+        # Interactive-Flat checkbox pattern on the lights tab).
+        # ─────────────────────────────────────────────────────────────
+        self.reject_interactive_cb = QCheckBox(self.tr("Review subs interactively before stacking"))
+        self.reject_interactive_cb.setToolTip(self.tr(
+            "After measurement, show a scatter plot of each sub's weighted "
+            "score (sorted) with a draggable red threshold line. Subs below "
+            "the line are set to weight 0 and excluded from the integration.\n\n"
+            "Non-interactive auto-rejection uses median − k·σ from Settings."
+        ))
+        self.reject_interactive_cb.setChecked(
+            self.settings.value("stacking/reject_outliers_interactive", False, type=bool)
+        )
+        # Persist toggles immediately so this checkbox survives a tab reopen,
+        # same pattern as the Interactive Flat checkbox on the lights tab.
+        # Writes to the same QSettings key the stacking-settings dialog
+        # reads/writes, so the two touchpoints always agree.
+        self.reject_interactive_cb.toggled.connect(
+            lambda v: self.settings.setValue("stacking/reject_outliers_interactive", bool(v))
+        )
+        output_opts_row.addWidget(self.reject_interactive_cb)
+
         output_opts_row.addStretch(1)
         layout.addLayout(output_opts_row)
 
@@ -11991,8 +14343,11 @@ class StackingSuiteDialog(QDialog):
         # ─────────────────────────────────────────
         # 10) Init + persist bits
         # ─────────────────────────────────────────
-        self.populate_calibrated_lights()
-        self._refresh_reg_tree_summaries()
+        # The tree fills in the background. Seed its groups' drizzle state with
+        # the values the synchronous load used: the widget defaults, captured
+        # before the saved drizzle settings are restored below.
+        self._reg_drizzle_seed = self._current_drizzle_defaults()
+        self._populate_calibrated_lights_async()
         tab.setLayout(layout)
 
         self.drizzle_checkbox.setChecked(self.settings.value("stacking/drizzle_enabled", False, type=bool))
@@ -12851,10 +15206,19 @@ class StackingSuiteDialog(QDialog):
                     h, w = arr.shape[:2]
         return w, h
 
-    def _probe_fits_meta(self, fp: str):
+    def _probe_fits_meta(self, fp: str) -> CalibratedMeta:
+        """
+        Filter, exposure, size and GAIN from the primary header, plus the
+        target name from the science HDU (as _object_from_path finds it), all
+        from one open of the file.
+        """
         try:
-            hdr0 = fits.getheader(fp, ext=0)
+            hdr0, science_hdr = read_fits_headers(fp)
+        except Exception as e:
+            print(f"⚠️ Could not read FITS {fp}: {e}; treating as generic image")
+            return CalibratedMeta("Unknown", 0.0, "Unknown", None, "")
 
+        try:
             filt = self._sanitize_name(hdr0.get("FILTER", "Unknown"))
             exp_raw = hdr0.get("EXPTIME", hdr0.get("EXPOSURE", 0.0))
             try:
@@ -12865,11 +15229,49 @@ class StackingSuiteDialog(QDialog):
             w = int(hdr0.get("NAXIS1", 0) or 0)
             h = int(hdr0.get("NAXIS2", 0) or 0)
             size = f"{w}x{h}" if (w and h) else "Unknown"
-
-            return filt or "Unknown", float(exp), size
+            filt, exp = filt or "Unknown", float(exp)
         except Exception as e:
             print(f"⚠️ Could not read FITS {fp}: {e}; treating as generic image")
-            return "Unknown", 0.0, "Unknown"
+            filt, exp, size = "Unknown", 0.0, "Unknown"
+
+        gain = None
+        try:
+            g = hdr0.get("GAIN", None)
+            if g is not None:
+                gain = float(g)
+        except Exception:
+            pass
+
+        obj = ""
+        if science_hdr is not None:
+            try:
+                obj = self._object_from_header(science_hdr)
+            except Exception:
+                pass
+
+        return CalibratedMeta(filt, exp, size, gain, obj)
+
+    def _probe_calibrated_meta(self, fp: str) -> CalibratedMeta:
+        """
+        Header-only grouping metadata for one Image Integration frame.
+
+        Touches no widgets, so the background scan calls it from worker threads.
+        """
+        ext = os.path.splitext(fp)[1].lower()
+        if ext in (".fits", ".fit", ".ftz", ".fz"):
+            return self._probe_fits_meta(fp)
+        if ext == ".xisf":
+            filt, exp, size = self._probe_xisf_meta(fp)
+            return CalibratedMeta(filt, exp, size, None, self._object_from_path(fp))
+        if ext in (".tiff", ".tif"):
+            try:
+                w, h = self._get_image_size(fp)
+            except Exception as e:
+                print(f"⚠️ Cannot read image size for {fp}: {e}")
+                return CalibratedMeta("Unknown", 0.0, "Unknown", None, "", usable=False)
+            # A TIFF has no FITS header, so no OBJECT keyword either.
+            return CalibratedMeta("Unknown", 0.0, f"{w}x{h}", None, "")
+        return CalibratedMeta("Unknown", 0.0, "Unknown", None, "", usable=False)
 
 
 
@@ -12925,40 +15327,20 @@ class StackingSuiteDialog(QDialog):
             return "Unknown", 0.0, "Unknown"
 
 
-    def populate_calibrated_lights(self):
-        from PIL import Image
-
-        def _fmt(enabled, scale, drop):
-            return (f"Drizzle: True, Scale: {scale:g}x, Drop: {drop:.2f}" if enabled else "Drizzle: False")
-
-        self.reg_tree.clear()
-        self.reg_tree.setColumnCount(3)
-        self.reg_tree.setHeaderLabels(["Filter - Exposure - Size", "Metadata", "Drizzle"])
-        hdr = self.reg_tree.header()
-        for col in (0, 1, 2):
-            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
-
-        # only allow real image/light formats
-        allowed_exts = {".fit", ".fits", ".ftz", ".fz", ".tiff", ".tif", ".xisf"}
-
-        # gather files
+    def _calibrated_scan_entries(self) -> list:
+        """
+        Frames for the Image Integration tree: Calibrated/ plus manually added
+        files, minus frames removed this session, without duplicate paths.
+        """
         calibrated_folder = os.path.join(self.stacking_directory or "", "Calibrated")
-        files = []
-        if os.path.isdir(calibrated_folder):
-            for fn in os.listdir(calibrated_folder):
-                fp = os.path.join(calibrated_folder, fn)
-                if not os.path.isfile(fp):
-                    continue
-                ext = os.path.splitext(fn)[1].lower()
-                if ext in allowed_exts:
-                    files.append(fp)
+        entries = list_folder_entries(calibrated_folder, CALIBRATED_EXTS)
 
         # include manual files, but only if valid extension
         for fp in self.manual_light_files:
             try:
                 ext = os.path.splitext(fp)[1].lower()
-                if ext in allowed_exts:
-                    files.append(fp)
+                if ext in CALIBRATED_EXTS:
+                    entries.append(stat_entry(fp))
             except Exception:
                 pass
 
@@ -12971,65 +15353,139 @@ class StackingSuiteDialog(QDialog):
                 dead = set(self.deleted_calibrated_files)
 
         if dead:
-            files = [
-                f for f in files
-                if os.path.normcase(os.path.abspath(f)) not in dead
+            entries = [
+                e for e in entries
+                if os.path.normcase(os.path.abspath(e.path)) not in dead
             ]
 
-        files = list(dict.fromkeys(files))
-        if not files:
+        unique = {}
+        for entry in entries:
+            unique.setdefault(entry.path, entry)
+        return list(unique.values())
+
+    def _current_drizzle_defaults(self) -> tuple:
+        """(enabled, scale, drop) from the global drizzle controls."""
+        enabled = self.drizzle_checkbox.isChecked()
+        try:
+            scale = float(self.drizzle_scale_combo.currentText().replace("x", "", 1))
+        except Exception:
+            scale = 1.0
+        return enabled, scale, self.drizzle_drop_shrink_spin.value()
+
+    def _cancel_calibrated_scan(self):
+        """Stop any background header scan and drop its pending result."""
+        self._cal_scan_gen += 1
+        if self._cal_scan_stop is not None:
+            self._cal_scan_stop.set()
+            self._cal_scan_stop = None
+
+    def _populate_calibrated_lights_async(self):
+        """
+        Fill the Image Integration tree without blocking the GUI thread.
+
+        Headers missing from the cache are read on background threads, then
+        _finish_initial_reg_load builds the tree from the warm cache. Code that
+        needs the complete tree first calls _ensure_reg_tree_loaded.
+        """
+        self._cancel_calibrated_scan()
+        misses = [
+            e for e in self._calibrated_scan_entries()
+            if self._cal_meta_cache.lookup(e) is None
+        ]
+        if not misses:
+            self._finish_initial_reg_load()
             return
+
+        gen = self._cal_scan_gen
+        stop = threading.Event()
+        self._cal_scan_stop = stop
+        self.update_status(self.tr(
+            "🔎 Reading headers of {0} calibrated frame(s) in the background…"
+        ).format(len(misses)))
+
+        def _emit(signal_name, *args):
+            # Runs on scan threads; the dialog may be deleted by then.
+            try:
+                getattr(self, signal_name).emit(*args)
+            except RuntimeError:
+                pass
+
+        start_background_read(
+            misses, self._cal_meta_cache, self._probe_calibrated_meta,
+            stop=stop,
+            on_progress=lambda done, total: _emit("_cal_scan_progress", gen, done, total),
+            on_done=lambda: _emit("_cal_scan_done", gen),
+        )
+
+    def _on_cal_scan_progress(self, gen: int, done: int, total: int):
+        if gen == self._cal_scan_gen:
+            self.update_status("\r" + self.tr(
+                "🔎 Read {0}/{1} calibrated frame headers…"
+            ).format(done, total))
+
+    def _on_cal_scan_done(self, gen: int):
+        if gen == self._cal_scan_gen and self._cal_scan_stop is not None:
+            self._finish_initial_reg_load()
+
+    def _finish_initial_reg_load(self):
+        """Build the tree as the dialog's constructor used to, from the warm cache."""
+        self.populate_calibrated_lights()
+        self._refresh_reg_tree_summaries()
+        self._update_drizzle_summary_columns()
+
+    def _ensure_reg_tree_loaded(self):
+        """Finish a pending background load now, for code that needs the full tree."""
+        if self._cal_scan_stop is not None:
+            self._finish_initial_reg_load()
+
+    def populate_calibrated_lights(self):
+        """
+        Rebuild the Image Integration tree from Calibrated/ plus manual frames.
+
+        Synchronous, because registration reads the tree right after
+        calibration. Only frames missing from self._cal_meta_cache (new or
+        changed files) have their headers read.
+        """
+        def _fmt(enabled, scale, drop):
+            return (f"Drizzle: True, Scale: {scale:g}x, Drop: {drop:.2f}" if enabled else "Drizzle: False")
+
+        self._cancel_calibrated_scan()
+        drizzle_seed, self._reg_drizzle_seed = self._reg_drizzle_seed, None
+
+        self.reg_tree.clear()
+        self.reg_tree.setColumnCount(4)
+        self.reg_tree.setHeaderLabels(["Filter - Exposure - Size", "Metadata", "Drizzle", "Set"])
+        hdr = self.reg_tree.header()
+        for col in (0, 1, 2, 3):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+
+        scan_entries = self._calibrated_scan_entries()
+        if not scan_entries:
+            return
+        files = [e.path for e in scan_entries]
+        metas = read_calibrated_metas(scan_entries, self._cal_meta_cache, self._probe_calibrated_meta)
 
         # group by (filter, ~exposure, size) within tolerance
         grouped = {}  # key -> list of dicts: {"path", "exp", "size"}
-        tol = self.exposure_tolerance_spin.value()
+        if getattr(self, "_object_name_cache", None) is None:
+            self._object_name_cache = {}
 
         for fp in files:
-            ext = os.path.splitext(fp)[1].lower()
-            filt = "Unknown"
-            exp = 0.0
-            size = "Unknown"
-
-            if ext in (".fits", ".fit", ".ftz", ".fz"):
-                filt, exp, size = self._probe_fits_meta(fp)
-            elif ext == ".xisf":
-                filt, exp, size = self._probe_xisf_meta(fp)
-            elif ext in (".tiff", ".tif"):
-                try:
-                    w, h = self._get_image_size(fp)
-                    size = f"{w}x{h}"
-                except Exception as e:
-                    print(f"⚠️ Cannot read image size for {fp}: {e}")
-                    continue
-            else:
-                # extra safety: ignore anything unexpected
+            meta = metas.get(fp) or self._probe_calibrated_meta(fp)
+            # _auto_assign_sets_by_object reads OBJECT from here, not the file
+            self._object_name_cache[fp] = meta.obj
+            if not meta.usable:
                 continue
 
-            # Read gain from header
-            gain = None
-            try:
-                if ext in (".fits", ".fit", ".ftz", ".fz"):
-                    from astropy.io import fits as _fits
-                    hdr = _fits.getheader(fp, memmap=True)
-                    g = hdr.get("GAIN", None)
-                    if g is not None:
-                        gain = float(g)
-                elif ext == ".xisf":
-                    pass  # XISF gain would need _probe_xisf_meta extension
-            except Exception:
-                pass
-
-            key = self._find_or_make_exposure_group_key(grouped, filt, exp, size, gain=gain)
-            grouped.setdefault(key, []).append({"path": fp, "exp": exp, "size": size, "gain": gain})
+            key = self._find_or_make_exposure_group_key(grouped, meta.filt, meta.exp, meta.size, gain=meta.gain)
+            grouped.setdefault(key, []).append(
+                {"path": fp, "exp": meta.exp, "size": meta.size, "gain": meta.gain}
+            )
 
         # current global drizzle defaults
-        global_enabled = self.drizzle_checkbox.isChecked()
-        try:
-            global_scale = float(self.drizzle_scale_combo.currentText().replace("x", "", 1))
-        except Exception:
-            global_scale = 1.0
-        global_drop = self.drizzle_drop_shrink_spin.value()
+        global_enabled, global_scale, global_drop = drizzle_seed or self._current_drizzle_defaults()
 
+        tops = []
         for key, entries in grouped.items():
             paths = [d["path"] for d in entries]
             exps  = [d["exp"]  for d in entries]
@@ -13054,9 +15510,9 @@ class StackingSuiteDialog(QDialog):
                 top.setText(2, _fmt(state["enabled"], state["scale"], state["drop"]))
 
             top.setData(0, Qt.ItemDataRole.UserRole, paths)
-            self.reg_tree.addTopLevelItem(top)
 
             # leaf rows: show basename + per-file size
+            leaves = []
             for d in entries:
                 fp = d["path"]
                 leaf = QTreeWidgetItem([
@@ -13064,11 +15520,18 @@ class StackingSuiteDialog(QDialog):
                     f"Size: {d['size']}" + (f", Gain: {int(d['gain'])}" if d.get('gain') is not None else "")
                 ])
                 leaf.setData(0, Qt.ItemDataRole.UserRole, fp)
-                top.addChild(leaf)
+                leaves.append(leaf)
+            # Attached while the group is outside the tree: no per-row model signals.
+            top.addChildren(leaves)
+            tops.append(top)
 
-            top.setExpanded(True)
+        self.reg_tree.addTopLevelItems(tops)
+        for top in tops:
+            top.setExpanded(True)  # only takes effect once the item is in the tree
 
         self._refresh_quick_stack_summary_later()
+        self._auto_assign_sets_by_object(files)   # per-target Sets before the column renders
+        self._refresh_set_column()
 
     def _iter_group_items(self):
         for i in range(self.reg_tree.topLevelItemCount()):
@@ -13152,6 +15615,8 @@ class StackingSuiteDialog(QDialog):
             }
 
     def _on_drizzle_param_changed(self, *_):
+        # With no selection this applies to every group, so they must all exist.
+        self._ensure_reg_tree_loaded()
         # Persist global scale/pixfrac so they survive reopen (combo defaults to 1x)
         if hasattr(self, "drizzle_scale_combo"):
             self._set_drizzle_scale(self.drizzle_scale_combo.currentText())
@@ -13351,6 +15816,59 @@ class StackingSuiteDialog(QDialog):
             self._pipeline_objects = objs
         return objs
 
+    def _auto_assign_sets_by_object(self, paths=None) -> None:
+        """Assign each integration frame to a Set named for its FITS OBJECT so a
+        multi-target run auto-splits into per-target Sets (each registers to its
+        own reference). Every frame carrying an OBJECT/TARGET is keyed to a Set
+        named for it (single target or mosaic alike). A frame is
+        auto-assigned at most once (first time it appears) and only while still on
+        'Default', so a later manual reassignment or reset is respected. Frames
+        whose headers carry no usable OBJECT stay on 'Default'."""
+        try:
+            if paths is None:
+                paths = self._all_reg_tree_paths()
+        except Exception:
+            return
+        if not paths:
+            return
+        if getattr(self, "_object_name_cache", None) is None:
+            self._object_name_cache = {}
+        obj_of = {}
+        for fp in paths:
+            o = self._object_name_cache.get(fp)
+            if o is None:
+                o = self._object_from_path(fp)
+                self._object_name_cache[fp] = o
+            obj_of[fp] = o
+        distinct = {o for o in obj_of.values() if o}
+        if not distinct:
+            return  # no OBJECT/TARGET on any frame -> nothing to key Sets on
+        seen = getattr(self, "_auto_set_seen", None)
+        if seen is None:
+            seen = set(); self._auto_set_seen = seen
+        changed = False
+        for fp, o in obj_of.items():
+            key = self._set_key(fp)
+            if key in seen:
+                continue          # only auto-assign a given frame once
+            seen.add(key)
+            if not o:
+                continue
+            if self.frame_set_of.get(key, "Default") != "Default":
+                continue          # respect an existing manual assignment
+            self.reg_sets.setdefault(o, {"reference": None, "locked": False})
+            self.frame_set_of[key] = o
+            changed = True
+        if changed:
+            try:
+                self._rebuild_set_combo()
+            except Exception:
+                pass
+            self.update_status(self.tr(
+                "🎯 Auto-assigned targets to Sets: {0}. "
+                "Review Set assignments & references in Image Integration."
+            ).format(", ".join(sorted(distinct))))
+
     def _maybe_offer_new_stacking_dir(self, paths) -> bool:
         """
         Pre-ingest guard for LIGHT adds: if incoming files carry a different
@@ -13391,27 +15909,32 @@ class StackingSuiteDialog(QDialog):
             resuming = os.path.isdir(suggested)
 
             msg = QMessageBox(self)
-            msg.setIcon(QMessageBox.Icon.Warning)
-            msg.setWindowTitle(self.tr("Different Target Detected"))
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setWindowTitle(self.tr("New Target Detected"))
             msg.setText(self.tr(
                 "The files you're adding are for <b>{0}</b>, but this stacking "
-                "directory already contains <b>{1}</b>.<br><br>"
-                "Mixing targets in one stacking directory will send both to "
-                "Image Integration as a single set — they'll try to register to "
-                "one reference frame and the stack will fail."
+                "directory is currently working on <b>{1}</b>.<br><br>"
+                "SASpro will add them as a <b>new Set</b> named for the "
+                "target, with its <b>own reference frame</b>. Each Set "
+                "registers and integrates independently — the new frames "
+                "will <b>not</b> be stacked together with <b>{1}</b>.<br><br>"
+                "You can review the Set assignments and each Set's reference "
+                "frame in the Image Integration tab before integrating."
             ).format(", ".join(new_targets), ", ".join(sorted(existing))))
-            msg.setInformativeText(self.tr("{0}:<br><code>{1}</code>").format(
-                self.tr("Existing folder for this target found — switch to it")
-                if resuming else self.tr("Suggested new stacking directory"),
+            msg.setInformativeText(self.tr(
+                "Prefer to keep this target in its own folder instead? {0}:<br><code>{1}</code>"
+            ).format(
+                self.tr("Existing folder found — switch to it")
+                if resuming else self.tr("Suggested separate directory"),
                 suggested))
+            mix_btn = msg.addButton(self.tr("Add as New Set"),
+                                    QMessageBox.ButtonRole.AcceptRole)
             switch_btn = msg.addButton(
-                self.tr("Switch to Target Folder") if resuming
-                else self.tr("Create && Switch"),
-                QMessageBox.ButtonRole.AcceptRole)
-            mix_btn = msg.addButton(self.tr("Add Anyway (mix targets)"),
-                                    QMessageBox.ButtonRole.DestructiveRole)
+                self.tr("Use Separate Folder") if resuming
+                else self.tr("Create Separate Folder"),
+                QMessageBox.ButtonRole.ActionRole)
             msg.addButton(QMessageBox.StandardButton.Cancel)
-            msg.setDefaultButton(switch_btn)
+            msg.setDefaultButton(mix_btn)
             msg.exec()
 
             clicked = msg.clickedButton()
@@ -13704,11 +16227,48 @@ class StackingSuiteDialog(QDialog):
 
 
     # --- Directory walking ---------------------------------------------------------
+    # Subfolder names SASpro's own pipeline writes into. If a user drops
+    # their raw lights straight into the stacking directory and then
+    # points "Add Directory" at it, a plain recursive walk pulls the raw
+    # lights AND every stage of pipeline output underneath them —
+    # effectively tripling frame counts and polluting the tree with
+    # masters and intermediates. We prune these subfolder names from the
+    # walk so only the user's source frames come in.
+    #
+    # Comparison is case-folded for cross-platform safety (NTFS/HFS+ are
+    # case-insensitive by default and the names can appear with mixed
+    # casing in different SASpro versions). Names are matched against
+    # a FOLDER'S OWN NAME only, so if someone deliberately points the
+    # file dialog at an Aligned_Images folder as the root, its files
+    # are still collected — only descended children named the same way
+    # get skipped.
+    _PIPELINE_OUTPUT_DIRS = frozenset({
+        "aligned_images",
+        "calibrated",
+        "master_calibration_files",
+        "master_lights",
+        "master_light",
+        "normalized_images",
+    })
+
     def _collect_fits_paths(self, root: str, recursive: bool = True) -> list[str]:
         exts = (".fits", ".fit", ".fts", ".fits.gz", ".fit.gz", ".fz", ".xisf")
         paths = []
+        skipped_dirs: list[str] = []
         if recursive:
-            for d, _subdirs, files in os.walk(root):
+            for d, subdirs, files in os.walk(root):
+                # Prune pipeline-output folders from this level's descent.
+                # Mutating `subdirs` in-place is the documented way to tell
+                # os.walk to skip entering those directories.
+                keep, drop = [], []
+                for name in subdirs:
+                    (drop if name.casefold() in self._PIPELINE_OUTPUT_DIRS
+                           else keep).append(name)
+                if drop:
+                    subdirs[:] = keep
+                    for n in drop:
+                        skipped_dirs.append(os.path.join(d, n))
+
                 for f in files:
                     if f.lower().endswith(exts):
                         paths.append(os.path.join(d, f))
@@ -13718,6 +16278,20 @@ class StackingSuiteDialog(QDialog):
                     paths.append(os.path.join(root, f))
         # stable order (helps reproducibility + nice UX)
         paths.sort(key=lambda p: (os.path.dirname(p).lower(), os.path.basename(p).lower()))
+
+        # Light-touch status so the user understands why counts might
+        # differ from a bare filesystem listing. Only emits when we
+        # actually pruned something; the typical "point at raw-lights
+        # folder" case stays silent.
+        if skipped_dirs:
+            try:
+                shown = ", ".join(os.path.basename(p) for p in skipped_dirs[:5])
+                more = f" (+{len(skipped_dirs) - 5} more)" if len(skipped_dirs) > 5 else ""
+                self.update_status(self.tr(
+                    "📂 Skipped SASpro pipeline output folder(s) during scan: {0}{1}"
+                ).format(shown, more))
+            except Exception:
+                pass
         return paths
 
 
@@ -13804,14 +16378,36 @@ class StackingSuiteDialog(QDialog):
             return dt_timezone.utc
 
 
-    def _parse_date_obs(self, s: str):
+    # Timestamp shapes seen in real headers, tried in order after ISO parsing.
+    _DATE_FORMATS = (
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        # DWARF 2/3 write 'YYYY-MM-DD-HH-MM-SS-mmm': no 'T', all dashes.
+        # isoparse rejects it, so those frames previously produced no
+        # timestamp at all and therefore no session.
+        "%Y-%m-%d-%H-%M-%S-%f",
+        "%Y-%m-%d-%H-%M-%S",
+        "%Y%m%dT%H%M%S",
+        "%Y%m%d_%H%M%S",
+        "%Y-%m-%d",
+    )
+
+    def _parse_datetime_any(self, s):
         """
-        Parse DATE-OBS robustly → aware UTC datetime if possible.
-        Accepts ISO8601 with or without 'Z', fractional seconds, or date-only.
+        Parse a header timestamp into a datetime.
+
+        The result is tz-aware only if the string itself carried an offset --
+        callers decide what a naive value means. Date-only values are snapped
+        to midday to avoid accidental date flips.
         """
         if not s:
             return None
         s = str(s).strip()
+        if not s:
+            return None
 
         # Prefer dateutil if present
         try:
@@ -13821,29 +16417,52 @@ class StackingSuiteDialog(QDialog):
 
         if date_parser:
             try:
-                dt = date_parser.isoparse(s)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=dt_timezone.utc)
-                return dt.astimezone(dt_timezone.utc)
+                return date_parser.isoparse(s)
             except Exception:
                 pass
 
-        # Manual fallbacks
-        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ",
-                    "%Y-%m-%dT%H:%M:%SZ",
-                    "%Y-%m-%dT%H:%M:%S",
-                    "%Y-%m-%d"):
+        for fmt in self._DATE_FORMATS:
             try:
                 dt = dt_datetime.strptime(s, fmt)
-                if fmt.endswith("Z") or "T" in fmt:
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=dt_timezone.utc)
-                else:
-                    # date-only; assume midday UTC to avoid accidental date flips
-                    dt = dt.replace(tzinfo=dt_timezone.utc, hour=12)
-                return dt.astimezone(dt_timezone.utc)
             except Exception:
                 continue
+            if fmt == "%Y-%m-%d":
+                dt = dt.replace(hour=12)
+            return dt
+        return None
+
+    def _parse_date_obs(self, s: str):
+        """
+        Parse DATE-OBS robustly → aware UTC datetime if possible.
+        A naive timestamp is taken as UTC, which is what SGP and NINA write.
+        """
+        dt = self._parse_datetime_any(s)
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=dt_timezone.utc)
+        return dt.astimezone(dt_timezone.utc)
+
+    # Local wall-clock keywords. SGP and NINA both write DATE-LOC, the site's
+    # own clock, which pins the night with no timezone guessing at all.
+    _LOCAL_TIME_KEYS = ("DATE-LOC", "DATE-LOCAL", "LOCALTIM", "TIME-LOC")
+
+    def _local_wall_clock(self, hdr):
+        """Naive local wall-clock datetime from a DATE-LOC-style key, or None."""
+        if not hdr:
+            return None
+        for key in self._LOCAL_TIME_KEYS:
+            try:
+                v = hdr.get(key)
+            except Exception:
+                continue
+            if v in (None, ""):
+                continue
+            dt = self._parse_datetime_any(v)
+            if dt is None:
+                continue
+            # Keep the clock exactly as written: this is already local time.
+            return dt.replace(tzinfo=None)
         return None
 
 
@@ -13854,16 +16473,20 @@ class StackingSuiteDialog(QDialog):
         Rule: if local_time < cutoff_hour → use previous calendar date.
         Default cutoff = self.settings('stacking/night_cutoff_hour', 12)  # noon
         """
-        date_obs = hdr.get("DATE-OBS") if hdr else None
-        dt_utc = self._parse_date_obs(date_obs) if date_obs else None
-        if dt_utc is None:
-            return None
+        # Prefer the site's own clock when the header carries it: DATE-OBS is
+        # UTC, so bucketing it needs a site timezone, and a wrong or missing
+        # 'stacking/site_timezone' can push a frame into the neighbouring
+        # night (badly so east of Greenwich). DATE-LOC removes the guess.
+        dt_local = self._local_wall_clock(hdr)
+        if dt_local is None:
+            date_obs = self._acquisition_date_obs(hdr)
+            dt_utc = self._parse_date_obs(date_obs) if date_obs else None
+            if dt_utc is None:
+                return None
+            dt_local = dt_utc.astimezone(self._get_site_timezone(hdr))
 
         if cutoff_hour is None:
             cutoff_hour = int(self.settings.value("stacking/night_cutoff_hour", 12, type=int))
-
-        tz = self._get_site_timezone(hdr)
-        dt_local = dt_utc.astimezone(tz)
 
         # ✅ Use datetime.time alias, not the 'time' module
         cutoff = dt_time(hour=max(0, min(23, int(cutoff_hour))), minute=0)
@@ -13874,6 +16497,295 @@ class StackingSuiteDialog(QDialog):
 
         return local_date.isoformat()
 
+    # Header keywords that carry *acquisition* time, in priority order.
+    #
+    # This deliberately excludes every keyword that records when a FILE was
+    # written rather than when photons were collected -- 'DATE' (FITS write
+    # time), 'PCL:Signature:Integration' and friends (PixInsight process
+    # stamps), 'CREATED', etc. A master flat integrated in PixInsight weeks
+    # after the fact still belongs to the night its raw flats were shot, and
+    # WBPP/ImageIntegration preserve that in DATE-OBS / Observation:Time:Start.
+    _ACQUISITION_DATE_KEYS = (
+        "DATE-OBS",
+        "DATE-BEG",
+        "Observation:Time:Start",
+        "OBSSTART",
+        # NOTE: DATE-LOC is deliberately absent -- it is local time, and this
+        # list feeds _parse_date_obs, which reads a naive value as UTC.
+        # _local_wall_clock() handles DATE-LOC separately.
+        "DATE-AVG",
+        "DATE-END",
+        "Observation:Time:End",
+    )
+
+    def _acquisition_date_obs(self, hdr):
+        """
+        Return the best *acquisition* timestamp string in ``hdr``, or None.
+
+        DATE-OBS is preferred so ordinary frames behave exactly as before;
+        the remaining keys only matter for masters written by other tools.
+        """
+        if not hdr:
+            return None
+        for key in self._ACQUISITION_DATE_KEYS:
+            try:
+                val = hdr.get(key)
+            except Exception:
+                continue
+            if val is None:
+                continue
+            s = str(val).strip()
+            if not s:
+                continue
+            if self._parse_date_obs(s) is not None:
+                return s
+        return None
+
+    @staticmethod
+    def _fits_datetime(dt_aware) -> str:
+        """Aware datetime -> FITS 'YYYY-MM-DDThh:mm:ss.sss' in UTC."""
+        try:
+            return (dt_aware.astimezone(dt_timezone.utc)
+                            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3])
+        except Exception:
+            return str(dt_aware)
+
+    def _note_frame_acquisition(self, path: str, hdr):
+        """
+        Remember a frame's acquisition time from a header already in hand.
+
+        Called at ingest, where the header is read anyway, so building a
+        master costs no extra file reads. Caching None is meaningful: it
+        records that we looked and this header carries no acquisition date,
+        so nothing re-opens the file hoping for a different answer.
+        """
+        cache = getattr(self, "_frame_dateobs", None)
+        if cache is None:
+            cache = {}
+            self._frame_dateobs = cache
+        dt_utc = self._parse_date_obs(self._acquisition_date_obs(hdr)) if hdr else None
+        cache[path] = dt_utc
+        return dt_utc
+
+    def _raw_frame_time_span(self, file_list):
+        """
+        (earliest, latest, n_dated) acquisition datetimes across source frames.
+
+        Lets a master we build carry the acquisition window of the *raw* frames
+        that went into it, so it can be re-bucketed into the right
+        noon-to-noon night later -- by us after a restart, and by any other
+        tool -- instead of depending on a SESSION tag nothing else can read.
+
+        Served from the ingest-time cache; a header is only opened for a path
+        that never went through ingest (intermediates, a restored session).
+        """
+        cache = getattr(self, "_frame_dateobs", None)
+        if cache is None:
+            cache = {}
+            self._frame_dateobs = cache
+
+        first = last = None
+        n = 0
+        for p in (file_list or ()):
+            if p in cache:
+                dt_utc = cache[p]
+            else:
+                try:
+                    hdr, _ = get_valid_header(p)
+                except Exception:
+                    hdr = None
+                dt_utc = self._note_frame_acquisition(p, hdr)
+            if dt_utc is None:
+                continue
+            n += 1
+            if first is None or dt_utc < first:
+                first = dt_utc
+            if last is None or dt_utc > last:
+                last = dt_utc
+        return first, last, n
+
+    def _stamp_acquisition_provenance(self, header, file_list, exposure_time=None,
+                                      label="raw frames"):
+        """
+        Write the acquisition window of ``file_list`` into ``header``.
+
+        DATE-OBS / DATE-END / DATE-AVG describe when photons were collected;
+        DATE records when this master file was written and is deliberately
+        kept separate -- session matching must never fall back on it, or a
+        master integrated weeks later lands on the wrong night.
+        """
+        try:
+            t_first, t_last, _n = self._raw_frame_time_span(file_list)
+        except Exception:
+            t_first = t_last = None
+
+        if t_first is not None:
+            try:
+                exp = float(exposure_time or 0.0)
+            except Exception:
+                exp = 0.0
+            t_end = (t_last or t_first) + dt_timedelta(seconds=max(0.0, exp))
+            header["DATE-OBS"] = (self._fits_datetime(t_first),
+                                  f"Start of first {label} (acquisition)")
+            header["DATE-END"] = (self._fits_datetime(t_end),
+                                  f"End of last {label} (acquisition)")
+            header["DATE-AVG"] = (self._fits_datetime(t_first + (t_end - t_first) / 2),
+                                  f"Midpoint of {label} acquisition")
+        try:
+            header["DATE"] = (self._fits_datetime(dt_datetime.now(dt_timezone.utc)),
+                              "Master creation date (NOT acquisition)")
+        except Exception:
+            pass
+        return header
+
+    @staticmethod
+    def _session_token_to_date(token):
+        """'YYYY-MM-DD' (or 'YYYYMMDD') session token -> date(); else None."""
+        if not token:
+            return None
+        m = re.match(r"^\s*(20\d{2})[-_]?([01]\d)[-_]?([0-3]\d)\s*$", str(token))
+        if not m:
+            return None
+        try:
+            return _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            return None
+
+    def _master_flat_session(self, path: str, hdr=None) -> str:
+        """
+        Session token for a master flat.
+
+        Priority:
+          1) explicit SESSION keyword (SASpro-native masters write it)
+          2) the noon-to-noon local night of the *raw flats* behind the master
+             (DATE-OBS / Observation:Time:Start) -- this is what lets masters
+             imported from PixInsight pair with lights from the same night,
+             exactly like masters built natively in SASpro
+          3) a real date/session token in the filename or folder
+          4) 'Default'
+
+        Note it never scrapes an arbitrary filename field: PixInsight names
+        like ``masterFlat_BIN-1_8288x5644_FILTER-Ha_mono.xisf`` used to yield
+        a session of ``BIN-1``, which could never match a light.
+        """
+        cache = getattr(self, "_master_flat_session_cache", None)
+        if cache is None:
+            cache = {}
+            self._master_flat_session_cache = cache
+        if hdr is None:
+            # Only trust the cache when we have nothing fresher; a caller that
+            # hands us a header has just read the file (possibly a rebuilt
+            # master at an existing path), so recompute and refresh.
+            if path in cache:
+                return cache[path]
+            try:
+                hdr, _ = get_valid_header(path)
+            except Exception:
+                hdr = None
+        else:
+            self._file_dt_cache = getattr(self, "_file_dt_cache", {}) or {}
+            self._file_dt_cache.pop(path, None)
+            if getattr(self, "_master_flat_go", None):
+                self._master_flat_go.pop(path, None)
+
+        session = None
+
+        # 1) explicit SESSION keyword
+        try:
+            s = str((hdr.get("SESSION") if hdr else "") or "").strip()
+        except Exception:
+            s = ""
+        if s and s.lower() not in ("default", "unknown", "none", "n/a"):
+            session = s
+
+        # 2) noon-to-noon night of the raw flats
+        if not session:
+            session = self._session_from_dateobs_local_night(hdr)
+
+        # 3) date/session token in the filename, then the usual path walk
+        if not session:
+            name = os.path.basename(path)
+            for rx, fmt in _SESSION_PATTERNS:
+                m = rx.search(name)
+                if m:
+                    session = fmt(m)
+                    break
+        if not session:
+            try:
+                from_path = self._auto_session_from_path(path, None)
+            except Exception:
+                from_path = None
+            if from_path and from_path != "Default":
+                session = from_path
+
+        session = session or "Default"
+        cache[path] = session
+        return session
+
+    def _unique_master_flat_key(self, base_key: str, file_path: str, exposure=None) -> str:
+        """
+        Keep two distinct masters from colliding on one master_files key.
+
+        Now that sessions are real dates, two masters for the same
+        filter/size/night/gain produce an identical key and one would be
+        silently dropped. Any disambiguator is appended *after* the existing
+        brackets so the filter/size prefix and the leading session bracket
+        (which is what the matchers parse) stay intact.
+        """
+        existing = self.master_files.get(base_key)
+        if existing is None or os.path.normpath(existing) == os.path.normpath(file_path):
+            return base_key
+
+        # Prefer something meaningful: flats of the same night usually differ
+        # in exposure.
+        try:
+            exp_text = f"{float(exposure):g}s"
+        except Exception:
+            exp_text = None
+        if exp_text:
+            cand = f"{base_key} [{exp_text}]"
+            cur = self.master_files.get(cand)
+            if cur is None or os.path.normpath(cur) == os.path.normpath(file_path):
+                return cand
+
+        for n in range(2, 100):
+            cand = f"{base_key} [#{n}]"
+            cur = self.master_files.get(cand)
+            if cur is None or os.path.normpath(cur) == os.path.normpath(file_path):
+                return cand
+        return base_key
+
+    def _master_flat_night_date(self, path: str, key: str | None = None):
+        """
+        date() of the night a master flat's raw frames were shot, or None.
+
+        Prefers the session already encoded in the master_files key (which may
+        carry a user-applied tag) and falls back to re-reading the header.
+        """
+        d = self._session_token_to_date(key) if key else None
+        if d is not None:
+            return d
+        d = self._session_token_to_date(self._master_flat_session(path))
+        if d is not None:
+            return d
+        return self._file_local_night_date(path)
+
+    def _master_flat_gain_offset(self, path: str):
+        """(gain, offset) for a master flat -- XISF-aware and cached."""
+        if not hasattr(self, "_master_flat_go") or self._master_flat_go is None:
+            self._master_flat_go = {}
+        if path not in self._master_flat_go:
+            g = o = None
+            try:
+                hdr, _ = get_valid_header(path)
+                g = _get_key_float(hdr, "GAIN")
+                o = _get_key_float(hdr, "OFFSET")
+                if o is None:
+                    o = _get_key_float(hdr, "BLKLEVEL")
+            except Exception:
+                g = o = None
+            self._master_flat_go[path] = (g, o)
+        return self._master_flat_go[path]
 
     def _auto_tag_sessions_for_paths(self, paths: list[str]) -> dict[str, str]:
         session_map = {}
@@ -13963,8 +16875,9 @@ class StackingSuiteDialog(QDialog):
 
         try:
             if hdr is None:
-                with fits.open(path, memmap=True) as hdul:
-                    hdr = hdul[0].header
+                # get_valid_header() is XISF-aware; fits.open() is not, and
+                # masters exported from PixInsight are usually .xisf.
+                hdr, _ = get_valid_header(path)
         except Exception:
             hdr = None
 
@@ -13976,37 +16889,21 @@ class StackingSuiteDialog(QDialog):
         return d
 
     def _closest_flat_for(self, *, filter_name: str, image_size: str, light_path: str,
-                        light_gain: float | None = None, light_offset: float | None = None):
+                        light_gain: float | None = None, light_offset: float | None = None,
+                        light_session: str | None = None):
         ftoken = self._sanitize_name(filter_name)
-        light_d = self._file_local_night_date(light_path)
 
         candidates = []
         for key, path in self.master_files.items():
-            if (ftoken in key) and (f"({image_size})" in key):
+            if is_master_flat_key(key, filter_name=ftoken, image_size=image_size):
                 candidates.append((key, path))
         if not candidates:
             return None
 
-        if not hasattr(self, "_master_flat_go"):
-            self._master_flat_go = {}
-
-        def _flat_go(path):
-            if path not in self._master_flat_go:
-                try:
-                    hdr = fits.getheader(path, memmap=True)
-                    g = _get_key_float(hdr, "GAIN")
-                    o = _get_key_float(hdr, "OFFSET")
-                    if o is None:
-                        o = _get_key_float(hdr, "BLKLEVEL")
-                    self._master_flat_go[path] = (g, o)
-                except Exception:
-                    self._master_flat_go[path] = (None, None)
-            return self._master_flat_go[path]
-
         def _go_mismatch(path):
             if light_gain is None and light_offset is None:
                 return False
-            fg, fo = _flat_go(path)
+            fg, fo = self._master_flat_gain_offset(path)
             if light_gain is not None and fg is not None and abs(light_gain - fg) > 1:
                 return True
             if light_offset is not None and fo is not None and abs(light_offset - fo) > 1:
@@ -14019,14 +16916,19 @@ class StackingSuiteDialog(QDialog):
             return m.group(1) if m else None
 
         # 1) exact session + gain match — prefer the CACHED session tag (set correctly at ingest)
-        light_session = self.session_tags.get(light_path)
+        if not light_session:
+            light_session = self.session_tags.get(light_path)
         if not light_session:
             # fallback only if not cached for some reason
             try:
-                light_hdr = fits.getheader(light_path, memmap=True)
+                light_hdr, _ = get_valid_header(light_path)
             except Exception:
                 light_hdr = None
             light_session = self._session_from_dateobs_local_night(light_hdr) if light_hdr else None
+
+        light_d = self._file_local_night_date(light_path) if light_path else None
+        if light_d is None:
+            light_d = self._session_token_to_date(light_session)
 
         if light_session:
             exact_matches = [(k, p) for k, p in candidates if _key_session(k) == light_session]
@@ -14045,7 +16947,9 @@ class StackingSuiteDialog(QDialog):
 
         best = (None, 10**9, True)
         for _key, fpath in candidates:
-            fd = self._file_local_night_date(fpath)
+            # Night of the master's *raw* flats — works for SASpro-native and
+            # for PixInsight/XISF masters alike.
+            fd = self._master_flat_night_date(fpath, key=_key_session(_key))
             if fd is None:
                 continue
             delta = abs((fd - light_d).days)
@@ -14053,7 +16957,15 @@ class StackingSuiteDialog(QDialog):
             if (mismatch, delta) < (best[2], best[1]):
                 best = (fpath, delta, mismatch)
 
-        return best[0] if best[0] else candidates[0][1]
+        if best[0]:
+            return best[0]
+
+        # Nothing exposed a usable night: at least honour gain/offset instead
+        # of handing back an arbitrary candidate.
+        for _, path in candidates:
+            if not _go_mismatch(path):
+                return path
+        return candidates[0][1]
 
     def _ingest_paths_with_progress(self, paths, tree, expected_type, title, manual_session_name=None):
         # Reset per-batch missing-FILTER policy; keep _path_filter_override
@@ -14231,7 +17143,11 @@ class StackingSuiteDialog(QDialog):
             else:
                 forbidden = []
 
-            actual_type = self._guess_type_from_imagetyp(header.get("IMAGETYP"))
+            # Prefer IMAGETYP; fall back to a parent-folder-name hint
+            # (Darks/, Flats/, Bias/, DarkFlats/, Lights/) when the
+            # header is silent. This catches raw dumps and conversions
+            # that drop IMAGETYP but still live in a well-named folder.
+            actual_type = self._guess_frame_type(header, path)
             decision_key = (expected_type_u, (actual_type or "UNKNOWN"))
 
             # Legacy decision attr compatibility
@@ -14299,9 +17215,29 @@ class StackingSuiteDialog(QDialog):
                 keyword = self.settings.value("stacking/session_keyword", "Default", type=str)
                 session_tag = self._session_from_manual_keyword(path, keyword) or "Default"
 
+            # --- Acquisition timestamp (fast: header already loaded) ---
+            # Cached here so master creation can stamp the raw frames'
+            # acquisition window without re-opening every file in the group.
+            try:
+                self._note_frame_acquisition(path, header)
+            except Exception:
+                pass
+
             # --- Temperature (fast: header already loaded) ---
-            ccd_temp = header.get("CCD-TEMP", None)
-            set_temp = header.get("SET-TEMP", None)
+            # Via the vendor alias tables, so cameras that use a non-standard
+            # keyword (DWARF's DET-TEMP, for one) still group by temperature.
+            def _first_temp(keys):
+                for _k in keys:
+                    try:
+                        _v = header.get(_k, None)
+                    except Exception:
+                        continue
+                    if _v not in (None, ""):
+                        return _v
+                return None
+
+            ccd_temp = _first_temp(self._CCD_TEMP_KEYS)
+            set_temp = _first_temp(self._SET_TEMP_KEYS)
 
             def _to_float_temp(v):
                 try:
@@ -14331,8 +17267,8 @@ class StackingSuiteDialog(QDialog):
 
             # === DARKs ===
             if expected_type_u == "DARK":
-                ccd_t = _get_key_float(header, "CCD-TEMP")
-                set_t = _get_key_float(header, "SET-TEMP")
+                ccd_t = _to_float_temp(ccd_temp)
+                set_t = _to_float_temp(set_temp)
                 chosen_t = ccd_t if ccd_t is not None else set_t
 
                 temp_step = float(self.settings.value("stacking/temp_group_step", 1.0, type=float) or 1.0)
@@ -14505,26 +17441,41 @@ class StackingSuiteDialog(QDialog):
                     except Exception:
                         exposure_text = f"{exposure}s" if str(exposure).endswith("s") else str(exposure)
 
-                    sensor_temp = header.get("CCD-TEMP", header.get("SET-TEMP", None))
-                    gain_val = header.get("GAIN", None)
-                    temp_suffix = f" [{float(sensor_temp):+.1f}C]" if sensor_temp is not None else ""
-                    gain_suffix = f" [G{int(gain_val)}]" if gain_val is not None else ""
+                    # Use the tolerant extractor the matchers use, so a key and
+                    # the gain/offset we later compare against are read the same
+                    # way. Raw header.get() + int() throws on a string value
+                    # like '100.0' or '-10 C', and the outer except would then
+                    # drop the master entirely instead of just omitting a tag.
+                    sensor_temp = None
+                    for _tk in (self._CCD_TEMP_KEYS + self._SET_TEMP_KEYS):
+                        sensor_temp = _get_key_float(header, _tk)
+                        if sensor_temp is not None:
+                            break
+                    gain_val = _get_key_float(header, "GAIN")
+                    temp_suffix = f" [{sensor_temp:+.1f}C]" if sensor_temp is not None else ""
+                    gain_suffix = f" [G{int(round(gain_val))}]" if gain_val is not None else ""
                     key = f"{exposure_text} ({image_size}){temp_suffix}{gain_suffix}"
                     self.master_files[key] = file_path
                     self.master_sizes[file_path] = image_size
                 elif file_type.upper() == "FLAT":
-                    session_name = "Default"
-                    filename = os.path.basename(file_path)
-                    if filename.lower().startswith("masterflat_"):
-                        parts = filename.split("_")
-                        if len(parts) > 1:
-                            session_name = parts[1]
+                    # Derive the session from the header we already loaded: a
+                    # master flat carries the acquisition time of its *raw*
+                    # flats, so it buckets into the same noon-to-noon night as
+                    # the lights shot that night. Falls back to filename/folder
+                    # tokens only when no acquisition date is present.
+                    session_name = self._master_flat_session(file_path, header)
 
-                    gain_val = header.get("GAIN", None)
-                    offset_val = header.get("OFFSET", header.get("BLKLEVEL", None))
-                    gain_suffix = f" [G{int(gain_val)}]" if gain_val is not None else ""
+                    # Same tolerant read as the matchers (see DARK branch).
+                    # Offset is intentionally not in the key: it is compared at
+                    # match time by _master_flat_gain_offset, and most capture
+                    # software (SGP, NINA) does not record it at all.
+                    gain_val = _get_key_float(header, "GAIN")
+                    gain_suffix = f" [G{int(round(gain_val))}]" if gain_val is not None else ""
 
-                    key = f"{filter_name} ({image_size}) [{session_name}]{gain_suffix}"
+                    key = self._unique_master_flat_key(
+                        f"{filter_name} ({image_size}) [{session_name}]{gain_suffix}",
+                        file_path, exposure,
+                    )
                     self.master_files[key] = file_path
                     self.master_sizes[file_path] = image_size
 
@@ -14547,7 +17498,6 @@ class StackingSuiteDialog(QDialog):
 
                 self.update_status(self.tr(f"✅ Added Master {file_type} -> {file_path} under {key} with metadata: {metadata}"))
 
-                self.update_status(self.tr(f"📂 DEBUG: Master Files Stored: {self.master_files}"))
                 QApplication.processEvents()
 
             except Exception as e:
@@ -14724,7 +17674,7 @@ class StackingSuiteDialog(QDialog):
             try:
                 chunk_h, chunk_w = compute_safe_chunk(H, W, N, C, DTYPE, pref_chunk_h, pref_chunk_w)
             except MemoryError:
-                chunk_h, chunk_w = pref_chunk_h, pref_chunk_w
+                chunk_h, chunk_w = _band_shape(pref_chunk_h, H, W)
 
             gk = (exposure_time, image_size, session, temp_bucket, gain, offset)
             group_shapes[gk] = (H, W, C, chunk_h, chunk_w)
@@ -14821,12 +17771,13 @@ class StackingSuiteDialog(QDialog):
                             height, width, N_tmp, channels, DTYPE, pref_chunk_h, pref_chunk_w
                         )
                     except MemoryError:
-                        chunk_height, chunk_width = pref_chunk_h, pref_chunk_w
+                        chunk_height, chunk_width = _band_shape(pref_chunk_h, height, width)
 
                 N = len(file_list)
 
                 algo_name, params, cpu_label = _select_reducer("dark", N)
-                use_gpu = bool(self._hw_accel_enabled()) and _torch_ok() and _gpu_algo_supported(algo_name)
+                use_gpu = (bool(self._hw_accel_enabled()) and _torch_ok()
+                           and _gpu_algo_supported(algo_name) and _rejection_gpu_ok())
                 algo_brief = ("GPU" if use_gpu else "CPU") + " " + algo_name
                 self.update_status(self.tr(f"⚙️ {algo_brief} selected for {N} frames (channels={channels})"))
                 QApplication.processEvents()
@@ -14919,6 +17870,7 @@ class StackingSuiteDialog(QDialog):
                             sigma_high=float(getattr(self, "sigma_high", 2.5)),
                             trim_fraction=float(params.get("trim_fraction", getattr(self, "trim_fraction", 0.05))),
                             esd_threshold=float(getattr(self, "esd_threshold", 3.0)),
+                            esd_bonferroni=bool(getattr(self, "esd_bonferroni", False)),
                             biweight_constant=float(getattr(self, "biweight_constant", 6.0)),
                             modz_threshold=float(getattr(self, "modz_threshold", 3.5)),
                             comet_hclip_k=float(self.settings.value("stacking/comet_hclip_k", 1.30, type=float)),
@@ -15037,6 +17989,13 @@ class StackingSuiteDialog(QDialog):
                 master_header["SESSION"]  = (str(session), "Session-agnostic dark (applies to all)")
                 master_header["NCOMBINE"] = (int(N), "Number of darks combined")
                 master_header["NSTACK"]   = (int(N), "Alias of NCOMBINE (SetiAstro)")
+                # Acquisition window of the raw darks. Darks are matched on
+                # exposure/temp/gain rather than session, so this is provenance
+                # rather than matching -- but it keeps every master SASpro
+                # writes self-describing, and DATE stays the creation stamp.
+                self._stamp_acquisition_provenance(
+                    master_header, file_list, exposure_time, label="raw dark"
+                )
                 if gain is not None:
                     master_header["GAIN"]   = (float(gain),   "Camera gain used for these darks")
                 if offset is not None:
@@ -15419,13 +18378,94 @@ class StackingSuiteDialog(QDialog):
                 master_bias = None
 
         # -------------------------------------------------------------------------
-        # Pre-count tiles with per-group safe chunk sizes
+        # Dark-resolution helpers (hoisted so the pre-pass can resolve every
+        # group's dark path up-front — mirrors image integration's PHASE 0C).
+        # -------------------------------------------------------------------------
+        def _resolve_dark_path(exposure_time, image_size, filter_name) -> str | None:
+            """Resolve the master-dark path for a flat group, honouring per-group
+            override and auto-select. Returns a filesystem path, the sentinel
+            '__NO_DARK__', or None."""
+            override_val = None
+            fdo = getattr(self, "flat_dark_override", {}) or {}
+            if fdo:
+                exp_here = float(exposure_time)
+                for k, v in fdo.items():
+                    try:
+                        f_name, sz, lo_s, hi_s = k.split("|")
+                    except Exception:
+                        continue
+                    if f_name != filter_name:
+                        continue
+                    if sz != "Unknown" and image_size != "Unknown" and sz != image_size:
+                        continue
+                    if exp_here >= 0:
+                        lo = float(lo_s); hi = float(hi_s)
+                        if not (lo - 1e-6 <= exp_here <= hi + 1e-6):
+                            continue
+                    override_val = v
+                    break
+
+            if override_val == "__NO_DARK__":
+                return "__NO_DARK__"
+            if isinstance(override_val, str):
+                if os.path.exists(override_val):
+                    return override_val
+                # override missing on disk → fall through to auto/none
+
+            if self.auto_select_dark_checkbox.isChecked():
+                best = None
+                best_diff = float("inf")
+                exp_here = float(exposure_time)
+                for key, path in (getattr(self, "master_files", {}) or {}).items():
+                    if "MasterDark" not in os.path.basename(path):
+                        continue
+                    dark_size = self.master_sizes.get(path, "Unknown")
+                    m = re.match(r"([\d.]+)s", key or "")
+                    dark_exp = float(m.group(1)) if m else float("inf")
+                    size_ok = (
+                        image_size == "Unknown"
+                        or dark_size == "Unknown"
+                        or dark_size == image_size
+                    )
+                    if not size_ok:
+                        continue
+                    diff = abs(dark_exp - exp_here)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best = path
+                return best
+            return None
+
+        def _load_dark_normalized(path):
+            """Load a dark FITS/XISF, flip ROWORDER if needed, normalise layout to
+            final HWC (color) or 2D (mono) float32 — so the per-tile loop never
+            has to reshape it. Returns (array, is_color) or (None, False)."""
+            arr, hdr, _, _is_mono = load_image(path)
+            if arr is None:
+                return None, False
+            if str((hdr or {}).get("ROWORDER", "")).strip().upper() == "TOP-DOWN":
+                arr = np.ascontiguousarray(np.flipud(arr))
+            if arr.ndim == 3:
+                if arr.shape[0] in (1, 3):           # CHW → HWC
+                    arr = arr.transpose(1, 2, 0)
+                if arr.shape[-1] == 1:               # HWC with 1 channel → 2D
+                    arr = arr[..., 0]
+            arr = np.ascontiguousarray(arr, dtype=np.float32)
+            is_color = (arr.ndim == 3 and arr.shape[-1] == 3)
+            return arr, is_color
+
+        # -------------------------------------------------------------------------
+        # Pre-pass: tile count, per-group plan (dark path, bayer, roworder),
+        # max shared-buffer dims, and the set of unique dark paths to pre-load.
         # -------------------------------------------------------------------------
         total_tiles = 0
-        group_shapes: dict[tuple[float, str, str, str], tuple[int, int, int, int, int]] = {}
+        group_plan: dict = {}
         pref_chunk_h = self.chunk_height
         pref_chunk_w = self.chunk_width
         DTYPE = np.float32
+
+        max_N = 0; max_th = 0; max_tw = 0; max_C = 1
+        unique_dark_paths: set[str] = set()
 
         for (exposure_time, image_size, filter_name, session), file_list in flat_files_by_group.items():
             if len(file_list) < 2:
@@ -15443,10 +18483,47 @@ class StackingSuiteDialog(QDialog):
                     H, W, N, C, DTYPE, pref_chunk_h, pref_chunk_w
                 )
             except MemoryError:
-                chunk_h, chunk_w = pref_chunk_h, pref_chunk_w
+                chunk_h, chunk_w = _band_shape(pref_chunk_h, H, W)
 
-            group_shapes[(exposure_time, image_size, filter_name, session)] = (H, W, C, chunk_h, chunk_w)
+            # Bayer + ROWORDER from the first flat's header (one read).
+            bayerpat = None
+            flat_roworder = ""
+            try:
+                hdr0, _ = get_valid_header(file_list[0])
+                bayerpat = (hdr0.get("BAYERPAT") or hdr0.get("BAYERPATN") or hdr0.get("BAYER") or None)
+                if bayerpat is not None:
+                    bayerpat = str(bayerpat).strip().upper()
+                flat_roworder = str(hdr0.get("ROWORDER") or "")
+            except Exception:
+                pass
+            is_bayer_group = (C == 1) and bool(bayerpat)
+            if is_bayer_group and bayerpat not in ("RGGB", "BGGR", "GRBG", "GBRG"):
+                bayerpat = "RGGB"
+
+            # Resolve the dark path up-front so we can load each unique dark once.
+            resolved_dark = _resolve_dark_path(exposure_time, image_size, filter_name)
+            if resolved_dark and resolved_dark != "__NO_DARK__":
+                unique_dark_paths.add(resolved_dark)
+
+            group_plan[(exposure_time, image_size, filter_name, session)] = {
+                "H": H, "W": W, "C": C,
+                "chunk_h": chunk_h, "chunk_w": chunk_w,
+                "N": N, "file_list": file_list,
+                "dark_path": resolved_dark,
+                "bayerpat": bayerpat if is_bayer_group else None,
+                "flat_roworder": flat_roworder,
+                "is_bayer": is_bayer_group,
+            }
+            max_N  = max(max_N,  N)
+            max_th = max(max_th, chunk_h)
+            max_tw = max(max_tw, chunk_w)
+            max_C  = max(max_C,  C)
             total_tiles += _count_tiles(H, W, chunk_h, chunk_w)
+
+        # Kept so earlier call-sites that still check this don't KeyError. The
+        # group loop below reads from group_plan, not from group_shapes.
+        group_shapes = {k: (v["H"], v["W"], v["C"], v["chunk_h"], v["chunk_w"])
+                        for k, v in group_plan.items()}
 
         if total_tiles == 0:
             self.update_status(self.tr("⚠️ No eligible flat groups found to stack."))
@@ -15456,6 +18533,29 @@ class StackingSuiteDialog(QDialog):
             f"🧭 Total tiles to process: {total_tiles} (base chunk preference {pref_chunk_h}×{pref_chunk_w})"
         ))
         QApplication.processEvents()
+
+        # -------------------------------------------------------------------------
+        # Pre-load every unique master dark ONCE, normalised to final layout.
+        # A build with 10 flat groups all picking the same dark used to load it
+        # 10× from disk and re-shape it on every tile.
+        # -------------------------------------------------------------------------
+        dark_cache: dict = {}   # path -> (array, is_color)
+        if unique_dark_paths:
+            self.update_status(self.tr(
+                f"🌓 Pre-loading {len(unique_dark_paths)} unique master dark(s)…"
+            ))
+            QApplication.processEvents()
+            for dp in unique_dark_paths:
+                try:
+                    arr, is_color = _load_dark_normalized(dp)
+                    if arr is not None:
+                        dark_cache[dp] = (arr, is_color)
+                        self.update_status(self.tr(f"  ✓ {os.path.basename(dp)}"))
+                except Exception as e:
+                    self.update_status(self.tr(
+                        f"  ⚠️ Could not pre-load dark {os.path.basename(dp)}: {e}"
+                    ))
+            QApplication.processEvents()
 
         # -------------------------------------------------------------------------
         # Helpers (local to this function)
@@ -15696,262 +18796,210 @@ class StackingSuiteDialog(QDialog):
 
         from concurrent.futures import ThreadPoolExecutor
 
+        # Ordered list of eligible groups (filter out <2-frame groups once).
+        eligible_groups = [gk for gk, pl in group_plan.items() if pl["N"] >= 2]
+
+        # Warn once up-front about any skipped (too-small) groups so the per-group
+        # pause isn't padded with these one-liners.
+        for gk, file_list in flat_files_by_group.items():
+            if len(file_list) < 2:
+                exposure_time, image_size, filter_name, session = gk
+                self.update_status(self.tr(
+                    f"⚠️ Skipping {exposure_time}s ({image_size}) [{filter_name}] [{session}] "
+                    f"— Not enough frames to stack."
+                ))
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Background pools (the point of this refactor):
+        #   prep_pool  — opens the next group's _MMImages and estimates its
+        #                per-frame scales WHILE the current group's tile loop
+        #                runs. Removes the serial "scale-estimation + open-N-
+        #                mmaps" preamble that used to sit between every
+        #                master flat.
+        #   save_pool  — writes finished master flat FITS files in the
+        #                background so the NEXT group's tile loop isn't
+        #                blocked by the save.
+        #   tile_tp    — per-group tile-prefetch pool (same role as before).
+        # ─────────────────────────────────────────────────────────────────────
+        prep_pool = ThreadPoolExecutor(max_workers=1)
+        save_pool = ThreadPoolExecutor(max_workers=2)
+        save_futs: list = []
+
+        def _prepare_group(gk):
+            """Open the group's mmimages + estimate per-frame scales.
+            Runs on prep_pool so the preamble overlaps with the previous
+            group's tile loop. Returns {'scales', 'sources', 'dark_arr'}
+            or {'error': msg}."""
+            plan = group_plan[gk]
+            file_list = plan["file_list"]
+            dark_entry = dark_cache.get(plan["dark_path"]) if plan["dark_path"] else None
+            dark_arr = dark_entry[0] if dark_entry else None
+
+            # Scale subtractor: prefer dark; for mono/bayer, fall back to bias
+            scale_sub = dark_arr
+            if scale_sub is None and plan["is_bayer"] and master_bias is not None:
+                scale_sub = master_bias
+
+            try:
+                if plan["is_bayer"]:
+                    scales = _estimate_flat_scales_bayer(
+                        file_list, plan["H"], plan["W"], scale_sub, plan["bayerpat"]
+                    )
+                else:
+                    scales = _estimate_flat_scales(
+                        file_list, plan["H"], plan["W"], plan["C"], dark_arr
+                    )
+            except Exception as e:
+                return {"error": f"scale estimation failed: {e}"}
+
+            sources = []
+            try:
+                for p in file_list:
+                    sources.append(_MMImage(p))
+            except Exception as e:
+                for s in sources:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                return {"error": f"memmap open failed: {e}"}
+
+            return {"scales": scales, "sources": sources, "dark_arr": dark_arr}
+
+        # Prime the first group's prep so it starts running NOW; subsequent
+        # groups' prep is kicked off at the top of the previous group's loop
+        # body so it overlaps with that group's tile processing.
+        next_prep_fut = (
+            prep_pool.submit(_prepare_group, eligible_groups[0])
+            if eligible_groups else None
+        )
+
         try:
             # ---------------------------------------------------------------------
             # Per-group stacking loop
             # ---------------------------------------------------------------------
-            for (exposure_time, image_size, filter_name, session), file_list in flat_files_by_group.items():
-                if len(file_list) < 2:
-                    self.update_status(self.tr(
-                        f"⚠️ Skipping {exposure_time}s ({image_size}) [{filter_name}] [{session}] - Not enough frames to stack."
-                    ))
-                    continue
+            for gi, group_key in enumerate(eligible_groups):
                 if pd.cancelled:
                     self.update_status(self.tr("⛔ Master Flat creation cancelled."))
                     break
 
+                exposure_time, image_size, filter_name, session = group_key
+                plan = group_plan[group_key]
+                N              = plan["N"]
+                height         = plan["H"]
+                width          = plan["W"]
+                channels       = plan["C"]
+                chunk_height   = plan["chunk_h"]
+                chunk_width    = plan["chunk_w"]
+                bayerpat       = plan["bayerpat"]
+                is_bayer_group = plan["is_bayer"]
+                flat_roworder  = plan["flat_roworder"]
+                file_list      = plan["file_list"]
+
                 exp_label = f"{exposure_time}s" if exposure_time >= 0 else "Unknown"
                 self.update_status(self.tr(
-                    f"🟢 Processing {len(file_list)} flats for {exp_label} ({image_size}) "
+                    f"🟢 Processing {N} flats for {exp_label} ({image_size}) "
                     f"[{filter_name}] in session '{session}'…"
                 ))
-                QApplication.processEvents()
 
-                # -----------------------------------------------------------------
-                # Select matching master dark (override / auto-select logic)
-                # -----------------------------------------------------------------
-                selected_master_dark = None
-                override_val = None
-
-                fdo = getattr(self, "flat_dark_override", {}) or {}
-                if fdo:
-                    exp_here = float(exposure_time)
-                    tol = float(self.flat_exposure_tolerance_spinbox.value())
-                    for k, v in fdo.items():
-                        # keys are stored as "filter|size|exp_lo|exp_hi"
-                        try:
-                            f_name, sz, lo_s, hi_s = k.split("|")
-                        except Exception:
-                            continue
-
-                        if f_name != filter_name:
-                            continue
-
-                        # size: treat "Unknown" as wildcard on either side
-                        if sz != "Unknown" and image_size != "Unknown" and sz != image_size:
-                            continue
-
-                        if exp_here >= 0:
-                            lo = float(lo_s); hi = float(hi_s)
-                            if not (lo - 1e-6 <= exp_here <= hi + 1e-6):
-                                continue
-
-                        override_val = v
-                        break
-
-                if override_val == "__NO_DARK__":
+                # Per-group status for the resolved dark (resolution already
+                # happened in the pre-pass; we just report what was chosen).
+                dp = plan["dark_path"]
+                if dp == "__NO_DARK__":
                     self.update_status(self.tr("ℹ️ This flat group: override = No Calibration."))
-                elif isinstance(override_val, str):
-                    if os.path.exists(override_val):
-                        selected_master_dark = override_val
-                        self.update_status(self.tr(
-                            f"🌓 This flat group: using OVERRIDE dark → {os.path.basename(selected_master_dark)}"
-                        ))
-                    else:
-                        self.update_status(self.tr("⚠️ Override dark missing on disk; falling back to Auto/None."))
-                        override_val = None
-
-                # AUTO-SELECT when no override
-                if (override_val is None) and self.auto_select_dark_checkbox.isChecked():
-                    best_diff = float("inf")
-                    exp_here = float(exposure_time)
-
-                    for key, path in (getattr(self, "master_files", {}) or {}).items():
-                        if "MasterDark" not in os.path.basename(path):
-                            continue
-
-                        dark_size = self.master_sizes.get(path, "Unknown")
-                        m = re.match(r"([\d.]+)s", key or "")
-                        dark_exp = float(m.group(1)) if m else float("inf")
-
-                        size_ok = (
-                            image_size == "Unknown"
-                            or dark_size == "Unknown"
-                            or dark_size == image_size
-                        )
-                        if not size_ok:
-                            continue
-
-                        diff = abs(dark_exp - exp_here)
-                        if diff < best_diff:
-                            best_diff = diff
-                            selected_master_dark = path
-
-                    if selected_master_dark:
-                        self.update_status(self.tr(
-                            f"🌓 This flat group: using AUTO dark → {os.path.basename(selected_master_dark)}"
-                        ))
-                    else:
-                        self.update_status(self.tr(
-                            "ℹ️ This flat group: no matching Master Dark (size) — proceeding without subtraction."
-                        ))
-                elif (override_val is None) and (not self.auto_select_dark_checkbox.isChecked()):
+                elif dp:
                     self.update_status(self.tr(
-                        "ℹ️ This flat group: Auto-Select is OFF and no override set → No Calibration."
+                        f"🌓 This flat group: dark → {os.path.basename(dp)}"
                     ))
-                # -----------------------------------------------------------------
-                # Reference shape + per-group chunk size
-                # -----------------------------------------------------------------
-                if (exposure_time, image_size, filter_name, session) in group_shapes:
-                    height, width, channels, chunk_height, chunk_width = group_shapes[
-                        (exposure_time, image_size, filter_name, session)
-                    ]
                 else:
-                    ref_data, _, _, _ = load_image(file_list[0])
-                    if ref_data is None:
+                    if self.auto_select_dark_checkbox.isChecked():
                         self.update_status(self.tr(
-                            f"❌ Failed to load reference {os.path.basename(file_list[0])}"
+                            "ℹ️ This flat group: no matching Master Dark (size) "
+                            "— proceeding without subtraction."
                         ))
-                        continue
-                    height, width = ref_data.shape[:2]
-                    channels = 1 if ref_data.ndim == 2 else 3
-                    channels = max(1, channels)
-                    N_tmp = len(file_list)
-                    try:
-                        chunk_height, chunk_width = compute_safe_chunk(
-                            height, width, N_tmp, channels, DTYPE,
-                            pref_chunk_h, pref_chunk_w
-                        )
-                    except MemoryError:
-                        chunk_height, chunk_width = pref_chunk_h, pref_chunk_w
-
-                channels = max(1, channels)
-                N = len(file_list)
-                # Load the chosen dark if any
-                if selected_master_dark:
-                    dark_data, _dark_hdr, _, _ = load_image(selected_master_dark)
-                    if dark_data is not None:
-                        # Match the raw flats' on-disk (bottom-up) orientation for the
-                        # in-build subtraction (see the bias note above).
-                        if str((_dark_hdr or {}).get("ROWORDER", "")).strip().upper() == "TOP-DOWN":
-                            dark_data = np.ascontiguousarray(np.flipud(dark_data))
-                        if dark_data.ndim == 3 and dark_data.shape[-1] == 3:
-                            # keep HWC
-                            dark_data = dark_data.astype(np.float32, copy=False)
-                        elif dark_data.ndim == 3 and dark_data.shape[0] in (1, 3):
-                            dark_data = dark_data.transpose(1, 2, 0).astype(np.float32, copy=False)
-                        else:
-                            dark_data = dark_data.astype(np.float32, copy=False)
-
-                        # ── Shape mismatch check ──────────────────────────────────
-                        flat_is_color = (channels == 3)
-                        dark_is_color = (dark_data.ndim == 3 and (
-                            dark_data.shape[-1] == 3 or dark_data.shape[0] == 3
+                    else:
+                        self.update_status(self.tr(
+                            "ℹ️ This flat group: Auto-Select is OFF and no override set "
+                            "→ No Calibration."
                         ))
-                        if flat_is_color != dark_is_color:
-                            flat_desc = "color (debayered)" if flat_is_color else "mono/Bayer"
-                            dark_desc = "color (debayered)" if dark_is_color else "mono/Bayer"
-                            self.update_status(self.tr(
-                                f"❌ FLAT CALIBRATION ERROR: Flat group is {flat_desc} but "
-                                f"Master Dark is {dark_desc}. Skipping dark subtraction for this group.\n"
-                                f"  Dark: {os.path.basename(selected_master_dark)}"
-                            ))
-                            QMessageBox.warning(
-                                self,
-                                "Dark/Flat Mismatch",
-                                f"Cannot apply dark subtraction to flat group:\n\n"
-                                f"Flat frames are {flat_desc}\n"
-                                f"Master Dark is {dark_desc}\n\n"
-                                f"Dark: {os.path.basename(selected_master_dark)}\n\n"
-                                f"Continuing without dark subtraction for this flat group."
-                            )
-                            dark_data = None
-                        # ─────────────────────────────────────────────────────────
-                else:
-                    dark_data = None
-
-
-
-                # -----------------------------------------------------------------
-                # Detect Bayer (only meaningful when channels==1)
-                # -----------------------------------------------------------------
-                bayerpat = None
-                flat_roworder = ""   # sensor readout direction of the source flats
-                try:
-                    hdr0, _ = get_valid_header(file_list[0])
-                    bayerpat = (hdr0.get("BAYERPAT") or hdr0.get("BAYERPATN") or hdr0.get("BAYER") or None)
-                    if bayerpat is not None:
-                        bayerpat = str(bayerpat).strip().upper()
-                    flat_roworder = str(hdr0.get("ROWORDER") or "")
-                except Exception:
-                    bayerpat = None
-                is_bayer_group = (channels == 1) and bool(bayerpat)
-
                 if is_bayer_group:
-                    if bayerpat not in ("RGGB", "BGGR", "GRBG", "GBRG"):
-                        bayerpat = "RGGB"
                     self.update_status(self.tr(f"🧩 Bayer flat group detected: {bayerpat}"))
-                    QApplication.processEvents()
-
-                # -----------------------------------------------------------------
-                # Reducer selection & per-frame normalization scales
-                # -----------------------------------------------------------------
-                algo_name, params, cpu_label = _select_reducer("flat", N)
-                use_gpu = bool(self._hw_accel_enabled()) and _torch_ok() and _gpu_algo_supported(algo_name)
-
-                # For flat scaling estimation: subtract dark if present, else subtract bias if we have one (mono case)
-                scale_subtractor = dark_data
-                if scale_subtractor is None and is_bayer_group and master_bias is not None:
-                    # only use bias this way for mono/bayer flats
-                    scale_subtractor = master_bias
-
-                self.update_status(self.tr(f"⚙️ Normalizing {N} flats by per-frame medians (central patch)."))
                 QApplication.processEvents()
 
-                if is_bayer_group:
-                    scales = _estimate_flat_scales_bayer(file_list, height, width, scale_subtractor, bayerpat)
+                # Wait on THIS group's prep (ideally already done in background);
+                # then IMMEDIATELY submit next group's prep so it overlaps with
+                # this group's tile loop.
+                self.update_status(self.tr(
+                    f"⚙️ Normalizing {N} flats by per-frame medians (central patch)."
+                ))
+                QApplication.processEvents()
+                prep = next_prep_fut.result()
+                if gi + 1 < len(eligible_groups):
+                    next_prep_fut = prep_pool.submit(
+                        _prepare_group, eligible_groups[gi + 1]
+                    )
                 else:
-                    scales = _estimate_flat_scales(file_list, height, width, channels, dark_data)
+                    next_prep_fut = None
 
+                if "error" in prep:
+                    self.update_status(self.tr(f"❌ {prep['error']} — skipping group."))
+                    QApplication.processEvents()
+                    continue
+
+                sources  = prep["sources"]
+                scales   = prep["scales"]
+                dark_arr = prep["dark_arr"]
+
+                # ── Shape mismatch check (dark vs flat color) ──────────────
+                # dark_cache stored the dark in final HWC-or-2D layout, so the
+                # check is a one-liner now.
+                if dark_arr is not None:
+                    flat_is_color = (channels == 3)
+                    dark_is_color = (dark_arr.ndim == 3 and dark_arr.shape[-1] == 3)
+                    if flat_is_color != dark_is_color:
+                        flat_desc = "color (debayered)" if flat_is_color else "mono/Bayer"
+                        dark_desc = "color (debayered)" if dark_is_color else "mono/Bayer"
+                        self.update_status(self.tr(
+                            f"❌ FLAT CALIBRATION ERROR: Flat group is {flat_desc} but "
+                            f"Master Dark is {dark_desc}. Skipping dark subtraction for this group.\n"
+                            f"  Dark: {os.path.basename(dp or '')}"
+                        ))
+                        QMessageBox.warning(
+                            self,
+                            "Dark/Flat Mismatch",
+                            f"Cannot apply dark subtraction to flat group:\n\n"
+                            f"Flat frames are {flat_desc}\n"
+                            f"Master Dark is {dark_desc}\n\n"
+                            f"Dark: {os.path.basename(dp or '')}\n\n"
+                            f"Continuing without dark subtraction for this flat group."
+                        )
+                        dark_arr = None
+
+                # Choose tile-time subtractor (same precedence as before:
+                # dark preferred, bias fallback for mono/bayer).
+                tile_subtractor = dark_arr
+                if tile_subtractor is None and is_bayer_group and master_bias is not None:
+                    tile_subtractor = master_bias
+
+                # Reducer selection
+                algo_name, params, cpu_label = _select_reducer("flat", N)
+                use_gpu = (bool(self._hw_accel_enabled()) and _torch_ok()
+                           and _gpu_algo_supported(algo_name) and _rejection_gpu_ok())
                 self.update_status(self.tr(
                     f"⚙️ {'GPU' if use_gpu else 'CPU'} reducer for flats — {algo_name} "
                     f"({ 'k=%.1f' % params.get('kappa', 0) if cpu_label=='kappa1' else 'trim=%.0f%%' % (params.get('trim_fraction', 0)*100) if cpu_label=='trimmed' else 'median'})"
                 ))
                 QApplication.processEvents()
 
-                # -----------------------------------------------------------------
-                # Open all flats as memmapped sources (once per group)
-                # -----------------------------------------------------------------
-                sources = []
-                try:
-                    for p in file_list:
-                        sources.append(_MMImage(p))
-                except Exception as e:
-                    for s in sources:
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-                    self.update_status(self.tr(f"❌ Failed to memmap flat frames: {e}"))
-                    QApplication.processEvents()
-                    continue
-
-                # Temporary memmap for the master stack
-                memmap_path = os.path.join(
-                    master_dir,
-                    f"temp_flat_{session}_{exposure_time}_{image_size}_{filter_name}.dat",
-                )
-                self.update_status(self.tr(
-                    f"🗂️ Creating temp memmap: {os.path.basename(memmap_path)} "
-                    f"(shape={height}×{width}×{channels}, dtype=float32)"
-                ))
-                QApplication.processEvents()
-                final_stacked = np.memmap(
-                    memmap_path,
-                    dtype=np.float32,
-                    mode="w+",
-                    shape=(height, width, channels),
-                )
+                # ─────────────────────────────────────────────────────────────
+                # Output buffer: plain RAM array. The old code wrote this to a
+                # temp memmap file and immediately read it back with np.asarray
+                # before deleting the file — pure disk round-trip for ~250 MB
+                # (mono) / ~750 MB (color) per master flat. One master-flat
+                # output easily fits in RAM; the per-stack working set
+                # (buf0+buf1) was already far bigger.
+                # ─────────────────────────────────────────────────────────────
+                final_stacked = np.empty((height, width, channels), dtype=np.float32)
 
                 tiles = _tile_grid(height, width, chunk_height, chunk_width)
                 total_tiles_group = len(tiles)
@@ -15961,7 +19009,7 @@ class StackingSuiteDialog(QDialog):
                 ))
                 QApplication.processEvents()
 
-                # Allocate max-chunk buffers
+                # Allocate max-chunk buffers for this group
                 buf0 = np.empty(
                     (N, chunk_height, chunk_width, channels),
                     dtype=np.float32,
@@ -15969,29 +19017,86 @@ class StackingSuiteDialog(QDialog):
                 )
                 buf1 = np.empty_like(buf0)
 
-                # Helper: read one tile into the given buffer from all memmapped sources
-                def _read_tile_into(buf, y0, y1, x0, x1):
+                # ─────────────────────────────────────────────────────────────
+                # Multi-reader tile prefetch: the old loop read N files
+                # serially inside the single-worker prefetcher — one source
+                # at a time, each waiting on disk I/O. We fan the per-source
+                # reads out over `read_workers` threads so a tile's N file
+                # slices load concurrently, which is a straight win on SSD /
+                # NVMe and still safe on HDD (each _MMImage holds its own
+                # independent read-only mmap, so there's no shared state to
+                # race on). Capped at min(N, 4) by default; the setting is
+                # exposed so an HDD user can dial it back to 2.
+                # ─────────────────────────────────────────────────────────────
+                read_workers = int(self.settings.value(
+                    "stacking/tile_read_workers", 4, type=int
+                ))
+                read_workers = max(1, min(read_workers, N))
+                read_pool = ThreadPoolExecutor(
+                    max_workers=read_workers,
+                    thread_name_prefix="flatRead",
+                )
+
+                def _read_tile_into(buf, y0, y1, x0, x1,
+                                    _sources=sources, _N=N, _C=channels,
+                                    _pool=read_pool):
                     th = y1 - y0
                     tw = x1 - x0
-                    ts = buf[:N, :th, :tw, :channels]
-                    for i, src in enumerate(sources):
-                        src.read_tile_into(ts[i], y0, y1, x0, x1, channels)
+                    ts = buf[:_N, :th, :tw, :_C]
+                    futs = [
+                        _pool.submit(
+                            _sources[i].read_tile_into,
+                            ts[i], y0, y1, x0, x1, _C,
+                        )
+                        for i in range(_N)
+                    ]
+                    for f in futs:
+                        f.result()
                     return th, tw
 
-                tp = ThreadPoolExecutor(max_workers=1)
+                tile_tp = ThreadPoolExecutor(max_workers=1)
 
                 # Prime first read
                 (y0, y1, x0, x1) = tiles[0]
-                fut = tp.submit(_read_tile_into, buf0, y0, y1, x0, x1)
+                fut = tile_tp.submit(_read_tile_into, buf0, y0, y1, x0, x1)
                 use0 = True
 
                 self.update_status(self.tr(
-                    f"▶️ Starting tile processing for group '{filter_name}' ({exposure_time}s, {image_size}, session '{session}')"
+                    f"▶️ Starting tile processing for group '{filter_name}' "
+                    f"({exposure_time}s, {image_size}, session '{session}') "
+                    f"— {read_workers} reader thread(s)"
                 ))
                 QApplication.processEvents()
 
                 weights_np = np.ones((N,), dtype=np.float32)
                 cancelled_group = False
+
+                # tile_subtractor is already in final HWC-or-2D layout (either
+                # from dark_cache or from the bias load above); the only
+                # possible per-tile shape work is "repeat 2D mono to 3 chans".
+                sub_is_2d_to_rgb = (
+                    tile_subtractor is not None
+                    and tile_subtractor.ndim == 2
+                    and channels == 3
+                )
+
+                # ─────────────────────────────────────────────────────────────
+                # GPU calibration-prep hand-off:
+                # When the reducer runs on the GPU, we hand it the FULL dark
+                # frame + per-frame scales ONCE (keyed by group_key, so the
+                # upload happens on the first tile call) and let it fuse
+                # dark-sub + clip + per-frame scale into one device-side pass
+                # right after it uploads ts. The CPU prep below is then
+                # skipped. For the CPU reducer we still run the CPU prep —
+                # there's no device to defer it to.
+                # ─────────────────────────────────────────────────────────────
+                gpu_group_key = (
+                    f"flat::{session}::{exposure_time}::{image_size}::{filter_name}"
+                    if use_gpu else None
+                )
+                gpu_dark_np   = tile_subtractor if use_gpu else None
+                gpu_scales_np = scales          if use_gpu else None
+                gpu_bayer_pat = bayerpat        if (use_gpu and is_bayer_group) else None
 
                 # -----------------------------------------------------------------
                 # Tile loop
@@ -16007,42 +19112,20 @@ class StackingSuiteDialog(QDialog):
                     # Prefetch next
                     if t_idx < total_tiles_group:
                         ny0, ny1, nx0, nx1 = tiles[t_idx]
-                        fut = tp.submit(
+                        fut = tile_tp.submit(
                             _read_tile_into,
                             (buf1 if use0 else buf0),
                             ny0, ny1, nx0, nx1,
                         )
 
-                    pd.set_label(f"[{filter_name}] {session} — tile {t_idx}/{total_tiles_group} y:{y0}-{y1} x:{x0}-{x1}")
+                    pd.set_label(
+                        f"[{filter_name}] {session} — tile {t_idx}/{total_tiles_group} "
+                        f"y:{y0}-{y1} x:{x0}-{x1}"
+                    )
 
-                    # ---- per-tile subtractor (HWC), BEFORE normalization ----
-                    # Prefer flat-dark; else for mono/bayer, fall back to master bias to avoid bias imprint in flats.
-                    subtractor = dark_data
-                    if subtractor is None and is_bayer_group and master_bias is not None:
-                        subtractor = master_bias
-
-                    if subtractor is not None:
-                        dsub = subtractor
-                        if isinstance(dsub, np.ndarray):
-                            if dsub.ndim == 3 and dsub.shape[0] in (1, 3):  # CHW → HWC
-                                dsub = dsub.transpose(1, 2, 0)
-                            # If bias/dark is 2D, keep 2D
-                            if dsub.ndim == 3 and dsub.shape[2] == 1:
-                                dsub = dsub[:, :, 0]
-                        d_tile = dsub[y0:y1, x0:x1].astype(np.float32, copy=False)
-                        if d_tile.ndim == 2 and channels == 3:
-                            d_tile = np.repeat(d_tile[..., None], 3, axis=2)
-                        _subtract_dark_stack_inplace_hwc(ts_np, d_tile, pedestal=0.0)
-                        # Clip negatives before normalisation and stacking
-                        np.clip(ts_np, 0.0, None, out=ts_np)
-                    # ---- fast per-frame normalization ----
-                    if is_bayer_group:
-                        _apply_bayer_scales_stack_inplace(ts_np, scales, bayerpat, y0, x0)
-                    else:
-                        ts_np *= scales.reshape(N, 1, 1, 1)
-
-                    # ---- reduction (GPU or CPU) ----
                     if use_gpu:
+                        # Dark-sub + clip + per-frame scale happen on-device
+                        # inside the reducer; nothing to do on the CPU side.
                         tile_result, _ = _torch_reduce_tile(
                             ts_np,
                             weights_np,
@@ -16053,12 +19136,36 @@ class StackingSuiteDialog(QDialog):
                             sigma_high=float(getattr(self, "sigma_high", 2.5)),
                             trim_fraction=float(params.get("trim_fraction", getattr(self, "trim_fraction", 0.05))),
                             esd_threshold=float(getattr(self, "esd_threshold", 3.0)),
+                            esd_bonferroni=bool(getattr(self, "esd_bonferroni", False)),
                             biweight_constant=float(getattr(self, "biweight_constant", 6.0)),
                             modz_threshold=float(getattr(self, "modz_threshold", 3.5)),
                             comet_hclip_k=float(self.settings.value("stacking/comet_hclip_k", 1.30, type=float)),
                             comet_hclip_p=float(self.settings.value("stacking/comet_hclip_p", 25.0, type=float)),
+                            # ─── On-device calibration prep ───
+                            dark_full_np=gpu_dark_np,
+                            pedestal=0.0,
+                            scales_np=gpu_scales_np,
+                            bayer_pattern=gpu_bayer_pat,
+                            tile_origin=(y0, x0),
+                            group_key=gpu_group_key,
                         )
                     else:
+                        # CPU path: do dark-sub + clip + per-frame scale on
+                        # the host before the CPU reducer sees the stack.
+                        if tile_subtractor is not None:
+                            d_tile = tile_subtractor[y0:y1, x0:x1]
+                            if sub_is_2d_to_rgb:
+                                d_tile = np.repeat(d_tile[..., None], 3, axis=2)
+                            if d_tile.dtype != np.float32:
+                                d_tile = d_tile.astype(np.float32, copy=False)
+                            _subtract_dark_stack_inplace_hwc(ts_np, d_tile, pedestal=0.0)
+                            np.clip(ts_np, 0.0, None, out=ts_np)
+
+                        if is_bayer_group:
+                            _apply_bayer_scales_stack_inplace(ts_np, scales, bayerpat, y0, x0)
+                        else:
+                            ts_np *= scales.reshape(N, 1, 1, 1)
+
                         if cpu_label == "median":
                             tile_result = _cpu_tile_median(ts_np)
                         elif cpu_label == "trimmed":
@@ -16071,6 +19178,7 @@ class StackingSuiteDialog(QDialog):
                                 ts_np,
                                 float(params.get("kappa", 3.0)),
                             )
+
                     # Ensure tile_result has correct shape (th, tw, channels)
                     if tile_result.ndim == 2:
                         tile_result = tile_result[:, :, None]
@@ -16089,8 +19197,21 @@ class StackingSuiteDialog(QDialog):
                     use0 = not use0
 
                 try:
-                    tp.shutdown(wait=True)
+                    tile_tp.shutdown(wait=True)
                 finally:
+                    try:
+                        read_pool.shutdown(wait=True)
+                    except Exception:
+                        pass
+                    # Release the per-group GPU calibration tensors (dark +
+                    # scales) so the next group's dark can slot in without
+                    # the previous one lingering in VRAM. Safe on CPU-only
+                    # runs — gpu_group_key is None there.
+                    try:
+                        if gpu_group_key is not None:
+                            _release_flat_group_ctx(gpu_group_key)
+                    except Exception:
+                        pass
                     for s in sources:
                         try:
                             s.close()
@@ -16098,27 +19219,11 @@ class StackingSuiteDialog(QDialog):
                             pass
 
                 if cancelled_group:
-                    self.update_status(self.tr("⛔ Master Flat creation cancelled; cleaning up temporary files."))
-                    try:
-                        del final_stacked
-                    except Exception:
-                        pass
-                    try:
-                        os.remove(memmap_path)
-                    except Exception:
-                        pass
+                    self.update_status(self.tr("⛔ Master Flat creation cancelled."))
                     break
 
-                # Convert memmap to regular array, free file
-                master_flat_data = np.asarray(final_stacked, dtype=np.float32)
-                del final_stacked
-                gc.collect()
-                try:
-                    os.remove(memmap_path)
-                except Exception:
-                    pass
-
-                # If mono, squeeze to 2D (prevents accidental “(H,W,1)” weirdness later)
+                # If mono, squeeze to 2D (prevents accidental "(H,W,1)" weirdness later)
+                master_flat_data = final_stacked
                 if channels == 1 and master_flat_data.ndim == 3 and master_flat_data.shape[2] == 1:
                     master_flat_data = master_flat_data[:, :, 0]
 
@@ -16152,6 +19257,43 @@ class StackingSuiteDialog(QDialog):
                         header["GAIN"] = (flat_gain_val, "Camera gain of source flats")
                     if flat_offset_val is not None:
                         header["OFFSET"] = (flat_offset_val, "Camera offset of source flats")
+                    # Carry the site's timezone hints forward: 'local night'
+                    # bucketing resolves tz from QSettings, then from these
+                    # keys. Without them a master re-read on another machine
+                    # (or after the setting is cleared) can land on the
+                    # neighbouring night.
+                    for _k, _c in (("TIMEZONE", "Site timezone of source flats"),
+                                   ("TZ",       "Site timezone of source flats"),
+                                   ("SITELAT",  "Site latitude of source flats"),
+                                   ("SITELONG", "Site longitude of source flats"),
+                                   ("OBSGEO-B", "Site latitude of source flats"),
+                                   ("OBSGEO-L", "Site longitude of source flats")):
+                        try:
+                            _v = hdr0_full.get(_k)
+                        except Exception:
+                            _v = None
+                        if _v not in (None, ""):
+                            header[_k] = (_v, _c)
+                except Exception:
+                    pass
+
+                # ─────────────────────────────────────────────────────────────
+                # Acquisition provenance of the RAW flats.
+                #
+                # Previously the master carried no acquisition time at all, so
+                # the only thing tying it to a night was the SESSION tag --
+                # meaningless outside SASpro, and empty whenever the group was
+                # never tagged. Stamping the raw flats' window means this
+                # master buckets into the same noon-to-noon night as the lights
+                # shot that night, exactly like masters imported from
+                # PixInsight now do.
+                # ─────────────────────────────────────────────────────────────
+                self._stamp_acquisition_provenance(
+                    header, file_list, exposure_time, label="raw flat"
+                )
+                try:
+                    header["NCOMBINE"] = (int(len(file_list)), "Number of raw flats combined")
+                    header["NSTACK"]   = (int(len(file_list)), "Alias of NCOMBINE (SetiAstro)")
                 except Exception:
                     pass
                 # Stamp the source sensor's row order so this master is a faithful
@@ -16163,20 +19305,49 @@ class StackingSuiteDialog(QDialog):
                 # maze, and dust/vignetting misaligns.
                 if flat_roworder:
                     header["ROWORDER"] = flat_roworder
-                save_image(
+
+                # ─────────────────────────────────────────────────────────────
+                # Async save: hand the finished master to save_pool and move
+                # straight into the next group's tile loop. Cap in-flight saves
+                # at 2 so RAM stays bounded even on slow disks (each pending
+                # save holds one master_flat_data buffer alive).
+                # ─────────────────────────────────────────────────────────────
+                save_futs.append(save_pool.submit(
+                    save_image,
                     master_flat_data,
                     master_flat_path,
                     "fit",
                     "32-bit floating point",
                     header,
                     is_mono=(channels == 1),
-                )
+                ))
+                while len(save_futs) > 2:
+                    try:
+                        save_futs.pop(0).result()
+                    except Exception as _se:
+                        self.update_status(self.tr(f"⚠️ Master-flat save failed: {_se}"))
 
                 self.master_sizes[master_flat_path] = image_size
                 self.add_master_flat_to_tree(filter_name, master_flat_path)
-                self.update_status(self.tr(f"✅ Master Flat saved: {master_flat_path}"))
+                self.update_status(self.tr(
+                    f"✅ Master Flat queued: {os.path.basename(master_flat_path)}"
+                ))
                 QApplication.processEvents()
                 self.save_master_paths_to_settings()
+
+            # Drain remaining in-flight saves before wrap-up
+            for _fs in save_futs:
+                try:
+                    _fs.result()
+                except Exception as _se:
+                    self.update_status(self.tr(f"⚠️ Master-flat save failed: {_se}"))
+            save_futs.clear()
+            # Emit a clean "all done" marker so the Stacking Execution Monitor
+            # closes the Master Flats row for sure — the per-group "queued"
+            # message is the primary terminator, but if the monitor's rule
+            # for that is older than the async-save refactor, this final line
+            # guarantees the row stops ticking before the next phase begins.
+            self.update_status(self.tr("✅ All master flats saved."))
 
             # Final wrap-up
             self.assign_best_master_dark()
@@ -16184,6 +19355,31 @@ class StackingSuiteDialog(QDialog):
             self._refresh_quick_stack_summary_later()
 
         finally:
+            # Shut down pipeline pools first so no background work outlives the
+            # method. prep_pool: the next-group preamble may still be running
+            # if we broke out of the loop early — let it finish (its sources
+            # would otherwise leak file descriptors). save_pool: ensure every
+            # queued FITS write lands before we release resources.
+            try:
+                prep_pool.shutdown(wait=True)
+            except Exception:
+                pass
+            try:
+                save_pool.shutdown(wait=True)
+            except Exception:
+                pass
+            # Any sources opened by a prep that never ran as a group (early
+            # cancel) are owned by `next_prep_fut`'s result; drain and close.
+            try:
+                if next_prep_fut is not None:
+                    _leftover = next_prep_fut.result()
+                    for _s in (_leftover or {}).get("sources", []):
+                        try:
+                            _s.close()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             try:
                 _free_torch_memory()
             except Exception as e:
@@ -16203,19 +19399,18 @@ class StackingSuiteDialog(QDialog):
         session = "Default"
         gain_suffix = ""
         try:
-            hdr = fits.getheader(master_flat_path, memmap=True)
-            s = str(hdr.get("SESSION", "") or "").strip()
-            if s:
-                session = s
+            hdr, _ = get_valid_header(master_flat_path)
+            session = self._master_flat_session(master_flat_path, hdr)
             g = _get_key_float(hdr, "GAIN")
             if g is not None:
                 gain_suffix = f" [G{int(g)}]"
         except Exception:
             pass
 
-        key = f"{filter_name} ({size}) [{session}]{gain_suffix}"
-        if key not in self.master_files:
-            self.master_files[key] = master_flat_path
+        key = self._unique_master_flat_key(
+            f"{filter_name} ({size}) [{session}]{gain_suffix}", master_flat_path
+        )
+        self.master_files[key] = master_flat_path
 
         existing_items = self.master_flat_tree.findItems(filter_name, Qt.MatchFlag.MatchExactly, 0)
         if existing_items:
@@ -16244,14 +19439,43 @@ class StackingSuiteDialog(QDialog):
             return None
 
 
+    # Sensor/actual temperature keywords, most specific first, generic last.
+    _CCD_TEMP_KEYS = (
+        "CCD-TEMP", "CCDTEMP", "CCD_TEMP",
+        # DWARF 2/3 report the sensor temperature as DET-TEMP.
+        "DET-TEMP", "DETTEMP", "DET_TEMP",
+        "SENSOR-TEMP", "SENSORTEMP", "SENSOR_TEMP",
+        "CMOS-TEMP", "CMOSTEMP",
+        "CAMTEMP", "CAM-TEMP", "CAM_TEMP",
+        "CCD-TEMPERATURE", "SENSOR-TEMPERATURE",
+        "TEMPERAT", "TEMPERATURE", "TEMP",
+    )
+    # Commanded/setpoint temperature keywords.
+    _SET_TEMP_KEYS = (
+        "SET-TEMP", "SETTEMP", "SET_TEMP",
+        "TARGTEMP", "TARGET-TEMP", "TARGET_TEMP",
+        "SETPOINT", "SET-POINT", "TEC-TEMP", "TECTEMP",
+    )
+
     def _read_ccd_set_temp_from_fits(self, path: str) -> tuple[float|None, float|None]:
-        """Read CCD-TEMP and SET-TEMP from FITS header (primary HDU)."""
+        """Read the sensor (actual) and setpoint temperatures from the FITS
+        header. Tries the standard CCD-TEMP/SET-TEMP first, then vendor variants
+        (SVBony/DWARF/ASI/QHY/etc.) so headers that store the temperature under a
+        non-standard keyword still match. Used for BOTH lights and master darks,
+        so widening it here fixes temperature matching on both sides."""
         try:
-            with fits.open(path) as hdul:
-                hdr = hdul[0].header
-                ccd = self._parse_float(hdr.get("CCD-TEMP", None))
-                st  = self._parse_float(hdr.get("SET-TEMP", None))
-                return ccd, st
+            # get_valid_header() is XISF-aware; fits.open() is not.
+            hdr, _ = get_valid_header(path)
+            if hdr is not None:
+
+                def _first(keys):
+                    for k in keys:
+                        v = self._parse_float(hdr.get(k, None))
+                        if v is not None:
+                            return v
+                    return None
+
+                return _first(self._CCD_TEMP_KEYS), _first(self._SET_TEMP_KEYS)
         except Exception:
             return None, None
 
@@ -16331,6 +19555,10 @@ class StackingSuiteDialog(QDialog):
         meta["ccd"] = ccd
         meta["set"] = st
         meta["temp"] = self._temp_for_matching(ccd, st) if (ccd is not None or st is not None) else meta["temp"]
+        if meta["temp"] is None:
+            # No header temp and no MasterDark_ filename match — try a generic
+            # filename temp token (e.g. 'dark_exp..._21C_stack.fits').
+            meta["temp"] = self._temp_from_filename(p)
 
         # size from header if missing
         if not meta["size"]:
@@ -16346,6 +19574,28 @@ class StackingSuiteDialog(QDialog):
         return meta
 
 
+    def _temp_from_filename(self, name) -> float | None:
+        """Parse a sensor temperature from a filename token when the header has
+        none. Handles the plain convention ('..._27C', '..._-15C', '..._21.5C')
+        and SASpro's safe m/p convention ('m10p0C' -> -10.0, 'p5p3C' -> 5.3).
+        Returns None if no temperature token is present."""
+        import os, re
+        base = os.path.splitext(os.path.basename(str(name or "")))[0]
+        # SASpro m/p convention first, so 'm10p0C' isn't misread as a plain '0C'.
+        m = re.search(r"(?:^|[_\-. ])([mp])(\d+)(?:p(\d+))?C(?=[_\-. ]|$)", base)
+        if m:
+            sign = -1.0 if m.group(1) == "m" else 1.0
+            val = float(m.group(2)) + (float("0." + m.group(3)) if m.group(3) else 0.0)
+            return sign * val
+        # plain '<num>C' token (allow a leading sign and one decimal).
+        m = re.search(r"(?:^|[_\-. ])([+-]?\d+(?:\.\d+)?)\s*[cC](?=[_\-. ]|$)", base)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                return None
+        return None
+
     def _get_light_temp(self, light_path: str) -> tuple[float|None, float|None, float|None]:
         """Return (ccd, set, chosen) with caching."""
         if not hasattr(self, "_light_temp_cache"):
@@ -16360,6 +19610,10 @@ class StackingSuiteDialog(QDialog):
 
         ccd, st = self._read_ccd_set_temp_from_fits(p)
         chosen = self._temp_for_matching(ccd, st)
+        if chosen is None:
+            # Header carried no usable temp keyword (or the path is stale) —
+            # fall back to the temp token in the filename, e.g. '..._27C.fits'.
+            chosen = self._temp_from_filename(p)
         cache[p] = (ccd, st, chosen)
         return cache[p]
 
@@ -16432,9 +19686,11 @@ class StackingSuiteDialog(QDialog):
                         dark_choice = curr_dark  # leaf has its own per-file override, leave it
                     elif dark_override:
                         dark_choice = os.path.basename(dark_override)
-                    elif fill_only and curr_dark and curr_dark.lower() != "none":
-                        dark_choice = curr_dark
                     else:
+                        # Always recompute auto-assignments (never keep a stale
+                        # auto-fill) so the load order (darks / lights / flats, in
+                        # any sequence) can't leave a wrong match in place. Manual
+                        # per-leaf and group overrides above still win.
                         l_ccd, l_set, l_temp = self._get_light_temp(light_path)
 
                         if not hasattr(self, "_master_dark_go"):
@@ -16540,9 +19796,8 @@ class StackingSuiteDialog(QDialog):
                         flat_choice = curr_flat  # leaf has its own per-file override, leave it
                     elif flat_override:
                         flat_choice = os.path.basename(flat_override)
-                    elif fill_only and curr_flat and curr_flat.lower() != "none":
-                        flat_choice = curr_flat
                     else:
+                        # Always recompute auto-assignments (see dark branch note).
                         best_flat_path = None
 
                         # NOTE: master_files keys are like:
@@ -16557,21 +19812,8 @@ class StackingSuiteDialog(QDialog):
                         ]
 
                         if exact_candidates:
-                            if not hasattr(self, "_master_flat_go"):
-                                self._master_flat_go = {}
-
                             for candidate in exact_candidates:
-                                if candidate not in self._master_flat_go:
-                                    try:
-                                        hdr = fits.getheader(candidate, memmap=True)
-                                        g = _get_key_float(hdr, "GAIN")
-                                        o = _get_key_float(hdr, "OFFSET")
-                                        if o is None:
-                                            o = _get_key_float(hdr, "BLKLEVEL")
-                                        self._master_flat_go[candidate] = (g, o)
-                                    except Exception:
-                                        self._master_flat_go[candidate] = (None, None)
-                                fg, fo = self._master_flat_go[candidate]
+                                fg, fo = self._master_flat_gain_offset(candidate)
                                 gain_ok = (l_gain is None or fg is None or abs(l_gain - fg) <= 1)
                                 offset_ok = (l_offset is None or fo is None or abs(l_offset - fo) <= 1)
                                 if gain_ok and offset_ok:
@@ -16739,7 +19981,7 @@ class StackingSuiteDialog(QDialog):
                 item.setData(2, Qt.ItemDataRole.UserRole, file_path)
 
         # Do NOT write to manual_dark_overrides — per-leaf UserRole is the source of truth
-        print("✅ DEBUG: Light Dark override applied.")
+        print("✅ Light Dark override applied.")
 
     def _auto_pick_master_dark(self, image_size: str, exposure_time: float,
                                 light_gain: float | None = None,
@@ -16800,11 +20042,57 @@ class StackingSuiteDialog(QDialog):
 
         return best_path
 
-    def _auto_pick_master_flat(self, filter_name: str, image_size: str, session_name: str):
-        # Prefer session-specific, then session-agnostic
-        key_pref = f"{filter_name} ({image_size}) [{session_name}]"
-        if key_pref in self.master_files:
-            return self.master_files[key_pref]
+    def _auto_pick_master_flat(self, filter_name: str, image_size: str, session_name: str,
+                               light_path: str | None = None,
+                               light_gain: float | None = None,
+                               light_offset: float | None = None):
+        """
+        Resolve a master flat for a light group.
+
+        Keys look like 'Ha (8288x5644) [2025-09-18] [G100]', so the session
+        bracket is not necessarily the last one — match by prefix rather than
+        exact key. When no master shares the night, fall back to the same
+        nearest-night search the tree preview uses, so imported PixInsight
+        masters are considered instead of silently dropping to a
+        session-agnostic key.
+        """
+        prefixes = [f"{filter_name} ({image_size}) [{session_name}]"]
+        try:
+            ftoken = self._sanitize_name(filter_name)
+        except Exception:
+            ftoken = filter_name
+        if ftoken != filter_name:
+            prefixes.append(f"{ftoken} ({image_size}) [{session_name}]")
+
+        exact = []
+        for mk, mp in self.master_files.items():
+            mk = str(mk)
+            if any(mk.startswith(p) for p in prefixes) and mp not in exact:
+                exact.append(mp)
+
+        for path in exact:
+            fg, fo = self._master_flat_gain_offset(path)
+            gain_ok = (light_gain is None or fg is None or abs(light_gain - fg) <= 1)
+            offset_ok = (light_offset is None or fo is None or abs(light_offset - fo) <= 1)
+            if gain_ok and offset_ok:
+                return path
+        if exact:
+            return exact[0]
+
+        try:
+            best = self._closest_flat_for(
+                filter_name=filter_name,
+                image_size=image_size,
+                light_path=light_path,
+                light_gain=light_gain,
+                light_offset=light_offset,
+                light_session=session_name,
+            )
+        except Exception:
+            best = None
+        if best:
+            return best
+
         fallback_key = f"{filter_name} ({image_size})"
         return self.master_files.get(fallback_key)
 
@@ -17073,7 +20361,33 @@ class StackingSuiteDialog(QDialog):
         # No dedup — every leaf is a distinct file, even if basenames collide
         return paths
 
-    def _apply_satellite_removal_to_calibrated_light(self, light_data, *, is_mono: bool):
+    def _satellite_removal_opts(self) -> dict:
+        """Snapshot every QSettings value the satellite pass needs.
+
+        QSettings is REENTRANT, not thread-safe: separate instances in separate
+        threads are fine, one shared instance read from several threads is not.
+        The concurrent satellite pass calls this once on the GUI thread and
+        hands the dict to its workers, the same way the Blink detect pass
+        snapshots its edge-exclusion value before fanning out.
+        """
+        s = self.settings
+        return {
+            "clip_trail":         bool(s.value("stacking/calibration_satellite_clip", True, type=bool)),
+            "sensitivity":        float(s.value("stacking/calibration_satellite_sensitivity", 0.10, type=float)),
+            "use_gpu":            bool(s.value("stacking/calibration_satellite_gpu", True, type=bool)),
+            "compatibility_mode": bool(s.value("stacking/calibration_satellite_compatibility", False, type=bool)),
+            "chunk_size":         int(s.value("stacking/calibration_satellite_chunk_size", 256, type=int)),
+            "overlap":            int(s.value("stacking/calibration_satellite_overlap", 64, type=int)),
+            "border_size":        int(s.value("stacking/calibration_satellite_border", 16, type=int)),
+            "temp_stretch":       bool(s.value("stacking/calibration_satellite_temp_stretch", True, type=bool)),
+            "target_median":      float(s.value("stacking/calibration_satellite_target_median", 0.25, type=float)),
+            "workers":            max(1, int(s.value("stacking/calibration_satellite_workers", 2, type=int))),
+        }
+
+    def _apply_satellite_removal_to_calibrated_light(
+        self, light_data, *, is_mono: bool, models=None, opts: dict | None = None,
+        veto_mask=None, detect_tiles=None,
+    ):
         """
         Run SASpro satellite trail removal on an already-calibrated light frame.
 
@@ -17092,6 +20406,8 @@ class StackingSuiteDialog(QDialog):
         - The satellite engine now handles normalization/denormalization internally.
         - The returned sat_mask_2d is authoritative and should be saved/propagated
         instead of inferring rejection from pixel values.
+        - Pass a preloaded `models` bundle to avoid re-resolving the backend
+          on every frame.
         """
         import numpy as np
         from setiastro.saspro.resources import get_resources
@@ -17115,17 +20431,24 @@ class StackingSuiteDialog(QDialog):
             nan=0.0, posinf=0.0, neginf=0.0
         )
 
-        clip_trail = self.settings.value("stacking/calibration_satellite_clip", True, type=bool)
-        sensitivity = self.settings.value("stacking/calibration_satellite_sensitivity", 0.10, type=float)
-        use_gpu = self.settings.value("stacking/calibration_satellite_gpu", True, type=bool)
-        compatibility_mode = self.settings.value("stacking/calibration_satellite_compatibility", False, type=bool)
+        # Never touch self.settings from here: this method runs inside the
+        # satellite pass's worker threads. Callers on a background thread MUST
+        # pass a snapshot from _satellite_removal_opts(); opts=None is only
+        # valid on the GUI thread (the serial per-frame call site).
+        if opts is None:
+            opts = self._satellite_removal_opts()
 
-        chunk_size = self.settings.value("stacking/calibration_satellite_chunk_size", 256, type=int)
-        overlap = self.settings.value("stacking/calibration_satellite_overlap", 64, type=int)
-        border_size = self.settings.value("stacking/calibration_satellite_border", 16, type=int)
+        clip_trail = bool(opts["clip_trail"])
+        sensitivity = float(opts["sensitivity"])
+        use_gpu = bool(opts["use_gpu"])
+        compatibility_mode = bool(opts["compatibility_mode"])
 
-        temp_stretch = self.settings.value("stacking/calibration_satellite_temp_stretch", True, type=bool)
-        target_median = self.settings.value("stacking/calibration_satellite_target_median", 0.25, type=float)
+        chunk_size = int(opts["chunk_size"])
+        overlap = int(opts["overlap"])
+        border_size = int(opts["border_size"])
+
+        temp_stretch = bool(opts["temp_stretch"])
+        target_median = float(opts["target_median"])
 
         def _status(msg):
             try:
@@ -17133,8 +20456,11 @@ class StackingSuiteDialog(QDialog):
             except Exception:
                 pass
 
-        resources = get_resources()
-        models = get_satellite_models(resources=resources, use_gpu=bool(use_gpu), status_cb=_status)
+        if models is None:
+            resources = get_resources()
+            models = get_satellite_models(
+                resources=resources, use_gpu=bool(use_gpu), status_cb=_status
+            )
 
         out_img, detected, sat_mask_2d = satellite_remove_image(
             image=arr_in,
@@ -17150,6 +20476,8 @@ class StackingSuiteDialog(QDialog):
             compatibility_mode=bool(compatibility_mode),
             progress_cb=None,
             return_mask=True,
+            veto_mask=veto_mask,
+            detect_tiles=detect_tiles,
         )
 
         out = np.asarray(out_img, dtype=np.float32, copy=False)
@@ -17184,6 +20512,19 @@ class StackingSuiteDialog(QDialog):
                 f"Satellite mask shape mismatch: got {sat_mask_2d.shape}, expected {expected_hw}"
             )
 
+        # --- Satellite trail no-data marking -------------------------------
+        # Turn the removed trail into NaN (no-data), not a magic 0.0. NaN is
+        # nan-safe through normalization, blooms through the Lanczos
+        # registration warp (covering its ringing halo too), and is dropped by
+        # every rejection kernel via isfinite(). Uses the authoritative
+        # sat_mask_2d rather than an (out == 0.0) scan so genuine clamped-zero
+        # background is left untouched. Gated on clip_trail.
+        # Blanket no-data: every exactly-zero pixel becomes NaN, not just the
+        # satellite mask. The removal engine clips trails to 0.0, and any other
+        # genuine 0 in a calibrated light is dead data anyway, so this is safe
+        # and drops all dependence on the mask surviving downstream.
+        if clip_trail:
+            out[out == 0.0] = np.nan
         return out, sat_mask_2d
 
     def _apply_flat_strength(
@@ -17265,7 +20606,7 @@ class StackingSuiteDialog(QDialog):
 
     def _calibrate_lights_cpu(self, frame_infos, calibrated_dir, total_files,
                                master_bias_np, interactive_flat, do_satellite,
-                               hot_sigma, cold_sigma):
+                               hot_sigma, cold_sigma, protect_sigma=5.0):
         """
         CPU fallback calibration path — used when hardware acceleration is disabled.
         Sequential single-threaded processing, no GPU involvement.
@@ -17276,6 +20617,7 @@ class StackingSuiteDialog(QDialog):
         star_max_ratio  = self.settings.value("stacking/cosmetic/star_max_ratio",  0.55, type=float)
         sat_quantile    = self.settings.value("stacking/cosmetic/sat_quantile",  0.9995, type=float)
         processed_files = 0
+        _master_cache = MasterCache(load_image, _maybe_normalize_16bit_float)
 
         def _mask2d_from_image_zero_pixels(arr):
             a = np.asarray(arr)
@@ -17466,10 +20808,7 @@ class StackingSuiteDialog(QDialog):
                 dark_data = None
                 master_dark_path = fi["master_dark_path"]
                 if master_dark_path:
-                    dark_data, _, _, dark_is_mono = load_image(master_dark_path)
-                    dark_data = _maybe_normalize_16bit_float(
-                        dark_data, name=os.path.basename(master_dark_path)
-                    )
+                    dark_data, dark_is_mono = _master_cache.get(master_dark_path)
                     if dark_data is not None:
                         if not dark_is_mono and dark_data.ndim == 3 \
                                 and dark_data.shape[-1] == 3:
@@ -17517,10 +20856,7 @@ class StackingSuiteDialog(QDialog):
                         else:
                             flat_data = np.asarray(adj, dtype=np.float32).copy()
                     else:
-                        flat_data, _, _, flat_is_mono = load_image(master_flat_path)
-                        flat_data = _maybe_normalize_16bit_float(
-                            flat_data, name=os.path.basename(master_flat_path)
-                        )
+                        flat_data, _flat_is_mono = _master_cache.get(master_flat_path)
 
                     if flat_data is not None:
                         if not interactive_flat:
@@ -17584,11 +20920,13 @@ class StackingSuiteDialog(QDialog):
 
                     if use_bayer_cosmetic:
                         light_data = bulk_cosmetic_correction_bayer(
-                            light_data, hot_sigma=hot_sigma, cold_sigma=cold_sigma
+                            light_data, hot_sigma=hot_sigma, cold_sigma=cold_sigma,
+                            protect_sigma=protect_sigma,
                         )
                     else:
                         light_data = bulk_cosmetic_correction_numba(
-                            light_data, hot_sigma=hot_sigma, cold_sigma=cold_sigma
+                            light_data, hot_sigma=hot_sigma, cold_sigma=cold_sigma,
+                            protect_sigma=protect_sigma,
                         )
                     self.update_status(self.tr("Cosmetic Correction Applied"))
                     QApplication.processEvents()
@@ -17608,6 +20946,8 @@ class StackingSuiteDialog(QDialog):
                         # during registration warp, so it stays perfectly co-registered; a
                         # separate boolean mask can drift sub-pixel and leave a bright band.
                         light_data = np.asarray(cleaned_light_data, dtype=np.float32, copy=False)
+                        if _nan_probe_enabled():
+                            _nan_probe(f"calib: post sat-removal (mem) {os.path.basename(fi['light_file'])}", cleaned_light_data, self.update_status, force=True)
                         self.update_status(
                             self.tr(f"Satellite Trail Removal Applied "
                                     f"({int(np.count_nonzero(sat_mask_2d))} px)")
@@ -17624,7 +20964,7 @@ class StackingSuiteDialog(QDialog):
 
                 light_data = np.nan_to_num(
                     light_data.astype(np.float32, copy=False),
-                    nan=0.0, posinf=0.0, neginf=0.0
+                    nan=np.nan, posinf=0.0, neginf=0.0   # keep satellite-trail NaN no-data; scrub only +/-inf
                 )
 
                 min_val = float(np.min(light_data))
@@ -17662,14 +21002,12 @@ class StackingSuiteDialog(QDialog):
                     pass
 
                 calibrated_filename = _cal_out_name(fi["light_file"], calibrated_dir)
-                save_image(
-                    img_array=light_data,
-                    filename=calibrated_filename,
-                    original_format="fit",
-                    bit_depth="32-bit floating point",
-                    original_header=hdr,
-                    is_mono=is_mono,
-                )
+                write_calibrated_fast(calibrated_filename, light_data, hdr, is_mono)
+                if _nan_probe_enabled():
+                    try:
+                        _nan_probe(f"calib: reopened {os.path.basename(calibrated_filename)}", _probe_load_first(calibrated_filename), self.update_status, force=True)
+                    except Exception as _e:
+                        self.update_status(f"🔎 NaN-probe (reopen _c) failed: {_e}")
 
                 del light_data
                 del hdr
@@ -17748,6 +21086,186 @@ class StackingSuiteDialog(QDialog):
         except Exception as e:
             self.update_status(self.tr(f"⚠️ Auto register/integrate failed: {e}"))
 
+    def _frame_geometry(self, path):
+        """
+        Header-only geometry for a FITS/XISF frame.
+
+        Returns (H, W, naxis3_or_None, bayerpat_str) or None on failure.
+        Uses get_valid_header(), which is header-only (no pixel decode) and
+        already normalises NAXIS1/2/3 for both FITS and XISF.
+        """
+        try:
+            hdr, ok = get_valid_header(path)
+            if not ok or hdr is None:
+                return None
+            w = int(hdr.get("NAXIS1", 0) or 0)
+            h = int(hdr.get("NAXIS2", 0) or 0)
+            if w <= 0 or h <= 0:
+                return None
+            try:
+                n3 = hdr.get("NAXIS3", None)
+                n3 = int(n3) if n3 is not None else None
+            except Exception:
+                n3 = None
+            bayer = str(hdr.get("BAYERPAT", "") or "").strip()
+            return h, w, n3, bayer
+        except Exception:
+            return None
+
+    def _estimate_frames_bytes(self, paths, *, mode):
+        """
+        Sum estimated float32-FITS output bytes over `paths`.
+
+        mode = "as_is"   → channels = 3 only if the frame is already 3-plane,
+                           else 1. Used for calibration, which keeps CFA/mono
+                           data 2-D, and for already-debayered registered frames.
+        mode = "debayer" → channels = 3 if the frame is CFA (has BAYERPAT) or is
+                           already 3-plane, else 1. Used for registration output,
+                           which debayers CFA lights to RGB.
+
+        Frames whose geometry can't be read fall back to ~2× their source file
+        size (16-bit int → 32-bit float ≈ 2×) so the estimate is never silently
+        too small.
+
+        Returns (total_bytes, n_counted, n_fallback).
+        """
+        total = 0
+        n_counted = 0
+        n_fallback = 0
+        for p in paths:
+            geo = self._frame_geometry(p)
+            if geo is None:
+                try:
+                    total += int(os.path.getsize(p) * 2)
+                    n_fallback += 1
+                except Exception:
+                    pass
+                continue
+            h, w, n3, bayer = geo
+            already_color = (n3 == 3)
+            if mode == "debayer":
+                channels = 3 if (already_color or bayer) else 1
+            else:  # "as_is"
+                channels = 3 if already_color else 1
+            total += _frame_out_bytes(h, w, channels)
+            n_counted += 1
+        return total, n_counted, n_fallback
+
+    def _confirm_disk_budget(self, target_dir, plan, *, title):
+        """
+        Compare an estimated write budget against free space on target_dir's
+        volume and, if things look tight, ask the user whether to proceed.
+
+        `plan` is a list of (label, bytes) tuples describing each output
+        category. All categories are assumed to land on the same volume as
+        target_dir (true for the stacking-suite subfolders, which all live
+        under the stacking directory).
+
+        Returns True to proceed, False to abort. Never raises — an estimator
+        failure must not block the pipeline, so on any internal error it logs
+        and returns True.
+        """
+        try:
+            plan = [(lbl, int(max(0, b))) for lbl, b in plan]
+            total = int(sum(b for _, b in plan))
+        except Exception:
+            return True
+
+        free = _disk_free_bytes(target_dir)
+
+        # Surface the budget on the execution monitor's persistent readout so the
+        # user can watch free-vs-estimated live during the run, not just in the
+        # one-shot warning dialog below.
+        try:
+            mon = getattr(self, "_exec_monitor", None)
+            if mon is not None:
+                step = str(title or "").split("—")[0].strip() or self.tr("This step")
+                mon.set_disk_budget(target_dir, total, step_label=step)
+        except Exception:
+            pass
+
+        # Log the estimate + breakdown regardless of outcome.
+        self.update_status(self.tr(
+            f"💽 Estimated disk for this step: ~{_human_bytes(total)}"
+        ))
+        for lbl, b in plan:
+            if b:
+                self.update_status(self.tr(f"     – {lbl}: ~{_human_bytes(b)}"))
+
+        if free is None:
+            self.update_status(self.tr(
+                "⚠️ Could not read free disk space — skipping the space check."
+            ))
+            return True
+
+        self.update_status(self.tr(
+            f"💽 Free on target drive: {_human_bytes(free)}"
+        ))
+
+        # Headroom reserve so we never plan to fill the volume to zero (the OS,
+        # temp files, logs and FITS block padding all need a little slack):
+        # 2 GB or 5% of the free space, whichever is larger.
+        reserve = max(2 * 1024 ** 3, int(free * 0.05))
+
+        over = (total + reserve) > free
+        tight = (not over) and ((total + reserve) > free * 0.85)
+
+        if not over and not tight:
+            return True  # plenty of room — no dialog
+
+        drive_txt = (
+            os.path.splitdrive(os.path.abspath(target_dir))[0]
+            or os.path.abspath(target_dir)
+        )
+        breakdown = "\n".join(f"  • {lbl}: ~{_human_bytes(b)}"
+                              for lbl, b in plan if b)
+
+        if over:
+            icon = QMessageBox.Icon.Critical
+            headline = self.tr("⚠️ Not enough free disk space for this step")
+            detail = self.tr(
+                f"This step is estimated to write about {_human_bytes(total)}, "
+                f"but only {_human_bytes(free)} is free on {drive_txt}.\n\n"
+                f"Running out of space partway through will abort the job and can "
+                f"leave partial or corrupt files behind."
+            )
+        else:
+            icon = QMessageBox.Icon.Warning
+            headline = self.tr("⚠️ Disk space is going to be tight")
+            detail = self.tr(
+                f"This step is estimated to write about {_human_bytes(total)}, "
+                f"and only {_human_bytes(free)} is free on {drive_txt}.\n\n"
+                f"That leaves very little headroom. Consider freeing space or "
+                f"pointing the stacking directory at a larger drive."
+            )
+
+        try:
+            box = QMessageBox(self)
+            box.setIcon(icon)
+            box.setWindowTitle(title)
+            box.setText(headline)
+            box.setInformativeText(
+                detail + "\n\nEstimated breakdown:\n" + breakdown +
+                self.tr("\n\n(These are estimates based on frame geometry and "
+                        "32-bit float output; actual sizes vary a little.)")
+            )
+            proceed_btn = box.addButton(self.tr("Proceed anyway"),
+                                        QMessageBox.ButtonRole.AcceptRole)
+            cancel_btn = box.addButton(self.tr("Cancel"),
+                                       QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(cancel_btn if over else proceed_btn)
+            box.exec()
+            if box.clickedButton() is proceed_btn:
+                self.update_status(self.tr(
+                    "▶️ Proceeding despite low disk space (user confirmed)."
+                ))
+                return True
+            self.update_status(self.tr("🛑 Cancelled due to disk-space warning."))
+            return False
+        except Exception:
+            # If the dialog itself fails for any reason, don't hard-block.
+            return True
+
     def calibrate_lights(self):
         """
         Pipelined calibration:
@@ -17798,6 +21316,88 @@ class StackingSuiteDialog(QDialog):
             if not self.light_files[key]:
                 del self.light_files[key]
 
+        # ── Already-calibrated pre-check ────────────────────────────────
+        # If some tree frames already have fresh calibrated twins in the
+        # Calibrated folder, offer to skip (all matched) or shortcut
+        # (calibrate only the new ones). Mirrors the pre-registration twin
+        # check in register_images(). Any wrapped exception falls through
+        # to a normal full calibration so a bug here can't block the user.
+        try:
+            _cal_decision = self._precheck_calibrated_counterparts(calibrated_dir)
+        except Exception as _e:
+            self.update_status(self.tr(f"ℹ️ Pre-calibration check skipped: {_e}"))
+            _cal_decision = None
+
+        if _cal_decision == "skip":
+            # Everything is already calibrated → nothing to do. Refresh the
+            # Image Registration tab so the existing calibrated frames show
+            # up as the ready-to-register set, then honor the
+            # auto-register-after-cal setting the same way the normal
+            # end-of-calibration path does.
+            self.update_status(self.tr(
+                f"✅ All {total_files} selected light(s) already calibrated; "
+                f"nothing to do."))
+            self.populate_calibrated_lights()
+            self._refresh_quick_stack_summary_later()
+            try:
+                if self.settings.value(
+                    "stacking/auto_register_after_cal", False, type=bool
+                ):
+                    if hasattr(self, "tabs") and self.tabs is not None:
+                        try:
+                            for idx in range(self.tabs.count()):
+                                if self.tabs.tabText(idx).lower().startswith(
+                                    "image registration"
+                                ):
+                                    self.tabs.setCurrentIndex(idx)
+                                    break
+                        except Exception:
+                            pass
+                    self.update_status(self.tr(
+                        "⚙️ Auto: starting registration & integration…"))
+                    QApplication.processEvents()
+                    if hasattr(self, "register_images_btn") \
+                            and self.register_images_btn is not None:
+                        if not getattr(self, "_registration_busy", False):
+                            self.register_images_btn.click()
+                        else:
+                            self.update_status(self.tr(
+                                "ℹ️ Registration already in progress; "
+                                "auto-run skipped."))
+                    elif hasattr(self, "register_images"):
+                        if not getattr(self, "_registration_busy", False):
+                            self.register_images()
+                        else:
+                            self.update_status(self.tr(
+                                "ℹ️ Registration already in progress; "
+                                "auto-run skipped."))
+            except Exception as _are:
+                self.update_status(self.tr(
+                    f"⚠️ Auto register/integrate failed: {_are}"))
+            return
+        if _cal_decision == "cancel":
+            self.update_status(self.tr("❌ Calibration cancelled."))
+            return
+        if _cal_decision == "calibrate_new":
+            # self.light_files has been pruned to the uncalibrated frames.
+            # Rebuild leaf_paths to match so the tree-walk below skips the
+            # already-calibrated leaves (filter at line further down:
+            # "if not light_file or light_file not in leaf_paths: continue").
+            leaf_paths = [p for lst in self.light_files.values() for p in lst]
+            total_files = len(leaf_paths)
+            if total_files == 0:
+                # Shouldn't happen (precheck returns "skip" when matched==total),
+                # but belt-and-braces: refresh and bail cleanly.
+                self.update_status(self.tr(
+                    "✅ No new frames to calibrate."))
+                self.populate_calibrated_lights()
+                self._refresh_quick_stack_summary_later()
+                return
+            self.update_status(self.tr(
+                f"▶ Calibrating {total_files} new frame(s); reusing existing "
+                f"calibrated frames for the rest."))
+        # "calibrate_all" / None → fall through to normal full calibration.
+
         interactive_flat = self.settings.value(
             "stacking/interactive_flat_strength", False, type=bool
         )
@@ -17807,6 +21407,7 @@ class StackingSuiteDialog(QDialog):
 
         hot_sigma       = self.settings.value("stacking/cosmetic/hot_sigma",       3.0,    type=float)
         cold_sigma      = self.settings.value("stacking/cosmetic/cold_sigma",       3.0,    type=float)
+        protect_sigma   = self.settings.value("stacking/cosmetic/protect_sigma",    5.0,    type=float)
         star_mean_ratio = self.settings.value("stacking/cosmetic/star_mean_ratio",  0.22,   type=float)
         star_max_ratio  = self.settings.value("stacking/cosmetic/star_max_ratio",   0.55,   type=float)
         sat_quantile    = self.settings.value("stacking/cosmetic/sat_quantile",     0.9995, type=float)
@@ -17965,7 +21566,10 @@ class StackingSuiteDialog(QDialog):
                                     master_flat_path = path; break
                     if master_flat_path is None:
                         master_flat_path = self._auto_pick_master_flat(
-                            filter_name, image_size, session_name
+                            filter_name, image_size, session_name,
+                            light_path=light_file,
+                            light_gain=light_gain,
+                            light_offset=light_offset,
                         )
 
                     group_key = (
@@ -17997,7 +21601,7 @@ class StackingSuiteDialog(QDialog):
         # Attach the resolved filter override to each frame_info so both the GPU
         # and CPU calibration paths can inject it into the saved header. The
         # tree/group filter value is already correct for files ingested via
-        # process_fits_header (which now consults _path_filter_override), but the
+        #sasprocess_fits_header (which now consults _path_filter_override), but the
         # source FITS/XISF header itself may still be blank — so we carry the
         # resolved name forward here.
         try:
@@ -18016,6 +21620,25 @@ class StackingSuiteDialog(QDialog):
         if not frame_infos:
             self.update_status(self.tr("⚠️ No light files to calibrate."))
             return
+
+        # ── disk-space pre-flight ─────────────────────────────────────────
+        # Each light produces one 32-bit calibrated frame in its native layout
+        # (CFA/mono stay single-plane; already-colour frames stay 3-plane), so
+        # "as_is" channel accounting matches what actually gets written.
+        try:
+            cal_bytes, _nc, _nf = self._estimate_frames_bytes(
+                [fi["light_file"] for fi in frame_infos], mode="as_is"
+            )
+            if not self._confirm_disk_budget(
+                calibrated_dir,
+                [(f"Calibrated frames (× {len(frame_infos)}, 32-bit)", cal_bytes)],
+                title=self.tr("Calibrate Lights — disk space"),
+            ):
+                self.update_status(self.tr("🛑 Calibration cancelled."))
+                return
+        except Exception as _dse:
+            self.update_status(self.tr(f"⚠️ Disk-space check skipped: {_dse}"))
+
         # ── hardware acceleration check ───────────────────────────────────
         use_hw_accel = self.settings.value("stacking/use_hardware_accel", True, type=bool)
         if not use_hw_accel:
@@ -18028,8 +21651,39 @@ class StackingSuiteDialog(QDialog):
                 do_satellite=do_satellite,
                 hot_sigma=self.settings.value("stacking/cosmetic/hot_sigma", 3.0, type=float),
                 cold_sigma=self.settings.value("stacking/cosmetic/cold_sigma", 3.0, type=float),
+                protect_sigma=self.settings.value("stacking/cosmetic/protect_sigma", 5.0, type=float),
             )
             return
+
+        dark_tensors = {}          # path -> (C,H,W) tensor on GPU
+        group_flat_tensors = {}    # group_key -> tensor on GPU or None
+        _flat_gpu_by_key = {}      # gpu_flat_cache_key -> shared tensor
+
+        def _fallback_calibrate_cpu(reason: str) -> None:
+            self.update_status(self.tr(
+                "⚠️ GPU out of memory while preparing calibration. "
+                "Falling back to CPU."
+            ))
+            self.update_status(self.tr(f"   {reason}"))
+            try:
+                dark_tensors.clear()
+                group_flat_tensors.clear()
+                _flat_gpu_by_key.clear()
+            except Exception:
+                pass
+            _free_torch_memory()
+            self._calibrate_lights_cpu(
+                frame_infos=frame_infos,
+                calibrated_dir=calibrated_dir,
+                total_files=total_files,
+                master_bias_np=master_bias_np,
+                interactive_flat=interactive_flat,
+                do_satellite=do_satellite,
+                hot_sigma=hot_sigma,
+                cold_sigma=cold_sigma,
+                protect_sigma=protect_sigma,
+            )
+
         # ════════════════════════════════════════════════════════════════
         # PHASE 0C — load master darks + flats to GPU once per unique path
         # ════════════════════════════════════════════════════════════════
@@ -18042,9 +21696,6 @@ class StackingSuiteDialog(QDialog):
         dev    = _device() or (
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
-
-        dark_tensors = {}   # path -> (C,H,W) tensor on GPU
-        flat_tensors = {}   # path -> (C,H,W) tensor on GPU (normalised)
 
         # collect unique paths
         unique_darks = {fi["master_dark_path"] for fi in frame_infos
@@ -18070,6 +21721,9 @@ class StackingSuiteDialog(QDialog):
                         self.tr(f"  ✓ Dark loaded: {os.path.basename(dark_path)}")
                     )
             except Exception as e:
+                if is_cuda_oom(e):
+                    _fallback_calibrate_cpu(str(e))
+                    return
                 self.update_status(
                     self.tr(f"  ⚠️ Could not load dark {os.path.basename(dark_path)}: {e}")
                 )
@@ -18221,8 +21875,8 @@ class StackingSuiteDialog(QDialog):
             # if interactive, we need per-group tensors; otherwise one per path
             pass  # handled below per-frame using group_key
 
-        # build group-keyed flat tensors (respects interactive adjustments)
-        group_flat_tensors = {}   # group_key -> tensor on GPU or None
+        # build group-keyed flat tensors (respects interactive adjustments).
+        # Share one GPU tensor per unique master path across groups.
         for fi in frame_infos:
             gk        = fi["group_key"]
             flat_path = fi["master_flat_path"]
@@ -18231,6 +21885,13 @@ class StackingSuiteDialog(QDialog):
 
             if flat_path is None:
                 group_flat_tensors[gk] = None
+                continue
+
+            cache_key = gpu_flat_cache_key(
+                gk, flat_path, interactive=interactive_flat
+            )
+            if cache_key is not None and cache_key in _flat_gpu_by_key:
+                group_flat_tensors[gk] = _flat_gpu_by_key[cache_key]
                 continue
 
             if interactive_flat:
@@ -18254,9 +21915,18 @@ class StackingSuiteDialog(QDialog):
                     flat_raws[flat_path], "flat"
                 )
 
-            group_flat_tensors[gk] = torch.from_numpy(
-                flat_prepared
-            ).to(dev, dtype=torch.float32, non_blocking=True)
+            try:
+                flat_t = torch.from_numpy(flat_prepared).to(
+                    dev, dtype=torch.float32, non_blocking=True
+                )
+            except Exception as e:
+                if is_cuda_oom(e):
+                    _fallback_calibrate_cpu(str(e))
+                    return
+                raise
+            if cache_key is not None:
+                _flat_gpu_by_key[cache_key] = flat_t
+            group_flat_tensors[gk] = flat_t
 
         # free raw flat numpy — no longer needed
         flat_raws.clear()
@@ -18265,12 +21935,20 @@ class StackingSuiteDialog(QDialog):
             self.tr(f"🔧 Calibration frames ready. Starting pipeline on {total_files} frame(s)…")
         )
         QApplication.processEvents()
+        _cal_timer = StageTimer()
+        _profile_cal = False #debug flag to profile calibration stages
 
         # ════════════════════════════════════════════════════════════════
         # PIPELINE — producer / GPU / consumer
         # PREFETCH_N controls how many raw frames sit in RAM at once
         # ════════════════════════════════════════════════════════════════
-        PREFETCH_N = 4
+        # Parallel readers keep the compute stage constantly fed; queues are
+        # sized to READ_WORKERS so readers run ahead of the GPU while maxsize
+        # still bounds RAM (backpressure).
+        READ_WORKERS = int(self.settings.value(
+            "stacking/calibration_readers",
+            max(2, min(4, (os.cpu_count() or 4))), type=int))
+        PREFETCH_N = max(6, READ_WORKERS * 2)
 
         raw_queue    = Queue(maxsize=PREFETCH_N)
         result_queue = Queue(maxsize=PREFETCH_N)
@@ -18279,13 +21957,22 @@ class StackingSuiteDialog(QDialog):
         processed_files = 0
         total_done      = 0
 
-        # ── producer: loads raw lights from disk ──────────────────────────
-        def _producer():
-            for fi in frame_infos:
-                if pipeline_error.is_set() or self._cancelled():
-                    break
+        # ── readers: N threads decode raw lights in parallel from one shared
+        #    work queue, so the compute stage never waits on a single slow read.
+        import queue as _rq
+        _feed_queue = _rq.SimpleQueue()
+        for _fi in frame_infos:
+            _feed_queue.put(_fi)
+
+        def _reader():
+            while not (pipeline_error.is_set() or self._cancelled()):
                 try:
-                    light_data, hdr, bit_depth, is_mono = load_image(fi["light_file"])
+                    fi = _feed_queue.get_nowait()
+                except _rq.Empty:
+                    return
+                try:
+                    with _cal_timer("load"):
+                        light_data, hdr, bit_depth, is_mono = load_image(fi["light_file"])
                     if light_data is None or hdr is None:
                         raw_queue.put(("error", fi, "Failed to load"))
                         continue
@@ -18301,11 +21988,19 @@ class StackingSuiteDialog(QDialog):
                         rej_mask = None
 
                     raw_queue.put(("frame", fi, light_data, hdr, is_mono, rej_mask))
-                    del light_data  # ← producer drops its reference immediately
+                    del light_data
 
                 except Exception as e:
                     raw_queue.put(("error", fi, str(e)))
 
+        def _producer():
+            # coordinator: run the reader pool, then emit exactly one sentinel
+            readers = [threading.Thread(target=_reader, daemon=True)
+                       for _ in range(READ_WORKERS)]
+            for r in readers:
+                r.start()
+            for r in readers:
+                r.join()
             raw_queue.put(None)
 
         # ── consumer: saves corrected frames, runs satellite removal ─────
@@ -18333,7 +22028,7 @@ class StackingSuiteDialog(QDialog):
 
                 light_data = np.nan_to_num(
                     light_data.astype(np.float32, copy=False),
-                    nan=0.0, posinf=0.0, neginf=0.0
+                    nan=np.nan, posinf=0.0, neginf=0.0   # keep satellite-trail NaN no-data; scrub only +/-inf
                 )
 
                 min_val = float(np.min(light_data))
@@ -18372,14 +22067,13 @@ class StackingSuiteDialog(QDialog):
                     pass
 
                 calibrated_filename = _cal_out_name(fi["light_file"], calibrated_dir)
-                save_image(
-                    img_array=light_data,
-                    filename=calibrated_filename,
-                    original_format="fit",
-                    bit_depth="32-bit floating point",
-                    original_header=hdr,
-                    is_mono=is_mono,
-                )
+                with _cal_timer("save"):
+                    write_calibrated_fast(calibrated_filename, light_data, hdr, is_mono)
+                if _nan_probe_enabled():
+                    try:
+                        _nan_probe(f"calib: reopened {os.path.basename(calibrated_filename)}", _probe_load_first(calibrated_filename), self.update_status, force=True)
+                    except Exception as _e:
+                        self.update_status(f"🔎 NaN-probe (reopen _c) failed: {_e}")
 
                 del light_data
                 del hdr
@@ -18405,9 +22099,12 @@ class StackingSuiteDialog(QDialog):
             # Phase 1 is pure calibration + disk save now (satellite deferred to
             # Phase 2), so parallel writers are safe again.
             WRITE_WORKERS = 3
+            def _on_write_error(e):
+                _status_queue.put(f"⚠️ Write error: {e}")
+
             with ThreadPoolExecutor(max_workers=WRITE_WORKERS) as write_pool:
-                # drain futures in a sliding window — never hold more than
-                # WRITE_WORKERS completed futures at once
+                # Bound in-flight saves. ThreadPoolExecutor queues unlimited
+                # submit() args, and each queued job retains its frame.
                 pending = []
                 while True:
                     item = result_queue.get()
@@ -18415,33 +22112,24 @@ class StackingSuiteDialog(QDialog):
                         result_queue.task_done()
                         break
                     try:
-                        pending.append(write_pool.submit(_save_one, item))
+                        pending = submit_bounded(
+                            write_pool, pending, _save_one, item,
+                            max_pending=WRITE_WORKERS,
+                            on_error=_on_write_error,
+                        )
                         del item
                     except Exception as e:
                         _status_queue.put(f"⚠️ Could not submit save task: {e}")
                         del item
                     finally:
                         result_queue.task_done()
+                    pending = reap_completed(pending, on_error=_on_write_error)
 
-                    # drain completed futures immediately — don't let them accumulate
-                    still_pending = []
-                    for f in pending:
-                        if f.done():
-                            try:
-                                f.result()
-                            except Exception as e:
-                                _status_queue.put(f"⚠️ Write error: {e}")
-                            # future is done and result collected — drop it
-                        else:
-                            still_pending.append(f)
-                    pending = still_pending
-
-                # drain any remaining
                 for f in pending:
                     try:
                         f.result()
                     except Exception as e:
-                        _status_queue.put(f"⚠️ Write error: {e}")
+                        _on_write_error(e)
                 pending.clear()
                 del pending
 
@@ -18457,6 +22145,15 @@ class StackingSuiteDialog(QDialog):
         _current_group_label = None
         _group_frame_count   = 0
         _group_frame_total   = 0
+
+        # per-group totals precomputed once — progress stays correct even though
+        # parallel readers can deliver frames out of strict group order.
+        from collections import defaultdict as _dd
+        _group_totals = _dd(int)
+        for _f2 in frame_infos:
+            _group_totals[(_f2["filter_name"], _f2["exposure_text"])] += 1
+        _group_counts = _dd(int)
+        _seen_groups  = set()
 
         def _drain_status():
             try:
@@ -18486,19 +22183,12 @@ class StackingSuiteDialog(QDialog):
             _, fi, light_data, hdr, is_mono, rej_mask = item
             gk = fi["group_key"]
 
-            # ── group change detection ────────────────────────────────
+            # ── group label + first-seen announcement (order-independent) ──
             group_label = f"{fi['filter_name']} — {fi['exposure_text']}"
-            if group_label != _current_group_label:
-                _current_group_label = group_label
-                _group_frame_count   = 0
-                _group_frame_total   = sum(
-                    1 for f2 in frame_infos
-                    if f2["filter_name"] == fi["filter_name"]
-                    and f2["exposure_text"] == fi["exposure_text"]
-                )
-                self.update_status(
-                    self.tr(f"📷 Calibrating group: {group_label}")
-                )
+            _gkey = (fi["filter_name"], fi["exposure_text"])
+            if _gkey not in _seen_groups:
+                _seen_groups.add(_gkey)
+                self.update_status(self.tr(f"📷 Calibrating group: {group_label}"))
 
             try:
                 dark_path = fi["master_dark_path"]
@@ -18526,21 +22216,28 @@ class StackingSuiteDialog(QDialog):
                       f"Flat: {os.path.basename(fi['master_flat_path']) if fi['master_flat_path'] else 'None'} | "
                       f"Cosmetic: {fi['apply_cosmetic']}")
                 )
-                light_data = calibration_pipeline_gpu(
-                    light_data,
-                    dark_t=dark_t,
-                    flat_t=flat_t,
-                    pedestal=fi["pedestal_value"],
-                    hot_sigma=hot_sigma,
-                    cold_sigma=cold_sigma,
-                    apply_cosmetic=fi["apply_cosmetic"],
-                    bayer_pattern=fi["bayerpat"],
-                )
+                try:
+                    with _cal_timer("gpu"):
+                        light_data = calibration_pipeline_gpu(
+                            light_data,
+                            dark_t=dark_t,
+                            flat_t=flat_t,
+                            pedestal=fi["pedestal_value"],
+                            hot_sigma=hot_sigma,
+                            cold_sigma=cold_sigma,
+                            protect_sigma=protect_sigma,
+                            apply_cosmetic=fi["apply_cosmetic"],
+                            bayer_pattern=fi["bayerpat"],
+                        )
+                except Exception as _gpu_e:
+                    if not is_cuda_oom(_gpu_e):
+                        raise
+                    _free_torch_memory()
 
-                _group_frame_count += 1
+                _group_counts[_gkey] += 1
                 self.update_status(
                     self.tr(f"📷 Progress: {group_label} — "
-                            f"{_group_frame_count}/{_group_frame_total} frames")
+                            f"{_group_counts[_gkey]}/{_group_totals[_gkey]} frames")
                 )
 
             except Exception as e:
@@ -18584,36 +22281,53 @@ class StackingSuiteDialog(QDialog):
             QApplication.processEvents()
             consumer_thread.join(timeout=0.1)
         producer_thread.join()
+        if _profile_cal:
+            self.update_status(self.tr(_cal_timer.report()))
 
         # drain any final status messages
         _drain_status()
         QApplication.processEvents()
+
+        # Close the last Calibration monitor row before Phase 2 so satellite
+        # trail time is not billed to the last filter group.
+        if do_satellite and not cancelled:
+            self.update_status(self.tr("📷 All light groups calibrated"))
+            QApplication.processEvents()
 
         # ── Phase 1 done: every frame calibrated + saved. Free the GPU
         #    COMPLETELY before the satellite pass so the CNN gets a clean
         #    card — this is the whole point of the split. frame_infos is
         #    kept until AFTER Phase 2 (it rebuilds the calibrated paths).
         import gc
-        from setiastro.saspro.torch_rejection import _clear_cc_buffers
-        _clear_cc_buffers()
 
         dark_tensors.clear()
         group_flat_tensors.clear()
+        _flat_gpu_by_key.clear()
         del dark_tensors
         del group_flat_tensors
-
-        try:
-            import torch as _torch
-            if _torch.cuda.is_available():
-                _torch.cuda.empty_cache()
-        except Exception:
-            pass
+        del _flat_gpu_by_key
+        _free_torch_memory()
         gc.collect()
+
+        # Phase 1 (pure calibration) is fully done here. When a Phase-2
+        # satellite pass follows, close the per-group Calibration row now so
+        # the final filter stops accruing time while the (separate) satellite
+        # pass runs. Without a Phase-2 pass, the "✅ Calibration Complete!"
+        # emitted below already closes it at the right moment.
+        if do_satellite and not cancelled:
+            self.update_status(self.tr("📷 Calibration pipeline complete."))
+            QApplication.processEvents()
 
         # ════════════════════════════════════════════════════════════════
         # PHASE 2 — satellite trail removal on a CLEAN GPU
         # Strictly after calibration; masters + cosmetic buffers are gone,
-        # so the cuDNN CNN owns the whole card. One frame at a time.
+        # so the CNN owns the whole card.
+        #
+        # Frames are fanned out over worker threads below, but GPU SUBMISSION
+        # is serialized inside the engine (_SAT_GPU_LOCK in satellite_engine).
+        # The threads exist to overlap file I/O and CPU prep only. Do not try
+        # to "parallelize the GPU" here: interleaving dispatches from several
+        # threads onto one DirectML device is what removes the adapter.
         # ════════════════════════════════════════════════════════════════
         if do_satellite and not cancelled:
             sat_files = [
@@ -18625,59 +22339,373 @@ class StackingSuiteDialog(QDialog):
                 f"🛰️ Satellite trail removal — {n_sat} frame(s) on a clean GPU…"
             ))
             QApplication.processEvents()
-            for s_idx, cal_path in enumerate(sat_files, 1):
-                if self._cancelled():
-                    self.update_status(self.tr("⏹ Satellite pass cancelled."))
-                    break
+
+            from setiastro.saspro.resources import get_resources
+            from setiastro.saspro.cosmicclarity_engines.satellite_engine import (
+                get_satellite_models,
+                trail_mask_requires_rewrite,
+                satellite_detect_tiles,
+                ArtifactMapBuilder,
+            )
+            from setiastro.saspro.cosmicclarity_engines._backend_guard import (
+                DeviceLostError as _SatDeviceLost,
+                is_device_lost_error as _sat_is_device_lost,
+                safe_exception_str as _sat_exc_str,
+            )
+
+            def _sat_status(msg):
                 try:
-                    if not os.path.exists(cal_path):
-                        continue
-                    sd, shdr, _sbits, s_mono = load_image(cal_path)
-                    if sd is None:
-                        continue
-                    cleaned, _sat_mask = self._apply_satellite_removal_to_calibrated_light(
-                        sd, is_mono=s_mono
-                    )
-                    cleaned = np.asarray(cleaned, dtype=np.float32)
-                    if (not s_mono) and cleaned.ndim == 3 and cleaned.shape[0] == 3:
-                        cleaned = cleaned.transpose(1, 2, 0)
-                    cleaned = np.nan_to_num(
-                        cleaned.astype(np.float32, copy=False),
-                        nan=0.0, posinf=0.0, neginf=0.0,
-                    )
-                    try:
-                        if hasattr(shdr, "add_history"):
-                            shdr.add_history("Satellite trails removed (clipped to 0.0)")
-                        else:
-                            shdr["HISTORY"] = "Satellite trails removed (clipped to 0.0)"
-                    except Exception:
-                        pass
-                    save_image(
-                        img_array=cleaned,
-                        filename=cal_path,
-                        original_format="fit",
-                        bit_depth="32-bit floating point",
-                        original_header=shdr,
-                        is_mono=s_mono,
-                    )
+                    self.update_status(self.tr(str(msg)))
+                except Exception:
+                    pass
+
+            # Snapshot QSettings ONCE on this thread; workers read the dict.
+            sat_opts = self._satellite_removal_opts()
+
+            sat_models = None
+            try:
+                sat_models = get_satellite_models(
+                    resources=get_resources(),
+                    use_gpu=bool(sat_opts["use_gpu"]),
+                    status_cb=_sat_status,
+                )
+            except Exception as e:
+                self.update_status(self.tr(
+                    f"⚠️ Satellite models failed to load: {e}"
+                ))
+
+            n_rewritten = 0
+            n_unchanged = 0
+            n_failed = 0
+            n_aborted = 0
+
+            # Declared out here, not inside the `sat_models is not None`
+            # branch: the completion message below reads them unconditionally.
+            import threading as _th_sat
+            sat_abort = _th_sat.Event()
+            sat_device_err: list[str] = []
+
+            if sat_models is not None:
+                # ── Image-level concurrency. Workers overlap file I/O (load +
+                # write) and CPU numpy prep/post ONLY: the engine's GPU gate
+                # serializes every dispatch, so raising sat_workers does not
+                # put more work on the card at once. Same pattern as
+                # blink_comparator_pro's Detect Satellite Trails.
+                #
+                # Each worker is independent: loads one calibrated FITS,
+                # applies satellite_remove_image, and (if a trail was found)
+                # writes it back to disk. write_calibrated_fast is already
+                # used concurrently in Phase 1 (WRITE_WORKERS=3), so parallel
+                # writes to distinct paths are safe.
+                import concurrent.futures as _cf_sat
+
+                sat_workers = int(sat_opts["workers"])
+
+                # ── PASS 1 — detect across every calibrated light, write
+                # nothing. A diffraction spike sits in the same sensor
+                # position in every frame; without this it gets clipped to
+                # 0.000 in all of them, damaging that star across the whole
+                # integration. Detection is two small classifiers and removal
+                # is a 4-level UNet, so skipping NAFNet on persistent tiles
+                # more than pays for the extra scan.
+                sat_clean: set = set()      # scanned, no real trail -> never reloaded
+                sat_real_tiles: dict = {}   # path -> REAL trail tiles from pass 1
+                sat_scanned_any = False
+                if sat_files:
+                    sat_scanned_any = True
                     self.update_status(self.tr(
-                        f"🛰️ {s_idx}/{n_sat}: {os.path.basename(cal_path)}"
+                        f"🛰️ Pass 1 of 2 — scanning {n_sat} frame(s) for "
+                        f"diffraction spikes / amp glow…"
                     ))
-                except Exception as e:
-                    self.update_status(self.tr(
-                        f"⚠️ Satellite pass failed on "
-                        f"{os.path.basename(cal_path)}: {e}"
-                    ))
-                finally:
+                    QApplication.processEvents()
+
+                    _builder = ArtifactMapBuilder()
+                    _scanned_any_frame = False
+                    for _i, _cp in enumerate(sat_files):
+                        if self._cancelled() or sat_abort.is_set():
+                            break
+                        try:
+                            if not os.path.exists(_cp):
+                                continue
+                            _sd, _shdr, _sb, _smono = load_image(_cp)
+                            if _sd is None:
+                                continue
+                            _arr = np.asarray(_sd, dtype=np.float32)
+                            if _arr.ndim == 3 and _arr.shape[0] == 3 and _arr.shape[-1] != 3:
+                                _arr = _arr.transpose(1, 2, 0)
+                            _hw = tuple(int(v) for v in _arr.shape[:2])
+                            # Object/Filter/Exposure/Instrument, NOT shape:
+                            # Ha and Green off one camera share a shape, and
+                            # pooling them sinks the Ha amp glow below the
+                            # persistence threshold so every Ha frame flags.
+                            _tiles = satellite_detect_tiles(
+                                _arr, sat_models,
+                                chunk_size=int(sat_opts["chunk_size"]),
+                                # MUST be 0: the persistence map is tested back
+                                # against whole tiles, so this grid has to be
+                                # fixed and non-overlapping. Pass 2 takes
+                                # detect_tiles and runs no detection, so there
+                                # is no sensitivity gap to close here.
+                                overlap=0,
+                                border_size=int(sat_opts["border_size"]),
+                                temp_stretch=bool(sat_opts["temp_stretch"]),
+                                target_median=float(sat_opts["target_median"]),
+                                compatibility_mode=bool(sat_opts["compatibility_mode"]),
+                                stop_after=None,
+                                status_cb=lambda _m: None,
+                            )
+                        except _SatDeviceLost as _e:
+                            if not sat_device_err:
+                                sat_device_err.append(_sat_exc_str(_e))
+                            sat_abort.set()
+                            break
+                        except Exception as _e:
+                            self.update_status(self.tr(
+                                f"⚠️ Pass 1 skipped {os.path.basename(_cp)}: {_e}"
+                            ))
+                            continue
+
+                        _builder.add(_cp, _shdr, _hw, _tiles)
+                        _scanned_any_frame = True
+
+                        if (_i % 10) == 0:
+                            self.update_status(self.tr(
+                                f"🛰️ Pass 1: {_i + 1}/{n_sat}"
+                            ))
+                            QApplication.processEvents()
+
+                    # A pass 1 that stopped early (cancel, or the adapter going
+                    # away) has seen only part of the set. Counts from a
+                    # fraction of the frames cannot support the persistence
+                    # statistic, and a partial "clean" list would skip frames
+                    # that were simply never looked at. Discard it and fall
+                    # back to ordinary single-pass behavior.
+                    if self._cancelled() or sat_abort.is_set() or not _scanned_any_frame:
+                        sat_real_tiles.clear()
+                        sat_clean.clear()
+                        sat_scanned_any = False
+                        self.update_status(self.tr(
+                            "🛰️ Scan did not finish — no tiles ignored, "
+                            "processing every frame."
+                        ))
+                    else:
+                        # Same engine helper Blink and the CC batch use, so all
+                        # three agree on what counts as fixed-pattern structure.
+                        _clean, _real, _n_art = _builder.finalize(
+                            status_cb=lambda m: self.update_status(
+                                self.tr(f"🛰️ {m}"))
+                        )
+                        sat_clean.update(_clean)
+                        sat_real_tiles.update(_real)
+                        self.update_status(self.tr(
+                            f"🛰️ Fixed-pattern filter: {_n_art} tile(s) ignored "
+                            f"across {_builder.n_groups} group(s); "
+                            f"{len(_real)} frame(s) have real trails."
+                        ))
+                    QApplication.processEvents()
+
+                # sat_abort / sat_device_err are declared above the branch.
+                # A removed D3D12 device is permanent and process-wide. Once
+                # one frame reports it, every remaining dispatch fails — and a
+                # failed frame is written back UNMODIFIED, so its trail goes
+                # into the stack. Stop the pass instead of grinding through
+                # the rest producing silently dirty calibrated lights.
+
+                # Snapshot debug flag so workers don't call Qt-dependent
+                # status callbacks. _nan_probe is kept but sinks to print().
+                _probe_on = _nan_probe_enabled()
+
+                def _sat_worker(cal_path):
+                    """
+                    Returns (cal_path, outcome, err_msg).
+                    outcome: 'missing' | 'unchanged' | 'rewritten' | 'failed'
+                             | 'aborted'
+                    """
+                    if sat_abort.is_set():
+                        return (cal_path, 'aborted', None)
                     try:
-                        import torch as _torch_sat
-                        if _torch_sat.cuda.is_available():
-                            _torch_sat.cuda.empty_cache()
-                    except Exception:
-                        pass
-                QApplication.processEvents()
+                        if not os.path.exists(cal_path):
+                            return (cal_path, 'missing', None)
+                        sd, shdr, _sbits, s_mono = load_image(cal_path)
+                        if sd is None:
+                            return (cal_path, 'missing', None)
+                        if sat_abort.is_set():
+                            return (cal_path, 'aborted', None)
+                        try:
+                            cleaned, sat_mask = self._apply_satellite_removal_to_calibrated_light(
+                                sd, is_mono=s_mono, models=sat_models, opts=sat_opts,
+                                detect_tiles=sat_real_tiles.get(cal_path),
+                            )
+                        except _SatDeviceLost as e:
+                            if not sat_device_err:
+                                sat_device_err.append(_sat_exc_str(e))
+                            sat_abort.set()
+                            return (cal_path, 'aborted', None)
+                        if not trail_mask_requires_rewrite(sat_mask):
+                            return (cal_path, 'unchanged', None)
+                        cleaned = np.asarray(cleaned, dtype=np.float32)
+                        if _probe_on:
+                            try:
+                                _nan_probe(
+                                    f"calib(repass): post sat-removal (mem) {os.path.basename(cal_path)}",
+                                    cleaned, print, force=True,
+                                )
+                            except Exception:
+                                pass
+                        if (not s_mono) and cleaned.ndim == 3 and cleaned.shape[0] == 3:
+                            cleaned = cleaned.transpose(1, 2, 0)
+                        cleaned = np.nan_to_num(
+                            cleaned.astype(np.float32, copy=False),
+                            nan=np.nan, posinf=0.0, neginf=0.0,   # keep satellite-trail NaN no-data; scrub only +/-inf
+                        )
+                        try:
+                            if hasattr(shdr, "add_history"):
+                                shdr.add_history("Satellite trails removed (clipped to 0.0)")
+                            else:
+                                shdr["HISTORY"] = "Satellite trails removed (clipped to 0.0)"
+                        except Exception:
+                            pass
+                        write_calibrated_fast(cal_path, cleaned, shdr, s_mono)
+                        if _probe_on:
+                            try:
+                                _nan_probe(
+                                    f"calib: reopened {os.path.basename(cal_path)}",
+                                    _probe_load_first(cal_path), print, force=True,
+                                )
+                            except Exception:
+                                pass
+                        return (cal_path, 'rewritten', None)
+                    except Exception as e:
+                        # A device loss can also surface here (e.g. raw, when
+                        # the engine's own CPU retry was not applicable).
+                        if _sat_is_device_lost(e):
+                            if not sat_device_err:
+                                sat_device_err.append(_sat_exc_str(e))
+                            sat_abort.set()
+                            return (cal_path, 'aborted', None)
+                        return (cal_path, 'failed', _sat_exc_str(e))
+
+                # Only frames pass 1 found a real trail in reach pass 2.
+                # Everything else is already correct on disk, untouched.
+                sat_todo = [p for p in sat_files if p not in sat_clean]
+                n_unchanged += len(sat_files) - len(sat_todo)
+                if sat_scanned_any:
+                    self.update_status(self.tr(
+                        f"🛰️ Pass 2 of 2 — {len(sat_todo)} of {n_sat} frame(s) need "
+                        f"removal; {len(sat_files) - len(sat_todo)} already clean."
+                    ))
+                    QApplication.processEvents()
+
+                completed = len(sat_files) - len(sat_todo)
+                with _cf_sat.ThreadPoolExecutor(max_workers=sat_workers) as _sat_ex:
+                    futures = {}
+                    for cal_path in sat_todo:
+                        fut = _sat_ex.submit(_sat_worker, cal_path)
+                        futures[fut] = cal_path
+
+                    pending = set(futures.keys())
+                    cancelled_mid = False
+                    while pending:
+                        if self._cancelled():
+                            sat_abort.set()
+                            for f in pending:
+                                f.cancel()
+                            self.update_status(self.tr("⏹ Satellite pass cancelled."))
+                            cancelled_mid = True
+                            break
+
+                        if sat_abort.is_set():
+                            # Device gone: stop feeding it. Already-running
+                            # workers return 'aborted' on their own.
+                            for f in pending:
+                                f.cancel()
+
+                        done, pending = _cf_sat.wait(
+                            pending,
+                            timeout=0.1,
+                            return_when=_cf_sat.FIRST_COMPLETED,
+                        )
+
+                        for fut in done:
+                            if fut.cancelled():
+                                completed += 1
+                                n_aborted += 1
+                                continue
+                            try:
+                                cp, outcome, err = fut.result()
+                            except Exception as e:
+                                cp = futures.get(fut, '?')
+                                outcome = 'failed'
+                                err = _sat_exc_str(e)
+
+                            completed += 1
+                            basename = os.path.basename(cp) if cp else '?'
+
+                            if outcome == 'unchanged':
+                                n_unchanged += 1
+                                self.update_status(self.tr(
+                                    f"🛰️ {completed}/{n_sat}: {basename}"
+                                ))
+                            elif outcome == 'rewritten':
+                                n_rewritten += 1
+                                self.update_status(self.tr(
+                                    f"🛰️ {completed}/{n_sat}: {basename}"
+                                ))
+                            elif outcome == 'failed':
+                                n_failed += 1
+                                self.update_status(self.tr(
+                                    f"⚠️ Satellite pass failed on {basename}: {err}"
+                                ))
+                            elif outcome == 'aborted':
+                                n_aborted += 1
+                            # 'missing' = silent skip (matches prior behavior)
+
+                        QApplication.processEvents()
+
+                # Clear the CUDA cache ONCE after all workers finish instead
+                # of per-frame — per-frame empty_cache() while sibling
+                # workers are still mid-flight would just thrash the
+                # allocator.
+                try:
+                    import torch as _torch_sat
+                    if _torch_sat.cuda.is_available():
+                        _torch_sat.cuda.empty_cache()
+                except Exception:
+                    pass
             # honor a cancel that arrived during the satellite pass
             cancelled = cancelled or self._cancelled()
+            # Give the monitor an explicit terminal signal so the dedicated
+            # "Satellite Removal" row finishes here instead of lingering as
+            # "running" until the end-of-run sweep.
+            if not cancelled:
+                # n_failed / n_aborted MUST appear here. A frame that failed
+                # was written back unmodified, so its trail is still in the
+                # data and will land in the integration. The old message
+                # counted only clipped+unchanged, so a run where every frame
+                # died still reported a cheerful ✅.
+                _n_bad = int(n_failed) + int(n_aborted)
+                if sat_device_err:
+                    self.update_status(self.tr(
+                        f"⛔ Satellite trail removal STOPPED — GPU device lost "
+                        f"({sat_device_err[0]}). "
+                        f"{n_rewritten} clipped, {n_unchanged} unchanged, "
+                        f"{_n_bad} NOT processed — those frames still contain "
+                        f"their trails. Re-run calibration (GPU acceleration is "
+                        f"disabled for the rest of this session)."
+                    ))
+                elif _n_bad:
+                    self.update_status(self.tr(
+                        f"⚠️ Satellite trail removal finished with errors "
+                        f"({n_rewritten} clipped, {n_unchanged} unchanged, "
+                        f"{_n_bad} failed — those frames still contain their trails)"
+                    ))
+                else:
+                    self.update_status(self.tr(
+                        f"✅ Satellite trail removal complete "
+                        f"({n_rewritten} clipped, {n_unchanged} unchanged)"
+                    ))
+                QApplication.processEvents()
+            _free_torch_memory()
 
         # frame_infos no longer needed
         frame_infos.clear()
@@ -18695,7 +22723,11 @@ class StackingSuiteDialog(QDialog):
             self._refresh_quick_stack_summary_later()
             return   # skip auto-register-after-cal on cancel
 
-        self.update_status(self.tr("✅ Calibration Complete!"))
+        # In the satellite path, Phase-1 completion was already signalled by
+        # "📷 Calibration pipeline complete." before Phase 2; re-emitting here
+        # would spawn a duplicate (empty-group) row in the monitor.
+        if not do_satellite:
+            self.update_status(self.tr("✅ Calibration Complete!"))
         QApplication.processEvents()
 
         if not self.settings.value("stacking/auto_register_after_cal", False, type=bool):
@@ -18742,7 +22774,6 @@ class StackingSuiteDialog(QDialog):
                         )
         except Exception as e:
             self.update_status(self.tr(f"⚠️ Auto register/integrate failed: {e}"))
-
     def select_reference_frame_robust(self, frame_weights, sigma_threshold=1.0):
         """
         Instead of sigma filtering, pick the frame at the 75th percentile of frame weights.
@@ -18788,6 +22819,7 @@ class StackingSuiteDialog(QDialog):
         - Filters non-existent paths
         - Merges groups whose exposure and gain fall within tolerance
         """
+        self._ensure_reg_tree_loaded()
         light_files: dict[str, list[str]] = {}
         total_leafs = 0
         total_paths = 0
@@ -18868,8 +22900,17 @@ class StackingSuiteDialog(QDialog):
 
                 return {"filter": filt, "exp": exp, "gain": gain, "dims": dims}
 
+            def _set_of_key(k: str) -> str:
+                # A group's set = the unique set of all its frames; mixed => a
+                # sentinel that never matches, so mixed groups never merge.
+                s = {self._set_of_frame(p) for p in light_files.get(k, [])}
+                return next(iter(s)) if len(s) == 1 else "__mixed__"
+
             def _can_merge(a: str, b: str) -> bool:
-                """True if two group keys are tolerance-compatible."""
+                """True if two group keys are tolerance-compatible AND same set."""
+                # Never merge across registration sets (mosaic panels / targets).
+                if _set_of_key(a) != _set_of_key(b):
+                    return False
                 pa = _parse_key(a)
                 pb = _parse_key(b)
 
@@ -18881,9 +22922,10 @@ class StackingSuiteDialog(QDialog):
                 if pa["dims"] != pb["dims"] and pa["dims"] is not None and pb["dims"] is not None:
                     return False
 
-                # Exposure tolerance
+                # Exposure tolerance (+0.5s epsilon — see
+                # _find_or_make_exposure_group_key for rationale)
                 if pa["exp"] is not None and pb["exp"] is not None:
-                    if abs(pa["exp"] - pb["exp"]) > exp_tol:
+                    if abs(pa["exp"] - pb["exp"]) > exp_tol + 0.5:
                         return False
 
                 # Gain tolerance
@@ -18957,6 +22999,16 @@ class StackingSuiteDialog(QDialog):
         if "oiii"  in k or "o3"     in k: comps.add("oiii")
         if "hb"    in k or "hbeta"  in k: comps.add("hb")
 
+        # SII written with a single i ("Si", "SiO3", "SiOiii", "SiHb"). Bare "si"
+        # is too generic to match blindly (it appears in unrelated words), so we
+        # only treat it as SII when it forms a recognizable dual-band pairing
+        # with OIII/Hb, or is the leading token of the name. Real narrowband
+        # filters always pair SII with OIII or Hβ, so this stays specific.
+        if "sii" not in k:  # don't double-handle the already-correct spelling
+            if (re.search(r"si(?=o3|oiii|hb)", k)      # SiO3 / SiOiii / SiHb (anywhere)
+                    or re.match(r"si(?![a-z])", k)):   # leading "si" then digit/end
+                comps.add("sii")
+
         # common vendor aliases → Ha/OIII
         vendor_aliases = (
             "lextreme", "lenhance", "lultimate",
@@ -18988,7 +23040,7 @@ class StackingSuiteDialog(QDialog):
 
         # NEW: if user explicitly asked to split dual-band, default to Ha/OIII
         try:
-            if hasattr(self, "split_dualband_cb") and self.split_dualband_cb.isChecked():
+            if self._dual_split_requested():
                 return "DUAL_HA_OIII"
         except Exception:
             pass
@@ -19230,7 +23282,18 @@ class StackingSuiteDialog(QDialog):
         - Then hardware/rotator keys like POSANGLE as weaker fallbacks
         - Finally derive from WCS CD/PC matrix if available
 
-        Returns float degrees or None.
+        Key families covered (expanded for NINA, APT, SharpCap, SGP,
+        Voyager, PixInsight, Astro-Physics, generic rotator drivers):
+
+          Strong (image/sky angle):
+            ANGLE, ORIENTAT, ROTSKYPA, ROTANGLE, PA, PA_ANGLE, SKY_PA,
+            POSANGL, FIELDROT, SKYPA
+          Hardware/rotator (NINA writes ROTATANG + ROTATOR for the same
+            mechanical angle; both go here):
+            POSANGLE, ROTATOR, ROTATANG, ROTANG, ROTATE, CROTA2, CROTA1,
+            MECHROT, MROTANG, OBJCTROT
+
+        Returns float degrees in [-180, 180) or None.
         """
         if hdr is None:
             return None
@@ -19247,13 +23310,27 @@ class StackingSuiteDialog(QDialog):
         def _as_float_deg(v):
             if v is None:
                 return None
+            if isinstance(v, bool):
+                # NINA emits plain True/False for a few boolean keys; a bool is
+                # never a usable angle, and bool is a subclass of int so it must
+                # be rejected explicitly BEFORE the numeric branch below.
+                return None
             if isinstance(v, (int, float, np.integer, np.floating)):
                 try:
                     return float(v)
                 except Exception:
                     return None
             try:
-                s = str(v)
+                s = str(v).strip()
+                # Reject obvious non-numeric payloads early (card comments, Y/N
+                # flags, etc.) so the regex doesn't pluck a stray digit from a
+                # unit suffix or a date fragment.
+                if not s or s.lower() in ("n/a", "na", "none", "unknown", "-"):
+                    return None
+                # Allow signed decimals; permit comma as decimal separator for
+                # locales (NINA on some locales writes "359,842" in copy/paste
+                # exports). Match the FIRST numeric substring, which handles
+                # "359.842deg", "+180", "-0.42", "180.42 (sky)" cleanly.
                 m = re.search(r"[-+]?\d+(?:[.,]\d+)?", s)
                 if not m:
                     return None
@@ -19262,23 +23339,29 @@ class StackingSuiteDialog(QDialog):
                 return None
 
         def _norm180(a):
-            """Normalize angle difference domain to [-180, 180)."""
+            """Normalize angle to [-180, 180)."""
             if a is None:
                 return None
             a = float(a)
             return ((a + 180.0) % 360.0) - 180.0
 
         # ---------------------------------------------------------
-        # 1) Strong-preference direct keys
+        # 1) Strong-preference direct keys (sky/image angle)
         # ---------------------------------------------------------
-        # ANGLE first because in your data this reflects the actual image angle
-        # after meridian flip, while POSANGLE may remain the fixed hardware angle.
+        # ANGLE first because on SGP-written data this reflects the actual
+        # image sky angle after meridian flip. ORIENTAT is the HST/STScI
+        # standard. POSANGL (no E) is Astro-Physics' plate solve angle.
         strong_keys = (
             "ANGLE",
             "ORIENTAT",
             "ROTSKYPA",
             "ROTANGLE",
             "PA",
+            "PA_ANGLE",
+            "SKY_PA",
+            "SKYPA",
+            "POSANGL",     # Astro-Physics / some PixInsight scripts
+            "FIELDROT",    # Voyager / RoboFocus
         )
         for k in strong_keys:
             ang = _as_float_deg(_get(k, None))
@@ -19307,11 +23390,26 @@ class StackingSuiteDialog(QDialog):
         # ---------------------------------------------------------
         # 3) Weaker hardware/rotator keys
         # ---------------------------------------------------------
+        # NINA writes BOTH ROTATOR and ROTATANG with the same mechanical
+        # angle (e.g. 359.842041015625). Either one is a valid signal
+        # when nothing stronger is present. Rotators on a GEM mount do
+        # change their mechanical angle by ~180° after a meridian flip
+        # if the rotator is physically on the OTA (common case) — if the
+        # rotator is on the mount side of the pier it stays fixed. In
+        # that fixed-rotator case the angle test alone can't catch the
+        # flip, which is why the PIERSIDE helper below provides an
+        # orthogonal second signal.
         weak_keys = (
             "POSANGLE",
             "ROTATOR",
+            "ROTATANG",   # NINA
+            "ROTANG",
+            "ROTATE",
             "CROTA2",
             "CROTA1",
+            "MECHROT",
+            "MROTANG",
+            "OBJCTROT",   # NINA target rotation (often 0, but non-null means it was recorded)
         )
         for k in weak_keys:
             ang = _as_float_deg(_get(k, None))
@@ -19320,23 +23418,360 @@ class StackingSuiteDialog(QDialog):
 
         return None
 
-    def _maybe_rot180(self, img, pa_cur, pa_ref, tol_deg):
+    def _extract_pierside(self, hdr):
         """
-        If |(pa_cur - pa_ref)| ≈ 180° (within tol), rotate image 180°.
+        Return a normalized pier-side string ('W' or 'E') or None.
+
+        Pier side is the gold-standard meridian-flip signal for GEM mounts:
+        it is a direct report from the mount driver about which side of
+        the pier the OTA is on, and it changes at the flip regardless of
+        whether a rotator is installed, whether the plate solve succeeded,
+        or whether an image angle key was written. Half a session before
+        the flip will carry one value, half after it the other.
+
+        Normalizes common variants from ASCOM, INDI, NINA, APT, SGP,
+        Voyager, EQMOD and homegrown drivers:
+          'West', 'EAST', 'w', 'E', 'pierWest', 'pierEast',
+          0, 1, 'OTA Pointing West', etc.
+
+        Case-insensitive, whitespace-tolerant. First-char fallback catches
+        anything that starts with 'W' or 'E' after stripping the common
+        'pier' prefix.
+
+        Returns 'W', 'E', or None (never raises).
+        """
+        if hdr is None:
+            return None
+
+        def _get(k, default=None):
+            try:
+                return self._hdr_get(hdr, k, default)
+            except Exception:
+                try:
+                    return hdr.get(k, default)
+                except Exception:
+                    return default
+
+        # Try multiple spellings; NINA uses PIERSIDE, SGP uses PIER_SIDE,
+        # some older drivers use SIDE_OF_PIER (SOP) or just SIDE.
+        for key in ("PIERSIDE", "PIER_SIDE", "SIDE_OF_PIER", "SIDEOFPIER",
+                    "SOP", "SIDE"):
+            raw = _get(key, None)
+            if raw is None:
+                continue
+            try:
+                # ASCOM numeric: 0 = pierEast, 1 = pierWest, -1 = unknown.
+                # (ASCOM.DeviceInterface.PierSide enum.) INDI uses the same.
+                if isinstance(raw, bool):
+                    # Guard — a bool here is almost certainly not meaningful.
+                    continue
+                if isinstance(raw, (int, float, np.integer, np.floating)):
+                    iv = int(raw)
+                    if iv == 0:
+                        return "E"
+                    if iv == 1:
+                        return "W"
+                    # -1 (unknown) or anything else: fall through
+                    continue
+                s = str(raw).strip()
+                if not s:
+                    continue
+                sl = s.lower()
+                # Strip common prefixes written by ASCOM-aware drivers.
+                for prefix in ("pierside=", "pier-side=", "pier ",
+                               "pier_", "pier-", "pier"):
+                    if sl.startswith(prefix):
+                        sl = sl[len(prefix):].lstrip(" :=")
+                        break
+                # Explicit words first (so "west side of pier" works).
+                if "west" in sl:
+                    return "W"
+                if "east" in sl:
+                    return "E"
+                # Single-letter / short-form.
+                c = sl[:1]
+                if c == "w":
+                    return "W"
+                if c == "e":
+                    return "E"
+            except Exception:
+                continue
+        return None
+
+    def _pierside_flip(self, ps_cur, ps_ref):
+        """
+        True iff both pier sides are known AND differ. Any 'unknown' on
+        either side returns False — never let a missing field force a
+        rotation we can't justify.
+        """
+        if ps_cur is None or ps_ref is None:
+            return False
+        if ps_cur == ps_ref:
+            return False
+        # Only valid pair at this point is {'W', 'E'}; anything else is a
+        # parser bug and should fail safe.
+        return {ps_cur, ps_ref} == {"W", "E"}
+
+    def _maybe_rot180(self, img, pa_cur, pa_ref, tol_deg,
+                      ps_cur=None, ps_ref=None):
+        """
+        Rotate image 180° if a meridian flip is detected.
+
+        Fires on EITHER signal (OR, not AND):
+          A. |pa_cur - pa_ref| ≈ 180° within tol_deg (classic angle test)
+          B. PIERSIDE values are both known AND differ (W vs E)
+
+        The pierside signal catches two important real-world cases the
+        angle test alone misses:
+          1. NINA frames with no plate solve: only ROTATOR/ROTATANG are
+             present. On a GEM where the rotator sits on the mount side
+             of the pier (not the OTA side), the mechanical angle does
+             NOT change at the flip, so pa_cur ≈ pa_ref and the angle
+             test correctly says "no change" — but the IMAGE on the
+             sensor IS rotated 180° because the OTA swung to the other
+             side of the pier. PIERSIDE catches it.
+          2. Any frame where the angle keys are missing, blank, or
+             carry a non-numeric string the parser can't recover.
+
+        If both signals disagree (angle says flip, pierside doesn't, or
+        vice versa), the OR rule errs toward flipping. The downstream
+        star_alignment check will catch and compensate if we were wrong
+        (its own meridian wrapper tests both rotation and translation
+        magnitude against the canvas), so a false positive here costs
+        one extra solve and nothing else; a false negative silently
+        corrupts the stack.
+
         Works for (H,W) or (H,W,3).
         Returns (img_out, rotated_bool).
         """
-        
-        if pa_cur is None or pa_ref is None:
+        _flip_by_angle = False
+        _flip_by_pierside = False
+
+        if pa_cur is not None and pa_ref is not None:
+            d = self._angdiff(pa_cur, pa_ref)
+            if abs(d - 180.0) <= tol_deg:
+                _flip_by_angle = True
+
+        if self._pierside_flip(ps_cur, ps_ref):
+            _flip_by_pierside = True
+
+        if not (_flip_by_angle or _flip_by_pierside):
             return img, False
-        d = self._angdiff(pa_cur, pa_ref)
-        if abs(d - 180.0) <= tol_deg:
-            # 180° is just two 90° rotations; cheap & exact
-            # np.rot90 returns a view, make contiguous for downstream processing
-            self.update_status(self.tr(f"Flipping Image"))
-            QApplication.processEvents()
-            return np.ascontiguousarray(np.rot90(img, 2)), True
-        return img, False
+
+        # Build a status line that names which signal(s) fired. This is
+        # genuinely useful for diagnosing suspect sessions — a user seeing
+        # "pierside only" knows their rotator keys are fine but mounted
+        # on the pier side (so angle alone can't catch future flips),
+        # while "angle only" with known-equal piersides points at a
+        # rotator the mount flipped under them.
+        if _flip_by_angle and _flip_by_pierside:
+            why = "angle+pierside"
+        elif _flip_by_angle:
+            why = "angle"
+        else:
+            why = "pierside"
+        self.update_status(self.tr(f"Flipping Image ({why})"))
+        QApplication.processEvents()
+        # 180° is just two 90° rotations; cheap & exact. np.rot90 returns
+        # a view, make contiguous for downstream processing.
+        return np.ascontiguousarray(np.rot90(img, 2)), True
+
+    def _sync_header_after_rot180(self, hdr, img_shape):
+        """
+        Update a FITS header in place so it stays consistent with pixels that
+        were just rotated 180° via np.rot90(img, 2). Without this sync the
+        header's WCS/PA keys still describe the pre-flip orientation, which
+        breaks downstream plate-solving, annotation, re-detection of the
+        meridian-flip condition, and any tool that reads ANGLE/POSANGLE from
+        the normalized file. All transformations here are exact (no
+        resampling bias).
+
+        Updates:
+        - SASROT180 : True  (sentinel, so other stages know this frame was
+                             pre-rotated during normalization)
+        - CRPIX1/2  : (NAXIS - CRPIX + 1)  (reference pixel moves to the
+                      diametrically opposite location; FITS pixel origin = 1)
+        - CDi_j     : negated (R180 = -I, so M' = R·M = -M)
+        - PCi_j     : negated (same reason, when PC/CDELT are used)
+        - CROTA1/2  : add 180 (mod 360)
+        - ANGLE / POSANGLE / ROTSKYPA / ROTANGLE / PA / ROTATOR: add 180 (mod 360)
+        - FLIPPED   : toggle if present (mount-reported pier side flag)
+
+        CRVAL1/CRVAL2 stay untouched: the sky coordinate associated with the
+        (new) CRPIX location is still that same sky point, because the pixel
+        pointing at it just moved to the opposite corner.
+
+        img_shape: shape of the ROTATED image (so NAXIS1/NAXIS2 match the
+                   file we are about to write).
+        """
+        import math as _math
+        if hdr is None:
+            return hdr
+        try:
+            # NAXIS1 = width (cols), NAXIS2 = height (rows). FITS is 1-based.
+            if len(img_shape) == 2:
+                H_rot, W_rot = int(img_shape[0]), int(img_shape[1])
+            else:
+                H_rot, W_rot = int(img_shape[0]), int(img_shape[1])
+            # Make sure NAXIS values in the header match the (rotated) image.
+            # Rotation preserves H and W, so these are the same numbers, but
+            # a prior stage may have resized the array before we got here.
+            try:
+                hdr["NAXIS1"] = int(W_rot)
+                hdr["NAXIS2"] = int(H_rot)
+            except Exception:
+                pass
+
+            # CRPIX update: ref pixel moves to the opposite corner.
+            for axis, N in (("1", W_rot), ("2", H_rot)):
+                k = f"CRPIX{axis}"
+                try:
+                    v = hdr.get(k, None)
+                    if v is not None:
+                        hdr[k] = float(N) - float(v) + 1.0
+                except Exception:
+                    pass
+
+            # CD / PC matrix: negate (R180 = -I).
+            for k in ("CD1_1", "CD1_2", "CD2_1", "CD2_2",
+                      "PC1_1", "PC1_2", "PC2_1", "PC2_2"):
+                try:
+                    v = hdr.get(k, None)
+                    if v is not None:
+                        hdr[k] = -float(v)
+                except Exception:
+                    pass
+
+            # Angle keys: add 180 (mod 360), normalized to [-180, 180).
+            # Formula: ((a + 180) mod 360) - 180 lands any real-valued
+            # angle in [-180, 180). This matches _extract_pa_deg's own
+            # _norm180 helper (same formula), so after sync a second
+            # pass of the detector sees a consistent angle representation.
+            def _norm_pm180(a):
+                a = float(a)
+                return ((a + 180.0) % 360.0) - 180.0
+
+            # Keep this list in sync with _extract_pa_deg's strong_keys and
+            # weak_keys so a second normalize pass of the written frame sees
+            # the same angle in every variant key that was present. Also
+            # includes ROTATANG (NINA) and POSANGL (Astro-Physics) which the
+            # expanded detector reads.
+            for k in ("ANGLE", "ORIENTAT", "ROTSKYPA", "ROTANGLE",
+                      "PA", "PA_ANGLE", "SKY_PA", "SKYPA",
+                      "POSANGL", "FIELDROT",
+                      "POSANGLE", "ROTATOR", "ROTATANG", "ROTANG",
+                      "ROTATE", "CROTA1", "CROTA2",
+                      "MECHROT", "MROTANG", "OBJCTROT"):
+                try:
+                    v = hdr.get(k, None)
+                    if v is None:
+                        continue
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        # some writers emit angle as a string with units
+                        import re as _re
+                        m = _re.search(r"[-+]?\d+(?:[.,]\d+)?", str(v))
+                        if not m:
+                            continue
+                        fv = float(m.group(0).replace(",", "."))
+                    hdr[k] = _norm_pm180(fv + 180.0)
+                except Exception:
+                    pass
+
+            # PIERSIDE — flip W<->E in every variant spelling the detector
+            # reads, so a re-run of _normalize_one on this file sees a
+            # ref_pierside that matches the orientation we just wrote.
+            # If the key value was numeric (ASCOM: 0=East, 1=West), swap
+            # the integer; if it was a string, swap W<->E preserving case
+            # as best we can. Unknown payloads are left alone.
+            def _flip_pierside_value(raw):
+                try:
+                    if isinstance(raw, bool):
+                        return raw  # unreliable payload — leave alone
+                    if isinstance(raw, (int, float, np.integer, np.floating)):
+                        iv = int(raw)
+                        if iv == 0:
+                            return 1
+                        if iv == 1:
+                            return 0
+                        return raw
+                    s = str(raw).strip()
+                    if not s:
+                        return raw
+                    sl = s.lower()
+                    # Full-word replacements first so "WEST SIDE" -> "EAST SIDE"
+                    # with case preserved per occurrence.
+                    out = s
+                    import re as _re
+                    # Case-insensitive word swap, preserving original case
+                    # of each matched instance.
+                    def _swap(m, _pair=(("west", "east"), ("east", "west"))):
+                        w = m.group(0)
+                        wl = w.lower()
+                        if wl == "west":
+                            rep = "east"
+                        elif wl == "east":
+                            rep = "west"
+                        else:
+                            return w
+                        # Preserve case shape: ALLCAPS, Capitalized, lowercase
+                        if w.isupper():
+                            return rep.upper()
+                        if w[0].isupper():
+                            return rep.capitalize()
+                        return rep
+                    swapped = _re.sub(r"(?i)\b(west|east)\b", _swap, out)
+                    if swapped != out:
+                        return swapped
+                    # Single-letter fallbacks (common in old drivers).
+                    if sl == "w":
+                        return "E" if s.isupper() else "e"
+                    if sl == "e":
+                        return "W" if s.isupper() else "w"
+                    # pierWest / pierEast
+                    if "west" in sl:
+                        return out.replace("west", "east").replace("West", "East").replace("WEST", "EAST")
+                    if "east" in sl:
+                        return out.replace("east", "west").replace("East", "West").replace("EAST", "WEST")
+                    return raw
+                except Exception:
+                    return raw
+
+            for k in ("PIERSIDE", "PIER_SIDE", "SIDE_OF_PIER", "SIDEOFPIER",
+                      "SOP", "SIDE"):
+                try:
+                    if k in hdr:
+                        hdr[k] = (_flip_pierside_value(hdr[k]),
+                                  "Flipped by SASpro rot180 sync")
+                except Exception:
+                    pass
+
+            # FLIPPED (pier side flag) — toggle only if explicitly present.
+            try:
+                if "FLIPPED" in hdr:
+                    cur = hdr["FLIPPED"]
+                    if isinstance(cur, str):
+                        s = cur.strip().lower()
+                        cur_b = s in ("1", "t", "true", "yes", "y", "on")
+                    else:
+                        cur_b = bool(cur)
+                    hdr["FLIPPED"] = (not cur_b, "Toggled by SASpro rot180 sync")
+            except Exception:
+                pass
+
+            # Sentinel: lets any downstream stage (star_alignment, drizzle,
+            # a second normalization pass, header dumps) detect that the
+            # pixels were rotated at normalization time.
+            try:
+                hdr["SASROT180"] = (True, "Pixels rotated 180 at normalize; WCS/PA synced")
+            except Exception:
+                pass
+        except Exception:
+            # Header sync is best-effort; a header we can't modify never
+            # blocks the pixel rotation that fixes alignment quality.
+            pass
+        return hdr
 
     def _ui_log(self, msg: str):
         self.update_status(self.tr(msg))  # your existing status logger
@@ -19520,10 +23955,51 @@ class StackingSuiteDialog(QDialog):
                 hdr = {}
 
             a = np.asarray(img)
+            if a.ndim == 3 and a.shape[0] == 3 and a.shape[-1] != 3:
+                a = np.transpose(a, (1, 2, 0))   # FITS colour is (3, H, W) -> HWC
             if a.ndim == 3 and a.shape[-1] == 1:
                 a = a[...,0]
-            # if it’s color, make a luma-like 2×2 superpixel preview; if mono/CFA, same superpixel trick
-            if a.ndim == 3 and a.shape[-1] == 3:
+            # 2D CFA frames (BAYERPAT in the header) build the preview from the
+            # MAX of each 2×2 Bayer block instead of its mean. The old flat
+            # ``(R + Gr + Gb + B) / 4`` silently diluted narrowband-OSC star
+            # peaks by ~4× — a bright Ha star lives in the single R pixel of
+            # its 2×2 block, so averaging it with its three dark Bayer siblings
+            # dropped it below sep's 5-σ detector and under-represented the
+            # frame to the quality scorer. OSC measurement looked "hella
+            # quicker" than mono because many narrowband stars never made it
+            # past detection, so the capped-at-100 FWHM loop ran on a thinner
+            # candidate set (SAME code, just a thinner preview). Taking the
+            # per-block MAX preserves the peak regardless of which Bayer colour
+            # carries the signal, so OSC and mono see comparable star density,
+            # run the full candidate budget, and produce comparable weights.
+            _cfa_bp = None
+            if a.ndim == 2 and hdr is not None:
+                _bp_raw = None
+                try:
+                    _bp_raw = hdr.get("BAYERPAT") if hasattr(hdr, "get") else None
+                    if not _bp_raw and hasattr(hdr, "get"):
+                        _fkw = hdr.get("FITSKeywords", None)
+                        if isinstance(_fkw, dict):
+                            _vals = _fkw.get("BAYERPAT", None)
+                            if _vals:
+                                _bp_raw = _vals[0].get("value")
+                except Exception:
+                    _bp_raw = None
+                if _bp_raw:
+                    _bpn = str(_bp_raw).strip().upper()
+                    if _bpn in ("RGGB", "BGGR", "GRBG", "GBRG"):
+                        _cfa_bp = _bpn
+            if _cfa_bp is not None:
+                _h, _w = a.shape[:2]
+                _h2, _w2 = _h - (_h % 2), _w - (_w % 2)
+                if _h2 > 0 and _w2 > 0:
+                    _ca = a[:_h2, :_w2].astype(np.float32, copy=False)
+                    _tl = _ca[0:_h2:2, 0:_w2:2]; _tr = _ca[0:_h2:2, 1:_w2:2]
+                    _bl = _ca[1:_h2:2, 0:_w2:2]; _br = _ca[1:_h2:2, 1:_w2:2]
+                    prev2d = np.maximum(np.maximum(_tl, _tr), np.maximum(_bl, _br))
+                else:
+                    prev2d = a.astype(np.float32, copy=False)
+            elif a.ndim == 3 and a.shape[-1] == 3:
                 prev2d = _superpixel2x2(a)
             else:
                 prev2d = _superpixel2x2(a)
@@ -19539,6 +24015,49 @@ class StackingSuiteDialog(QDialog):
         except Exception:
             return None
 
+    def _fast_fits_read(self, fp: str):
+        """Fast FITS reader for the normalization hot path: raw float32 pixels
+        + header, NaN preserved, row-order normalized -- WITHOUT load_image's
+        general overhead (second header open via get_valid_header, WCS attach,
+        per-frame prints, redundant copies). Returns (img, hdr) on the float
+        fast path, or (None, None) to tell the caller to use the full loader
+        (int/scaled/odd FITS, so bit-depth handling stays byte-identical)."""
+        try:
+            with fits.open(fp, memmap=False) as hdul:
+                hdu = None
+                for _x in hdul:
+                    _d = getattr(_x, "data", None)
+                    if _d is not None and getattr(_d, "ndim", 0) >= 2:
+                        hdu = _x; break
+                if hdu is None:
+                    return None, None
+                data = np.asarray(hdu.data)
+                hdr = hdu.header.copy()
+            # Fast path only for float FITS (calibrated/normalized frames).
+            if data.dtype.kind != "f":
+                return None, None
+            if data.dtype.byteorder not in ("=", "|"):
+                data = data.astype(data.dtype.newbyteorder("="))
+            img = np.asarray(data, dtype=np.float32)
+            # preserve NaN (satellite no-data); scrub only +/-inf -- matches
+            # _finalize_loaded_image under the NaN-preserve context.
+            img = np.nan_to_num(img, nan=np.nan, posinf=1.0, neginf=0.0)
+            img = np.squeeze(img)
+            if img.ndim == 3 and img.shape[0] == 3 and img.shape[1] > 1 and img.shape[2] > 1:
+                img = np.transpose(img, (1, 2, 0))   # CHW -> HWC
+            elif img.ndim == 3 and img.shape[-1] not in (1, 3):
+                return None, None   # unusual layout -> full loader
+            if img.ndim == 3 and img.shape[-1] == 1:
+                img = img[..., 0]
+            img = np.ascontiguousarray(img, dtype=np.float32)
+            try:
+                from setiastro.saspro.legacy.image_manager import _apply_roworder_flip
+                img, hdr = _apply_roworder_flip(img, hdr)
+            except Exception:
+                pass
+            return img, hdr
+        except Exception:
+            return None, None
 
     # ——— on-demand full load (float32, header-like), for normalization stage ———
     def _load_image_any(self, fp: str):
@@ -19550,8 +24069,19 @@ class StackingSuiteDialog(QDialog):
         ext = os.path.splitext(fp)[1].lower()
         try:
             if ext in (".fits", ".fit", ".fz"):
-                from setiastro.saspro.legacy.image_manager import load_image as legacy_load_image
-                img, hdr, _, _ = legacy_load_image(fp)
+                # Fast float32 path (skips load_image's double-open / WCS / prints
+                # / extra copies); full loader fallback keeps int/scaled FITS
+                # byte-identical. Both preserve satellite-trail NaN no-data.
+                _img, _hdr = self._fast_fits_read(fp)
+                if _img is not None:
+                    return _img, (_hdr or fits.Header())
+                from setiastro.saspro.legacy.image_manager import load_image as legacy_load_image, _load_nan_ctx
+                _prev_pn = getattr(_load_nan_ctx, "preserve", False)
+                _load_nan_ctx.preserve = True
+                try:
+                    img, hdr, _, _ = legacy_load_image(fp)
+                finally:
+                    _load_nan_ctx.preserve = _prev_pn
                 return img, (hdr or fits.Header())
             if ext == ".xisf":
                 from setiastro.saspro.legacy.xisf import XISF
@@ -19598,7 +24128,7 @@ class StackingSuiteDialog(QDialog):
             if hasattr(self, name):
                 setattr(self, name, None)
 
-        # Proactively clear any lru_cache’d helpers if available
+        #sasproactively clear any lru_cache’d helpers if available
         def _cc(f):
             try:
                 if hasattr(f, "cache_clear"): f.cache_clear()
@@ -19708,6 +24238,32 @@ class StackingSuiteDialog(QDialog):
                 except Exception:
                     pass
 
+        # WCS plate-scale matrix: divide (deg per pixel shrinks as image grows).
+        # CDi_j elements that mix X and Y use the row-axis factor (X-axis cards
+        # scale by upscale_x, Y-axis by upscale_y). Same for PCi_j with CDELTi.
+        try:
+            cd_keys = ("CD1_1", "CD1_2", "CD2_1", "CD2_2")
+            if any(k in hdr for k in cd_keys):
+                for k, axis in (("CD1_1", upscale_x), ("CD1_2", upscale_x),
+                                ("CD2_1", upscale_y), ("CD2_2", upscale_y)):
+                    if k in hdr:
+                        try:
+                            hdr[k] = float(hdr[k]) / float(axis)
+                        except Exception:
+                            pass
+            # If CD not present but PC+CDELT are, scale CDELT (keep PC rotational part).
+            elif ("CDELT1" in hdr) or ("CDELT2" in hdr):
+                if "CDELT1" in hdr:
+                    try: hdr["CDELT1"] = float(hdr["CDELT1"]) / float(upscale_x)
+                    except Exception: pass
+                if "CDELT2" in hdr:
+                    try: hdr["CDELT2"] = float(hdr["CDELT2"]) / float(upscale_y)
+                    except Exception: pass
+        except Exception:
+            pass
+
+        hdr["SASUPSCX"] = (float(upscale_x), "Header rescaled for X upscale factor (SASpro)")
+        hdr["SASUPSCY"] = (float(upscale_y), "Header rescaled for Y upscale factor (SASpro)")
         return hdr
 
     def _cancelled(self) -> bool:
@@ -19764,6 +24320,347 @@ class StackingSuiteDialog(QDialog):
     def _current_weight_mode(self) -> str:
         mode = self.settings.value("stacking/weight_mode", "Balanced", type=str)
         return mode if mode in self.WEIGHT_MODES else "Balanced"
+
+    def _group_frames_by_filter(self, frames: list) -> dict:
+        """Group paths by filter name using ``self.light_files`` keys as the
+        authoritative source for filter identity (keys look like
+        ``"Ha - 300s (4144x2822)"``), avoiding a per-frame FITS header read.
+        Falls back to ``self._get_filter_name`` for any path that isn't in
+        a known group (rare — e.g. mid-session re-measurements loaded via
+        a different code path)."""
+        path_to_filter = {}
+        for key, paths in (self.light_files or {}).items():
+            try:
+                if isinstance(key, tuple) and len(key) >= 1:
+                    filter_exposure = str(key[0])
+                else:
+                    filter_exposure = str(key)
+                # Keys like "Ha - 300s (4144x2822)" → everything before
+                # the LAST " - " is the filter name (rsplit handles the
+                # rare case of a filter name that itself contains " - ").
+                filter_name = filter_exposure.rsplit(" - ", 1)[0].strip() or "Unknown"
+            except Exception:
+                filter_name = "Unknown"
+            for p in (paths or []):
+                if p:
+                    path_to_filter[p] = filter_name
+
+        groups: dict = {}
+        for fp in frames:
+            fname = path_to_filter.get(fp)
+            if not fname:
+                try:
+                    fname = self._get_filter_name(fp) or "Unknown"
+                except Exception:
+                    fname = "Unknown"
+            groups.setdefault(fname, []).append(fp)
+        return groups
+
+    def _make_weight_resolver(self, weights: dict = None):
+        """Return a callable ``resolve(path) -> float`` that looks up a
+        frame's effective weight across the aligned→original path chain.
+        Factored out so ``_count_contributing_frames`` and the acquisition
+        summary filter use the SAME lookup, guaranteeing their counts
+        agree."""
+        import os as _os
+        if weights is None:
+            weights = getattr(self, "frame_weights", None) or {}
+        if not weights:
+            return lambda _p: 1.0
+
+        fw_norm = {}
+        for k, v in weights.items():
+            try:
+                fw_norm[_os.path.normcase(_os.path.normpath(k))] = float(v)
+            except Exception:
+                fw_norm[_os.path.normcase(_os.path.normpath(k))] = 1.0
+
+        _orig_by_aligned = getattr(self, "orig_by_aligned", {}) or {}
+        _orig2norm       = getattr(self, "_orig2norm", {}) or {}
+        _norm2orig_nc = {}
+        for orig_nc, norm_np in _orig2norm.items():
+            try:
+                _norm2orig_nc[_os.path.normpath(norm_np)] = orig_nc
+            except Exception:
+                pass
+
+        def _resolve(fp) -> float:
+            try:
+                p_nc = _os.path.normcase(_os.path.normpath(fp))
+            except Exception:
+                return 1.0
+            if p_nc in fw_norm:
+                return fw_norm[p_nc]
+            try:
+                p_np = _os.path.normpath(fp)
+            except Exception:
+                return 1.0
+            norm_path = _orig_by_aligned.get(p_np)
+            if norm_path:
+                orig_nc = _norm2orig_nc.get(_os.path.normpath(norm_path))
+                if orig_nc and orig_nc in fw_norm:
+                    return fw_norm[orig_nc]
+            return 1.0
+
+        return _resolve
+
+    def _count_contributing_frames(self, file_list, weights: dict = None) -> int:
+        """How many frames in ``file_list`` will actually contribute photons
+        to the integrated master. Soft-rejected subs — those whose score was
+        forced to 0 by ``_apply_sub_rejection`` — don't contribute even
+        though they're still in ``file_list`` for bookkeeping. The stacked
+        count that goes into the filename, ``NCOMBINE`` header, and status
+        summary should name the number of contributing frames, not the
+        pre-rejection pool size.
+
+        Registration failures DO NOT reach this method: aligned_light_files
+        is filtered against ``self.valid_transforms`` upstream (around line
+        27617) so a reg-failed frame is already absent from ``file_list``
+        by the time we count. The only drop reason this method consults is
+        soft rejection (weight = 0). Combined effect: 100 subs, 2 soft-
+        rejected (A, B), 2 reg-failed (A, C) → ``file_list`` arrives with
+        98 entries (A, C already gone), one has weight 0 (B), the returned
+        count is 97. A sub rejected by both routes (A) is subtracted once,
+        which is the correct accounting.
+
+        **Lookup chain** mirrors ``_resolve_weight`` inside the
+        integrators because ``file_list`` at this point holds ALIGNED
+        paths (Aligned_Images/...) but ``self.frame_weights`` is keyed by
+        the CALIBRATED/original paths the measurement pass saw:
+
+          aligned path  →  ``orig_by_aligned`` → normalized intermediate
+                        →  ``_orig2norm`` reverse → original (normcase)
+                        →  ``frame_weights`` → weight
+
+        Without this chain the direct ``weights.get(aligned_path, 1.0)``
+        would always return 1.0 and the Register-and-Integrate path would
+        silently count every frame as contributing. Any lookup that falls
+        off the chain defaults to 1.0 (contributing) so pipelines without
+        a weighting pass still produce an all-frames count — no regression.
+
+        ``weights`` can be an explicit dict (the prepass passes its own
+        captured copy for isolation); if omitted, falls back to
+        ``self.frame_weights``."""
+        resolve = self._make_weight_resolver(weights)
+        n = 0
+        for fp in file_list:
+            try:
+                if resolve(fp) > 0.0:
+                    n += 1
+            except Exception:
+                n += 1
+        return n
+
+    def _apply_sub_rejection(self, measured_frames: list,
+                             star_counts: dict = None,
+                             preview_medians: dict = None) -> int:
+        """Score-outlier rejection applied in-place to ``self.frame_weights``.
+
+        Runs PER FILTER: an OIII group almost always scores lower than an
+        Hα group under the same sky (fewer stars, lower photon rate), so
+        a single global threshold would brand an entire narrowband channel
+        as outliers of a brighter one. Each filter gets its own median,
+        robust MAD-σ, and threshold.
+
+        Rule (per filter):
+            med       = median(scores_in_filter)
+            sigma     = 1.4826 * median(|scores - med|)
+            threshold = med - k * sigma
+        with guards applied PER FILTER:
+          - skip the filter when fewer than 10 of its subs have a positive
+            weight (MAD is too noisy to call outliers below that)
+          - skip the filter when sigma < 0.02 (its scores are tightly
+            clustered — nothing stands out)
+          - skip the whole call when ``stacking/reject_outliers_enabled``
+            is False
+
+        The per-run checkbox on the integration tab
+        (``reject_interactive_cb``) decides whether the user reviews
+        thresholds in a dialog (one plot per filter, switched by a
+        dropdown) or we auto-apply.
+
+        Soft reject: rejected subs have ``self.frame_weights[fp] = 0.0``.
+        Files are untouched on disk — a later run can re-measure and
+        re-threshold without data loss. Returns the total rejection count
+        across all filters (0 is a valid result).
+        """
+        import numpy as _np
+        import os as _os
+
+        enabled = bool(self.settings.value("stacking/reject_outliers_enabled", True, type=bool))
+        if not enabled:
+            return 0
+
+        sigma_k = float(self.settings.value("stacking/reject_outliers_sigma_k", 3.5, type=float))
+
+        # Partition measured_frames by filter — authoritative lookup via
+        # self.light_files group keys (no disk I/O), with a header-read
+        # fallback for any orphan path.
+        groups_by_filter = self._group_frames_by_filter(measured_frames)
+
+        # Per-filter guards. Build the candidate_groups dict used by both
+        # the interactive dialog and the auto-apply branch so the two
+        # paths see IDENTICAL inputs.
+        candidate_groups: dict = {}      # filter_name -> {fp: score}
+        auto_thresholds: dict = {}       # filter_name -> (med, sig, threshold)
+        skipped: list = []               # (filter_name, reason) for logging
+
+        for fname, fps in groups_by_filter.items():
+            pairs = [
+                (fp, float(self.frame_weights.get(fp, 0.0)))
+                for fp in fps
+                if self.frame_weights.get(fp, 0.0) > 0.0
+            ]
+            if len(pairs) < 10:
+                skipped.append((fname, self.tr(
+                    "only {0} subs with positive weight — need ≥10"
+                ).format(len(pairs))))
+                continue
+
+            scores = _np.asarray([p[1] for p in pairs], dtype=_np.float32)
+            med = float(_np.median(scores))
+            mad = float(_np.median(_np.abs(scores - med)))
+            sig = 1.4826 * mad
+            if not (_np.isfinite(sig) and sig >= 0.02):
+                skipped.append((fname, self.tr(
+                    "σ = {0:.4f} < 0.02 (tight distribution; nothing stands out)"
+                ).format(sig)))
+                continue
+
+            candidate_groups[fname] = {fp: s for fp, s in pairs}
+            auto_thresholds[fname] = (med, sig, med - sigma_k * sig)
+
+        for fname, reason in skipped:
+            self.update_status(self.tr(
+                "ℹ️ Sub rejection skipped for filter '{0}': {1}"
+            ).format(fname, reason))
+
+        if not candidate_groups:
+            return 0
+
+        # Interactive? Per-run checkbox on the integration tab wins; fall
+        # back to the sticky setting if the tab's checkbox doesn't exist
+        # (e.g., headless invocation).
+        interactive = False
+        cb = getattr(self, "reject_interactive_cb", None)
+        if cb is not None:
+            try:
+                interactive = bool(cb.isChecked())
+            except Exception:
+                interactive = False
+        else:
+            interactive = bool(self.settings.value(
+                "stacking/reject_outliers_interactive", False, type=bool
+            ))
+
+        rejected: set = set()
+        per_filter_threshold: dict = {}
+
+        if interactive:
+            # Build per-filter per-metric data for the Advanced view. Each
+            # metric maps to a {fp: value} dict that mirrors the Score dict
+            # the dialog already consumes. If any required bit is missing
+            # we just drop the metric for that filter — the dialog hides
+            # Advanced mode when ANY filter is incomplete.
+            metrics_data = None
+            if star_counts is not None and preview_medians is not None:
+                metrics_data = {}
+                for fname, scores_map in candidate_groups.items():
+                    mdict: dict = {}
+                    fwhm_d, ecc_d, bg_d, count_d, noise_d = {}, {}, {}, {}, {}
+                    import math as _math
+                    for fp in scores_map:
+                        info = (star_counts or {}).get(fp) or {}
+                        try: fwhm_d[fp]  = float(info.get("fwhm", _math.nan))
+                        except Exception: fwhm_d[fp] = float("nan")
+                        try: ecc_d[fp]   = float(info.get("eccentricity", _math.nan))
+                        except Exception: ecc_d[fp] = float("nan")
+                        try: count_d[fp] = float(info.get("count", _math.nan))
+                        except Exception: count_d[fp] = float("nan")
+                        n = info.get("noise", None)
+                        try: noise_d[fp] = float(n) if n is not None else float("nan")
+                        except Exception: noise_d[fp] = float("nan")
+                        try: bg_d[fp]    = float((preview_medians or {}).get(fp, _math.nan))
+                        except Exception: bg_d[fp] = float("nan")
+                    mdict["fwhm"]  = fwhm_d
+                    mdict["ecc"]   = ecc_d
+                    mdict["bg"]    = bg_d
+                    mdict["count"] = count_d
+                    mdict["noise"] = noise_d
+                    metrics_data[fname] = mdict
+
+            start_adv = bool(self.settings.value(
+                "stacking/reject_outliers_advanced", False, type=bool
+            ))
+            dlg = SubRejectionDialog(
+                self, candidate_groups,
+                metrics_data=metrics_data,
+                sigma_k=sigma_k,
+                start_in_advanced=start_adv,
+            )
+            result = dlg.exec()
+            if result != QDialog.DialogCode.Accepted:
+                self.update_status(self.tr(
+                    "ℹ️ Sub rejection cancelled — keeping all subs."
+                ))
+                return 0
+            # Persist the "start in advanced?" preference so the view the
+            # user actually left in is the view they come back to.
+            try:
+                self.settings.setValue(
+                    "stacking/reject_outliers_advanced",
+                    bool(dlg.mode() == "advanced"),
+                )
+            except Exception:
+                pass
+            rejected = set(dlg.rejected_paths())
+            for fname in candidate_groups:
+                per_filter_threshold[fname] = dlg.threshold(fname, "score")
+        else:
+            for fname, scores_map in candidate_groups.items():
+                _med, _sig, threshold = auto_thresholds[fname]
+                per_filter_threshold[fname] = threshold
+                for fp, s in scores_map.items():
+                    if s < threshold:
+                        rejected.add(fp)
+
+        total_candidates = sum(len(g) for g in candidate_groups.values())
+
+        if not rejected:
+            self.update_status(self.tr(
+                "✅ Sub rejection: no outliers across any filter — "
+                "all {0} subs kept ({1} filter group(s) considered)."
+            ).format(total_candidates, len(candidate_groups)))
+            return 0
+
+        # Soft reject + per-sub log line (always useful for a stacking log).
+        for fp in rejected:
+            prev = self.frame_weights.get(fp, 0.0)
+            self.frame_weights[fp] = 0.0
+            try:
+                self.update_status(self.tr(
+                    "🚫 Rejected sub (score outlier): {0}  (score {1:.4f})"
+                ).format(_os.path.basename(fp), float(prev)))
+            except Exception:
+                pass
+
+        # Per-filter summary: how many each filter contributed and at what
+        # threshold — makes mixed-filter stacks much easier to audit.
+        for fname, scores_map in candidate_groups.items():
+            th = per_filter_threshold.get(fname, auto_thresholds[fname][2])
+            n_rej = sum(1 for fp in scores_map if fp in rejected)
+            n_tot = len(scores_map)
+            med, sig, _auto_th = auto_thresholds[fname]
+            self.update_status(self.tr(
+                "   • [{0}]  rejected {1}/{2}  threshold={3:.4f}  "
+                "(median={4:.4f}, σ={5:.4f})"
+            ).format(fname, n_rej, n_tot, th, med, sig))
+
+        self.update_status(self.tr(
+            "🚫 Sub rejection: {0} / {1} subs rejected across {2} filter group(s) "
+            "(k = {3:.2f})."
+        ).format(len(rejected), total_candidates, len(candidate_groups), sigma_k))
+        return len(rejected)
 
     @staticmethod
     def _score_frame_terms(*, count, ecc, bg, fwhm, noise,
@@ -19825,11 +24722,111 @@ class StackingSuiteDialog(QDialog):
         )
         return float(w), {"sharp": sharp_term, "snr": snr_term}
 
+    def _exposure_factors_for_frames(self, frames: list[str]) -> tuple[dict[str, float], float]:
+        """Compute per-frame linear exposure weighting factors over a group.
+
+        Pulls each frame's exposure from the group key it already sits under
+        in ``self.light_files`` (keys look like
+        ``("Ha - 300s (4144x2822)", session)``) — no FITS header re-reads,
+        because that information was already parsed and used to group these
+        frames in the first place. Returns ``(factors, max_exp)`` where
+        ``factors[fp] = exp(fp) / max_exp`` clamped to ``(1e-4, 1.0]``.
+
+        A frame that can't be matched back to a group — or whose group key
+        has a non-numeric exposure token like ``"Unknown"`` — maps to a
+        neutral ``1.0`` factor so a key-parsing quirk never silently zeroes
+        a frame. When every frame shares one exposure (the common single-
+        exposure stack) every factor is exactly ``1.0`` and this call is a
+        no-op mathematically.
+
+        This is the correct weighting in the photon-shot-noise-dominated
+        regime of modern CMOS sensors: variance ∝ 1/T, so the inverse-
+        variance optimal weight is proportional to T itself. Read noise
+        (which scales as √T) is a second-order correction we deliberately
+        ignore here per the UX contract on the "Scale weights by exposure
+        time" checkbox.
+
+        Returns:
+            factors : {file_path: factor_in_(1e-4, 1.0]}
+            max_exp : the longest exposure in the group (0.0 if nothing in
+                      self.light_files has a parseable exposure — caller
+                      should treat that as "no exposure info available" and
+                      skip scaling).
+        """
+        # Build a path → exposure map from self.light_files group keys.
+        # The exposure text in a key looks like "300s" / "0.5s" / "Unknown";
+        # we match the first "<number>s" token in the first element of the
+        # tuple key (filter+exposure+size string). Falls back to 0.0 on no
+        # match, which the loop below translates into a neutral 1.0 factor.
+        _light_files = getattr(self, "light_files", None) or {}
+        _exp_token = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+
+        def _parse_exp_from_key(key) -> float:
+            try:
+                label = key[0] if isinstance(key, tuple) and key else key
+                if not isinstance(label, str):
+                    return 0.0
+                m = _exp_token.search(label)
+                if not m:
+                    return 0.0
+                v = float(m.group(1))
+                return v if math.isfinite(v) and v > 0.0 else 0.0
+            except Exception:
+                return 0.0
+
+        path_exp: dict[str, float] = {}
+        for key, paths in _light_files.items():
+            e = _parse_exp_from_key(key)
+            for p in paths or ():
+                # Last-group-wins on a duplicate path — not expected inside a
+                # single light_files snapshot, but harmless if it occurs.
+                path_exp[p] = e
+
+        # Also index by normcase(abspath) so a frame whose path differs only
+        # in case/separators (common on Windows) still matches its group.
+        path_exp_nc: dict[str, float] = {
+            os.path.normcase(os.path.normpath(p)): e for p, e in path_exp.items()
+        }
+
+        exps: dict[str, float] = {}
+        for fp in frames:
+            e = path_exp.get(fp)
+            if e is None:
+                e = path_exp_nc.get(os.path.normcase(os.path.normpath(fp)), 0.0)
+            exps[fp] = float(e) if e and e > 0.0 else 0.0
+
+        valid = [e for e in exps.values() if e > 0.0]
+        if not valid:
+            return ({fp: 1.0 for fp in frames}, 0.0)
+
+        max_exp = max(valid)
+        if max_exp <= 0.0:
+            return ({fp: 1.0 for fp in frames}, 0.0)
+
+        factors: dict[str, float] = {}
+        for fp, e in exps.items():
+            if e <= 0.0:
+                # Missing / unparseable → neutral factor (quality score stands
+                # alone); better than zeroing a frame over a key-text quirk.
+                factors[fp] = 1.0
+            else:
+                f = e / max_exp
+                # Clamp defensively — a bogus key exposure greater than the
+                # group max shouldn't be able to lift a frame above 1.0,
+                # which would perturb the mean-normalisation step downstream.
+                if f > 1.0:
+                    f = 1.0
+                elif f < 1e-4:
+                    f = 1e-4
+                factors[fp] = float(f)
+        return factors, float(max_exp)
+
     @staticmethod
     def _mad_noise(arr) -> float:
         """Robust MAD-based noise estimate, star-insensitive. Plain numpy so it
         works on any preview dtype without njit compilation concerns."""
         a = np.asarray(arr, dtype=np.float32).ravel()
+        a = a[np.isfinite(a)]  
         if a.size == 0:
             return 0.0
         med = float(np.median(a))
@@ -19859,7 +24856,9 @@ class StackingSuiteDialog(QDialog):
         a = np.asarray(img2d, dtype=np.float32)
         if a.ndim != 2 or a.size == 0:
             return 0.0
-
+        if not np.isfinite(a).all():                 # fill NaN with background first
+            fin = a[np.isfinite(a)]
+            a = np.where(np.isfinite(a), a, float(np.median(fin)) if fin.size else 0.0)
         med = float(np.median(a))
         mad = float(np.median(np.abs(a - med))) * 1.4826
         if not (mad > 0):
@@ -19913,6 +24912,420 @@ class StackingSuiteDialog(QDialog):
         if not fwhms:
             return 0.0
         return float(np.median(fwhms))
+
+    def _slugify_set(self, name):
+        import re
+        s = re.sub(r'[^A-Za-z0-9._-]+', '_', str(name or "")).strip('_')
+        return s or "set"
+
+    def _partition_light_files_by_set(self, light_files):
+        """Split {group_key:[paths]} into an ordered list of
+        (set_name, {group_key:[paths]}) — one entry per registration set that
+        actually has frames. Group keys are preserved (NOT prefixed) so drizzle
+        settings and tree lookups keep matching; per-set disambiguation of
+        outputs is handled by the Aligned_Images subfolder and the master tag."""
+        from collections import OrderedDict
+        order = list(self.reg_sets.keys())
+        if "Default" not in order:
+            order = ["Default"] + order
+        buckets = OrderedDict((s, OrderedDict()) for s in order)
+        for group_key, paths in light_files.items():
+            for p in paths:
+                sname = self._set_of_frame(p)
+                b = buckets.setdefault(sname, OrderedDict())
+                b.setdefault(group_key, []).append(p)
+        return [(s, dict(g)) for s, g in buckets.items() if g]
+
+    def _buffer_set_summary(self, master_paths, sasd_path, sasd_exists):
+        """Stash one set's integration results for a single end-of-run summary
+        (used during multi-set / mosaic runs instead of prompting per set).
+        Each set's .sasd is copied to a per-set name so it survives the next
+        set overwriting alignment_transforms.sasd.
+
+        Also snapshots the current set's light_files groups so the final
+        multi-set summary can produce a per-set acquisition breakdown
+        (nights/filter/exposure) from the real headers rather than just
+        a master count.
+        """
+        preserved_sasd = None
+        if sasd_exists:
+            try:
+                import shutil
+                slug = self._reg_current_set_slug or self._slugify_set(self._reg_current_set)
+                preserved_sasd = os.path.join(self.stacking_directory,
+                                              f"alignment_transforms_{slug}.sasd")
+                shutil.copy2(sasd_path, preserved_sasd)
+                from setiastro.saspro.dither_analysis import _save_pixscale_for_sasd
+                ps = getattr(self, "_ref_pixscale_arcsec", None)
+                if ps:
+                    _save_pixscale_for_sasd(QSettings("SetiAstro", "SASpro"), preserved_sasd, ps)
+            except Exception:
+                preserved_sasd = sasd_path
+        if getattr(self, "_reg_summary_buffer", None) is None:
+            self._reg_summary_buffer = []
+
+        # Snapshot THIS set's light_files groups so we can build an
+        # acquisition summary at the end of the run. self.light_files is
+        # narrowed to the current set during multi-set processing (see
+        # register_images → self.light_files = {g: list(p) for g, p in
+        # _set_groups.items()}), so copying it here captures exactly the
+        # files that went into the masters we just wrote.
+        try:
+            set_groups_snapshot = {
+                g: list(paths or [])
+                for g, paths in (getattr(self, "light_files", None) or {}).items()
+            }
+        except Exception:
+            set_groups_snapshot = {}
+
+        self._reg_summary_buffer.append({
+            "set": self._reg_current_set,
+            "masters": list(master_paths or []),
+            "sasd": preserved_sasd,
+            "groups": set_groups_snapshot,
+        })
+        self.update_status(self.tr(
+            f"🧩 Set '{self._reg_current_set}' integrated — summary deferred to end of run."
+        ))
+
+    def _show_multiset_summary(self):
+        """One prompt after all registration sets finish: open all masters,
+        every per-set dither analysis, or both. Also presents an
+        acquisition summary (nights / filters / integration), broken out
+        per-set, built from the per-set snapshots stashed by
+        _buffer_set_summary. No-op if nothing was buffered."""
+        buf = getattr(self, "_reg_summary_buffer", None)
+        if not buf:
+            return
+        self._reg_summary_buffer = []
+
+        all_masters = []
+        for e in buf:
+            for m in e.get("masters", []):
+                if m not in all_masters:
+                    all_masters.append(m)
+        sasd_list = [e["sasd"] for e in buf
+                     if e.get("sasd") and os.path.exists(e["sasd"])]
+
+        # Build the acquisition summary from per-set snapshots.
+        sets_map = {}
+        for e in buf:
+            set_name = e.get("set") or self.tr("Set")
+            groups = e.get("groups") or {}
+            if groups:
+                # Disambiguate accidentally-equal set names from different
+                # mosaic phases, if any — rare, but cheap to protect against.
+                if set_name in sets_map:
+                    k = 2
+                    while f"{set_name} ({k})" in sets_map:
+                        k += 1
+                    set_name = f"{set_name} ({k})"
+                sets_map[set_name] = groups
+
+        summary = None
+        try:
+            summary = self._build_acquisition_summary(sets_map)
+        except Exception as e:
+            try: self.update_status(self.tr(f"(summary skipped: {e})"))
+            except Exception: pass
+
+        def _open_all_masters():
+            self._open_saved_masters(all_masters)
+
+        def _open_all_dither():
+            from setiastro.saspro.dither_analysis import DitherAnalysisWindow
+            if not hasattr(self, "_dither_windows"):
+                self._dither_windows = []
+            for sp in sasd_list:
+                try:
+                    dlg = DitherAnalysisWindow(parent=self)
+                    dlg.setWindowFlag(Qt.WindowType.Window, True)
+                    dlg.load_sasd(sp)
+                    dlg.show()
+                    dlg.raise_()
+                    dlg.activateWindow()
+                    self._dither_windows.append(dlg)
+                except Exception as ex:
+                    QMessageBox.warning(
+                        self, "Dither Analysis",
+                        f"Could not open Dither Analysis for {os.path.basename(sp)}:\n{ex}"
+                    )
+
+        lead = self.tr("All {0} registration sets complete.").format(len(buf))
+
+        if summary and summary.get("text"):
+            # Prepend a compact per-set master count on top of the
+            # auto-generated acquisition summary — gives mosaic users a
+            # quick glance at how many masters landed per panel.
+            per_set_bits = [
+                f"  • {e['set']}: {len(e.get('masters', []))} master(s)"
+                for e in buf
+            ]
+            summary_text = (
+                "\n".join(per_set_bits)
+                + "\n\n"
+                + summary["text"]
+            )
+            actions = self._show_rich_summary_dialog(
+                title=self.tr("All Sets Complete"),
+                lead_text=lead,
+                summary_text=summary_text,
+                master_paths=all_masters,
+                sasd_paths=sasd_list,
+            )
+            if actions["open_masters"]:
+                _open_all_masters()
+            if actions["open_dither"]:
+                _open_all_dither()
+            return
+
+        # Fallback: old plain-dialog path for the (unlikely) case where
+        # no headers could be read at all.
+        lines = [lead, ""]
+        for e in buf:
+            lines.append(f"• {e['set']}: {len(e.get('masters', []))} master(s)")
+        text = "\n".join(lines)
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(self.tr("All Sets Complete"))
+        msg_box.setText(text)
+        msg_box.setIcon(QMessageBox.Icon.Information)
+        msg_box.addButton(QMessageBox.StandardButton.Ok)
+
+        masters_btn = None
+        if all_masters:
+            masters_btn = msg_box.addButton(
+                self.tr("🖼 Open All Masters ({0})").format(len(all_masters)),
+                QMessageBox.ButtonRole.ActionRole
+            )
+        dither_btn = None
+        if sasd_list:
+            dither_btn = msg_box.addButton(
+                self.tr("📊 Open All Dither ({0})").format(len(sasd_list)),
+                QMessageBox.ButtonRole.ActionRole
+            )
+        both_btn = None
+        if all_masters and sasd_list:
+            both_btn = msg_box.addButton(
+                self.tr("🖼 📊 Open Both"), QMessageBox.ButtonRole.ActionRole
+            )
+
+        msg_box.exec()
+        clicked = msg_box.clickedButton()
+        if both_btn is not None and clicked == both_btn:
+            _open_all_masters()
+            _open_all_dither()
+        elif masters_btn is not None and clicked == masters_btn:
+            _open_all_masters()
+        elif dither_btn is not None and clicked == dither_btn:
+            _open_all_dither()
+
+    def _release_reg_set_runtime_memory(self, status_cb=None):
+        """Drop per-set arrays / GPU cache so the next mosaic panel can fit in RAM.
+
+        Integration stores full-frame rejection maps and (when MFDeconv is on)
+        the whole prepass payload on ``self``. Those survive after the masters
+        are written, so a 6-filter 9576×6388 panel can leave several GB
+        resident when set 2 starts measuring.
+
+        Fast-path on the main thread: detach big references from ``self`` (and
+        from the alignment thread) — cheap pointer moves. Slow-path on a
+        daemon sweeper: actual freeing of the numpy buffers, ``gc.collect()``,
+        torch cache release, and glibc ``malloc_trim(0)``. Before this split
+        all four ran synchronously on the main thread and left the UI
+        unresponsive for several seconds after the completion popup was
+        dismissed — enough time to look like SASpro had frozen. The sweeper
+        coalesces rapid back-to-back calls so we don't stack up threads if
+        the user finishes another set while the previous one is still being
+        freed.
+        """
+        import threading as _threading
+
+        log = status_cb or (lambda *_: None)
+        try:
+            n_maps = len(getattr(self, "_rej_maps", {}) or {})
+        except Exception:
+            n_maps = 0
+
+        # ---- Phase 1: FAST detach on the main thread -----------------------
+        # Move each big object into ``to_release`` so it lives only there while
+        # ``self`` gets a small empty replacement. Nothing is actually freed
+        # here — the sweeper below drops ``to_release`` and pays the free()
+        # cost off the main thread.
+        to_release: dict = {}
+
+        def _detach(name, empty):
+            if hasattr(self, name):
+                try:
+                    to_release[name] = getattr(self, name)
+                    setattr(self, name, empty)
+                except Exception:
+                    pass
+
+        for name, empty in (
+            ("_rej_maps", {}),
+            ("_mf_prepass", None),
+            ("_mf_grouped_files", None),
+            ("_mf_transforms_dict", None),
+            ("_mf_results", {}),
+            ("_mf_queue", []),
+            ("_mf_failures", None),
+            ("valid_matrices", {}),
+            ("valid_transforms", {}),
+            ("drizzle_xforms", {}),
+            ("matrix_by_aligned", {}),
+            ("orig_by_aligned", {}),
+            ("_split_drizzle_info", {}),
+            ("_pending_cfa_sparse", {}),
+            ("_upscale_factor_by_orig", {}),
+            ("_orig2norm", {}),
+            ("frame_weights", {}),
+            ("_mf_autocrop_rect", None),
+        ):
+            _detach(name, empty)
+
+        # Alignment thread: keep the QObject-level cleanup on main (Qt
+        # requires deleteLater() to be called from the thread that owns
+        # the object), but hand its large buffers over to the sweeper.
+        th = getattr(self, "alignment_thread", None)
+        if th is not None:
+            for a in (
+                "reference_image_2d", "ref_small_full", "ref_small", "ref_small_ds",
+                "alignment_matrices", "file_key_to_current_path", "drizzle_xforms",
+            ):
+                try:
+                    to_release[f"alignment_thread.{a}"] = getattr(th, a, None)
+                    setattr(th, a, None)
+                except Exception:
+                    pass
+            try:
+                th.deleteLater()
+            except Exception:
+                pass
+            self.alignment_thread = None
+
+        # ---- Phase 2: BACKGROUND sweep (coalesced) -------------------------
+        # Class-level lock + pending list + active flag so overlapping calls
+        # to this method don't spawn multiple sweeper threads. If one is
+        # already running, we just append our payload and let it drain
+        # everything in one final gc / torch / malloc_trim pass.
+        cls = type(self)
+        lock = getattr(cls, "_stacking_sweeper_lock", None)
+        if lock is None:
+            lock = _threading.Lock()
+            cls._stacking_sweeper_lock = lock
+        if not hasattr(cls, "_stacking_sweeper_pending"):
+            cls._stacking_sweeper_pending = []
+        if not hasattr(cls, "_stacking_sweeper_active"):
+            cls._stacking_sweeper_active = False
+
+        with lock:
+            cls._stacking_sweeper_pending.append(to_release)
+            if cls._stacking_sweeper_active:
+                extra = f", {n_maps} rejection map(s)" if n_maps else ""
+                log(self.tr(
+                    "🧹 Releasing previous set runtime buffers{0} (background, coalesced)."
+                ).format(extra))
+                return
+            cls._stacking_sweeper_active = True
+
+        def _sweep():
+            try:
+                while True:
+                    with lock:
+                        batch = list(cls._stacking_sweeper_pending)
+                        cls._stacking_sweeper_pending.clear()
+                        if not batch:
+                            cls._stacking_sweeper_active = False
+                            return
+                    # Drop refs OUTSIDE the lock — this is where numpy free()
+                    # actually runs and where the wall-clock cost lives.
+                    for item in batch:
+                        try:
+                            item.clear()
+                        except Exception:
+                            pass
+                    del batch
+                    try:
+                        import gc as _gc
+                        _gc.collect()
+                    except Exception:
+                        pass
+                    try:
+                        _free_torch_memory()
+                    except Exception:
+                        pass
+                    try:
+                        import ctypes
+                        ctypes.CDLL("libc.so.6").malloc_trim(0)
+                    except Exception:
+                        pass
+            except BaseException:
+                # Never let the sweep bring the app down; clear the active
+                # flag so the next call can start a fresh sweeper.
+                try:
+                    with lock:
+                        cls._stacking_sweeper_active = False
+                except Exception:
+                    pass
+
+        _threading.Thread(
+            target=_sweep,
+            name="StackingRuntimeSweeper",
+            daemon=True,
+        ).start()
+
+        extra = f", {n_maps} rejection map(s)" if n_maps else ""
+        log(self.tr("🧹 Releasing previous set runtime buffers{0} (background).").format(extra))
+
+    def _reg_queue_has_more(self) -> bool:
+        """True if the current set is not the last one in an in-flight queue."""
+        q = getattr(self, "_reg_queue", None)
+        if not q:
+            return False
+        return int(getattr(self, "_reg_queue_pos", 0) or 0) + 1 < len(q)
+
+    def _reg_queue_advance(self):
+        """Advance to the next registration set, or tear the queue down when the
+        last set is done. Returns True if a further set was launched."""
+        if not getattr(self, "_reg_queue", None):
+            return False
+        self._reg_queue_pos += 1
+        if self._reg_queue_pos >= len(self._reg_queue):
+            n = len(self._reg_queue)
+            self._reg_queue = None
+            self._reg_queue_pos = 0
+            self._reg_current_set = None
+            self._reg_current_set_slug = None
+            self._reg_precheck_choice = None
+            self._release_reg_set_runtime_memory(self.update_status)
+            if n > 1:
+                self.update_status(self.tr(f"🎉 All {n} registration sets complete."))
+            self._show_multiset_summary()
+            return False
+        nxt = self._reg_queue[self._reg_queue_pos][0]
+        self.update_status(self.tr(
+            f"➡️ Next set {self._reg_queue_pos + 1}/{len(self._reg_queue)}: '{nxt}'"
+        ))
+        # Drop panel-N arrays before panel N+1 measures / aligns / stacks.
+        self._release_reg_set_runtime_memory(self.update_status)
+        # Busy flag is already cleared by the time a set finishes; re-enter the
+        # normal path, which narrows to the new position without rebuilding.
+        QTimer.singleShot(0, self.register_images)
+        return True
+
+    def _reg_queue_abort(self, reason: str = ""):
+        """Stop a multi-set run without launching further sets."""
+        if getattr(self, "_reg_queue", None):
+            self._reg_queue = None
+            self._reg_queue_pos = 0
+            self._reg_current_set = None
+            self._reg_current_set_slug = None
+            self._reg_precheck_choice = None
+            self._reg_queue_master_paths = []
+            self._release_reg_set_runtime_memory(self.update_status)
+            if reason:
+                self.update_status(self.tr(f"⏹ Multi-set run halted: {reason}"))
 
     def register_images(self):
 
@@ -20097,6 +25510,83 @@ class StackingSuiteDialog(QDialog):
                 self.update_status(self.tr(f"🚫 Excluding {len(dead)} removed frame(s) from registration/stacking."))
                 QApplication.processEvents()
 
+            # ── Registration Sets: build the run queue once, then narrow this
+            #    pass to the current set's frames + reference. A classic run with
+            #    no assignments is just a 1-element "Default" queue == old behavior.
+            self._ensure_default_set()
+            if getattr(self, "_reg_queue", None) is None:
+                self._reg_queue = self._partition_light_files_by_set(self.light_files)
+                self._reg_queue_pos = 0
+                # Fresh run → forget any pre-check choice from a previous run so
+                # the first set that finds registered twins prompts again. The
+                # Quick-tab Full Pipeline opts out of that reset by setting
+                # one of two latches right before it kicks off calibration:
+                #
+                #   `_pipeline_auto_reuse_reg`  → silently reuse any existing
+                #     aligned twins (pre-seed "reuse")
+                #   `_pipeline_force_rereg`     → "Force clean slate" is on,
+                #     silently re-register everything (pre-seed "register_all")
+                #
+                # Both are translated into a pre-seeded `_reg_precheck_choice`
+                # so `_precheck_registered_counterparts` takes the right path
+                # via its existing cached-choice branches instead of popping
+                # a dialog. The latches are mutually exclusive and both are
+                # consumed here so a later manual Register click (even in the
+                # same session) prompts normally again.
+                if getattr(self, "_pipeline_force_rereg", False):
+                    self._reg_precheck_choice = "register_all"
+                    self._pipeline_force_rereg = False
+                    # Clear the sibling flag too in case the pipeline somehow
+                    # set both (defensive — _run_full_pipeline sets only one).
+                    self._pipeline_auto_reuse_reg = False
+                    try:
+                        self.update_status(self.tr(
+                            "🧹 Full Pipeline (clean slate): re-registering "
+                            "every frame — ignoring any existing aligned "
+                            "frames."))
+                    except Exception:
+                        pass
+                elif getattr(self, "_pipeline_auto_reuse_reg", False):
+                    self._reg_precheck_choice = "reuse"
+                    self._pipeline_auto_reuse_reg = False
+                    try:
+                        self.update_status(self.tr(
+                            "⏭️ Full Pipeline: will reuse any existing "
+                            "aligned frames and register only the stragglers."))
+                    except Exception:
+                        pass
+                else:
+                    self._reg_precheck_choice = None
+                self._reg_queue_master_paths = []
+                if len(self._reg_queue) > 1:
+                    self.update_status(self.tr(
+                        f"🧩 {len(self._reg_queue)} registration sets queued: "
+                        + ", ".join(s for s, _ in self._reg_queue)
+                    ))
+            if not self._reg_queue or self._reg_queue_pos >= len(self._reg_queue):
+                self._reg_queue = None
+                self.update_status(self.tr("⚠️ No frames to register."))
+                self._set_registration_busy(False)
+                return
+            _set_name, _set_groups = self._reg_queue[self._reg_queue_pos]
+            self._reg_current_set = _set_name
+            self._reg_current_set_slug = self._slugify_set(_set_name)
+            self.light_files = {g: list(p) for g, p in _set_groups.items()}
+            _cfg = self.reg_sets.get(_set_name, {"reference": None, "locked": False})
+            if _cfg.get("locked") and _cfg.get("reference"):
+                self.reference_frame = os.path.normpath(_cfg["reference"])
+                self._user_ref_locked = True
+                self.update_status(self.tr(
+                    f"📌 Set '{_set_name}': locked reference {os.path.basename(self.reference_frame)}"
+                ))
+            else:
+                self._user_ref_locked = False   # auto-pick the best frame *within this set*
+            if len(self._reg_queue) > 1:
+                _nfr = sum(len(v) for v in self.light_files.values())
+                self.update_status(self.tr(
+                    f"🎬 Set {self._reg_queue_pos + 1}/{len(self._reg_queue)}: "
+                    f"'{_set_name}' — {_nfr} frame(s)"
+                ))
 
             comet_mode = bool(getattr(self, "comet_cb", None) and self.comet_cb.isChecked())
             if comet_mode:
@@ -20136,6 +25626,9 @@ class StackingSuiteDialog(QDialog):
                     self.integrate_registered_images()
                     return
                 if _decision == "cancel":
+                    # Cancel stops the whole run, not just this set — tear the
+                    # multi-set queue down so no further sets launch.
+                    self._reg_queue_abort()
                     self.update_status(self.tr("❌ Registration cancelled."))
                     self._set_registration_busy(False)
                     return
@@ -20160,6 +25653,30 @@ class StackingSuiteDialog(QDialog):
 
             all_files = [f for lst in self.light_files.values() for f in lst]
             self.update_status(self.tr(f"📊 Found {len(all_files)} total frames. Now measuring in parallel batches..."))
+
+            # ── disk-space pre-flight ─────────────────────────────────
+            # Registration writes a Normalized_Images copy AND an Aligned_Images
+            # copy of every frame, each debayered to RGB for CFA/OSC data — so
+            # the budget is 2 × the per-frame debayered size across all frames.
+            # This is by far the biggest disk consumer in the whole pipeline.
+            try:
+                per_set_bytes, _nc, _nf = self._estimate_frames_bytes(
+                    all_files, mode="debayer"
+                )
+                n = len(all_files)
+                if not self._confirm_disk_budget(
+                    self.stacking_directory,
+                    [
+                        (f"Normalized frames (× {n}, 32-bit)", per_set_bytes),
+                        (f"Registered frames (× {n}, 32-bit)", per_set_bytes),
+                    ],
+                    title=self.tr("Register Images — disk space"),
+                ):
+                    self.update_status(self.tr("🛑 Registration cancelled."))
+                    self._set_registration_busy(False)
+                    return
+            except Exception as _dse:
+                self.update_status(self.tr(f"⚠️ Disk-space check skipped: {_dse}"))
 
             # ── binning (FITS/XISF aware) ─────────────────────────────
             bin_map = {}
@@ -20337,7 +25854,7 @@ class StackingSuiteDialog(QDialog):
 
             total = len(all_files)
             done = 0
-            report_every = max(1, total // 100)
+            report_every = max(10, total // 20)   # ~20 updates max; never per-frame
 
             def _ingest(status, fp, payload):
                 # Shared result consumer for both the process and thread paths.
@@ -20382,18 +25899,40 @@ class StackingSuiteDialog(QDialog):
                 if preview is None:
                     return ("noprev", fp, None)
                 try:
-                    mean  = float(np.mean(preview))
-                    pmin  = float(np.nanmin(preview))
-                    med   = float(np.median(preview - pmin))
-                    c, ecc, _blind = _star_count_ecc_size(preview)
-                    size  = self._measure_fwhm_halfres(preview)
-                    noise = self._mad_noise(preview)
+                    # NaN = satellite-trail no-data. Plain np.mean/np.median and the
+                    # cv2 star detector return garbage/NaN on it, which floored the
+                    # frame's weight (Bg=nan). Measure on finite, nonzero pixels; give
+                    # the star detector a NaN-free (background-filled) copy.
+                    preview = np.asarray(preview, dtype=np.float32)
+                    finite  = np.isfinite(preview)
+                    vals    = preview[finite & (preview != 0.0)]
+                    if vals.size == 0:
+                        return ("err", fp, "no finite data in preview")
+                    pmin  = float(np.min(vals))
+                    med   = float(np.median(vals - pmin))
+                    mean  = float(np.mean(vals))
+                    _fill = float(np.median(vals))
+                    preview_filled = np.where(finite, preview, _fill).astype(np.float32, copy=False)
+                    c, ecc, _blind = _star_count_ecc_size(preview_filled)
+                    size  = self._measure_fwhm_halfres(preview_filled)
+                    noise = self._mad_noise(vals)
                     return ("ok", fp, (mean, med, c, ecc, size, noise))
                 except Exception as e:
                     return ("err", fp, f"{type(e).__name__}: {e}")
 
             measured_ok = False
-            if use_processes:
+            # One-shot worker preflight (spawns a single probe process that
+            # imports the scientific stack). If it can't, every real pool would
+            # BrokenProcessPool -> disable process pools for this run and log the
+            # fix. Cached, so measurement / ABE / registration all see the same
+            # decision. Registration reads it via star_alignment._make_executor.
+            try:
+                from setiastro.saspro.worker_env import check_process_pools, process_pools_ok as _pp_ok
+                check_process_pools(log_fn=self.update_status)
+            except Exception:
+                def _pp_ok():
+                    return True
+            if use_processes and _pp_ok():
                 try:
                     import multiprocessing as _mp
                     from setiastro.saspro.stacking_measure_worker import measure_file
@@ -20584,7 +26123,44 @@ class StackingSuiteDialog(QDialog):
             # Register scores borderless raw/calibrated frames (full preview),
             # while Skip Registration scores the border-stripped valid core of
             # already-aligned frames. The scoring math applied is identical.
+            # Exposure-time scaling (linear): multiply each frame's quality
+            # score by exp/max_exp *before* mean-normalisation. For a
+            # single-exposure group every factor is 1.0 (no-op). For a mixed
+            # 120s/300s group the 120s subs end up ~0.4× their quality score
+            # relative to the 300s subs, correcting the hidden "all subs are
+            # equal exposure" assumption in the mean-normalisation that
+            # follows. Mean-normalisation preserves ratios, so a 2.5× raw
+            # advantage survives it as a 2.5× normalised weight. Toggleable
+            # via the "Scale weights by exposure time" checkbox (default on);
+            # disabling it restores the legacy equal-exposure behaviour.
+            _exp_scaling_on = bool(self.settings.value(
+                "stacking/exposure_weighted", True, type=bool
+            ))
+            if _exp_scaling_on:
+                _exp_factors, _exp_max = self._exposure_factors_for_frames(measured_frames)
+            else:
+                _exp_factors, _exp_max = ({fp: 1.0 for fp in measured_frames}, 0.0)
+
             dbg = [f"\n📊 **Frame Weights Debug Log (mode: {_wmode}):**"]
+            if _exp_scaling_on and _exp_max > 0.0:
+                _n_short = sum(1 for f in _exp_factors.values() if f < 0.999)
+                if _n_short > 0:
+                    dbg.append(
+                        f"⏱️ Exposure scaling ON — max exposure in group "
+                        f"{_exp_max:g}s; {_n_short}/{len(measured_frames)} "
+                        f"frame(s) carry < max exposure and will be down-"
+                        f"weighted linearly (120s @ 300s-max → ×0.400 of its "
+                        f"quality score, etc.)."
+                    )
+            elif not _exp_scaling_on:
+                dbg.append(
+                    "⏱️ Exposure scaling OFF — frames weighted purely on "
+                    "quality terms; mixed-exposure groups will over-weight "
+                    "the shorter-exposure subs. Enable in Settings → "
+                    "Frame weighting → \"Scale weights by exposure time\" "
+                    "if that's not what you want."
+                )
+
             raw_scores = {}
             for fp in measured_frames:
                 info = star_counts.get(fp, {"count": 0, "eccentricity": 1.0})
@@ -20598,12 +26174,14 @@ class StackingSuiteDialog(QDialog):
                     count=c, ecc=ecc, bg=bg, fwhm=fwhm, noise=noise,
                     fwhm_ref=_fwhm_ref, noise_ref=_noise_ref, exps=_wexps,
                 )
-                raw_scores[fp] = raw_w
+                exp_f = float(_exp_factors.get(fp, 1.0))
+                scaled_w = raw_w * exp_f
+                raw_scores[fp] = scaled_w
                 dbg.append(
                     f"📂 {os.path.basename(fp)} → StarCount={int(c)}, Ecc={ecc:.4f}, "
                     f"Bg={bg:.4f}, FWHM~{fwhm:.2f}, "
                     f"Sharp={terms['sharp']:.3f}, SNR={terms['snr']:.3f}, "
-                    f"Weight={raw_w:.4f}"
+                    f"ExpScale={exp_f:.3f}, Weight={scaled_w:.4f}"
                 )
 
             score_vals = [v for v in raw_scores.values() if v > 0]
@@ -20637,7 +26215,24 @@ class StackingSuiteDialog(QDialog):
                 f"min={min(self.frame_weights.values()):.3f}, "
                 f"max={max(self.frame_weights.values()):.3f}, "
                 f"mean={float(np.mean(list(self.frame_weights.values()))):.3f}"
-            )) 
+            ))
+
+            # ─────────────────────────────────────────────────────────────
+            # Optional score-outlier sub rejection. Soft reject: rejected
+            # subs have their weight zeroed so integration treats them as
+            # absent, but the source file is untouched — re-running with a
+            # different threshold is just another measurement pass. No-ops
+            # on CPU-only runs, small groups, tightly clustered scores, or
+            # when the user disables the feature in Settings.
+            # ─────────────────────────────────────────────────────────────
+            try:
+                self._apply_sub_rejection(
+                    measured_frames,
+                    star_counts=star_counts,
+                    preview_medians=preview_medians,
+                )
+            except Exception as _e:
+                self.update_status(self.tr(f"⚠️ Sub rejection skipped: {_e}"))
 
             ref_stats_meas = star_counts.get(self.reference_frame, {"count": 0, "eccentricity": 0.0})
             ref_count = ref_stats_meas["count"]
@@ -20675,14 +26270,24 @@ class StackingSuiteDialog(QDialog):
             # Modeless ref review (unchanged)
             stats_payload = {"star_count": ref_count, "eccentricity": ref_ecc, "mean": ref_median}
 
+            _multi_followup = (
+                bool(getattr(self, "_reg_queue", None))
+                and int(getattr(self, "_reg_queue_pos", 0) or 0) > 0
+            )
             if user_ref_locked:
                 self.update_status(self.tr("✅ User reference is locked; skipping reference review dialog."))
                 try:
                     self.ref_frame_path.setText(os.path.basename(self.reference_frame or "") or "No file selected")
                 except Exception:
                     pass
-            elif self.auto_accept_ref_cb.isChecked():
-                self.update_status(self.tr("✅ Auto-accept measured reference is enabled; using the measured best frame."))
+            elif self.auto_accept_ref_cb.isChecked() or _multi_followup:
+                if _multi_followup and not self.auto_accept_ref_cb.isChecked():
+                    self.update_status(self.tr(
+                        "✅ Auto-accepting measured reference for set '{0}' "
+                        "(multi-set run continues without a prompt)."
+                    ).format(getattr(self, "_reg_current_set", "") or ""))
+                else:
+                    self.update_status(self.tr("✅ Auto-accept measured reference is enabled; using the measured best frame."))
                 try:
                     self.ref_frame_path.setText(os.path.basename(self.reference_frame or "") or "No file selected")
                 except Exception:
@@ -20755,6 +26360,92 @@ class StackingSuiteDialog(QDialog):
                     f"B={ref_target_medians_rgb[2]:.6f}"))
             else:
                 ref_target_medians_rgb = None
+
+            # ─────────────────────────────────────────────────────────────
+            # PER-FILTER normalization targets
+            # ─────────────────────────────────────────────────────────────
+            # The single global reference above still defines alignment
+            # geometry + a fallback brightness target. But normalizing EVERY
+            # filter to one reference forces e.g. Ha subs onto a broadband G
+            # reference's sky level, crushing them relative to G. Instead,
+            # record the best-scored frame PER FILTER and give each filter its
+            # own target (luma min-subtracted median + per-channel medians for
+            # OSC) so each filter normalizes to its own best frame. Alignment
+            # geometry is unaffected (still the one global reference).
+            def _compute_norm_target(_dimg):
+                """(target_median, target_min, target_medians_rgb) from a
+                debayered image, mirroring the global-reference semantics."""
+                _L = _Luma(_dimg)
+                _mn = float(np.nanmin(_L))
+                _tmed = float(np.nanmedian(_L - _mn))
+                if isinstance(_dimg, np.ndarray) and _dimg.ndim == 3 and _dimg.shape[-1] == 3:
+                    try:
+                        _sparse = max(float((_dimg[..., _k] == 0.0).mean()) for _k in range(3)) > 0.4
+                    except Exception:
+                        _sparse = False
+                    _rgb = []
+                    for _c in range(3):
+                        _band = _dimg[..., _c].astype(np.float32, copy=False)
+                        if _sparse:
+                            _nz = _band[_band != 0.0]
+                            _rgb.append(float(np.median(_nz)) if _nz.size else 0.0)
+                        else:
+                            _bmin = float(np.nanmin(_band))
+                            _rgb.append(float(np.nanmedian(_band - _bmin)))
+                else:
+                    _rgb = None
+                return _tmed, _mn, _rgb
+
+            # frame -> filter (from THIS set's light_files group keys)
+            self._norm_filter_by_frame = {}
+            for _gk, _flist in (self.light_files or {}).items():
+                try:
+                    _filt, _e, _s = self.parse_group_key(_gk)
+                except Exception:
+                    _filt = "Unknown"
+                _filt = (_filt or "Unknown")
+                for _f in (_flist or []):
+                    self._norm_filter_by_frame[os.path.normpath(_f)] = _filt
+
+            # best-scored frame per filter, then that frame's target
+            self._norm_target_by_filter = {}   # filter -> (t_med, t_min, t_rgb)
+            _best_by_filter = {}               # filter -> (score, fp)
+            for _fp in measured_frames:
+                _filt = self._norm_filter_by_frame.get(os.path.normpath(_fp), "Unknown")
+                try:
+                    _sc = _fast_ref_score(_fp)
+                except Exception:
+                    _sc = -1.0
+                _prev = _best_by_filter.get(_filt)
+                if (_prev is None) or (_sc > _prev[0]):
+                    _best_by_filter[_filt] = (_sc, _fp)
+
+            for _filt, (_sc, _fp) in _best_by_filter.items():
+                try:
+                    _bimg_raw, _bhdr = self._load_image_any(_fp)
+                    if _bimg_raw is None:
+                        continue
+                    _bayer = self._hdr_get(_bhdr, 'BAYERPAT')
+                    _splitdb = bool(self._hdr_get(_bhdr, 'SPLITDB', False))
+                    if _bayer and not _splitdb and (_bimg_raw.ndim == 2 or (_bimg_raw.ndim == 3 and _bimg_raw.shape[-1] == 1)):
+                        _bimg = self.debayer_image(_bimg_raw, _fp, _bhdr)
+                    else:
+                        _bimg = _bimg_raw
+                        if _bimg.ndim == 3 and _bimg.shape[-1] == 1:
+                            _bimg = np.squeeze(_bimg, axis=-1)
+                    _tm, _tmin, _trgb = _compute_norm_target(_bimg)
+                    self._norm_target_by_filter[_filt] = (_tm, _tmin, _trgb)
+                    self.update_status(self.tr(
+                        f"\U0001F4CA Filter '{_filt}' target \u2190 {os.path.basename(_fp)} "
+                        f"(score={_sc:.4f}): norm-median={_tm:.6f}"
+                        + ("" if _trgb is None else
+                           f", RGB=({_trgb[0]:.4f},{_trgb[1]:.4f},{_trgb[2]:.4f})")
+                    ))
+                except Exception as _e:
+                    self.update_status(self.tr(
+                        f"\u26A0\uFE0F Per-filter target failed for '{_filt}' "
+                        f"({os.path.basename(str(_fp))}): {_e}; using global reference target."))
+
             QApplication.processEvents()
             # Store pixscale from reference frame for Dither Analysis
             # Done here unconditionally — works for single-group and multi-group runs
@@ -20828,8 +26519,21 @@ class StackingSuiteDialog(QDialog):
             # ─────────────────────────────────────────────────────────────────────
             # PHASE 1b: Meridian flips
             # ─────────────────────────────────────────────────────────────────────
+            # Two independent signals: the parsed position angle (ANGLE /
+            # ROTATOR / ROTATANG / CD matrix / etc.) AND the pier side
+            # (PIERSIDE / PIER_SIDE / SIDE_OF_PIER). Either is enough on
+            # its own for the per-frame rot180 decision inside _normalize_one.
+            # NINA-generated frames in particular may have only ROTATOR /
+            # ROTATANG (which doesn't change at the flip if the rotator is
+            # pier-mounted) PLUS a reliable PIERSIDE — those frames need
+            # the pierside signal or the whole post-flip half silently
+            # stacks mis-oriented.
             ref_pa = self._extract_pa_deg(ref_hdr)
-            self.update_status(self.tr(f"🧭 Reference PA: {ref_pa:.2f}°" if ref_pa is not None else "🧭 Reference PA: (unknown)"))
+            ref_pierside = self._extract_pierside(ref_hdr)
+            _pa_txt = (f"{ref_pa:.2f}°" if ref_pa is not None else "(unknown)")
+            _ps_txt = (f"{ref_pierside}" if ref_pierside is not None else "(unknown)")
+            self.update_status(self.tr(
+                f"🧭 Reference PA: {_pa_txt}   |   Pier side: {_ps_txt}"))
             QApplication.processEvents()
 
             # ─────────────────────────────────────────────────────────────────────
@@ -21007,6 +26711,38 @@ class StackingSuiteDialog(QDialog):
             io_workers = min(8, max(2, ncpu // 2))
 
             ref_H, ref_W = ref_img.shape[:2] if ref_img.ndim == 2 else ref_img.shape[:2]
+            # When pixel-scale normalization is active, every frame (including the
+            # reference) is resampled to the hi-res target scale. _norm_target_hw
+            # is used by _force_shape_hw below to snap each normalized frame to a
+            # canonical size — if we leave it at the raw reference shape (e.g.
+            # 2822×4144 for a bin 2 ref), the correctly upscaled bin 2 frames
+            # (8288×5644 at bin 1 scale) get center-cropped back to bin 2 size
+            # and the "upscale to bin 1" step is silently reversed. Compute the
+            # post-normalization target shape by applying the ref's own gx/gy to
+            # its raw shape, using the same tol-clamp as the per-frame path so a
+            # ref that's already at target scale stays bit-stable.
+            if do_scale_norm:
+                try:
+                    _ref_psx, _ref_psy = _robust_scale_from_header(ref_hdr)
+                    if _ref_psx and _ref_psy and target_sx and target_sy:
+                        _gx_ref = float(_ref_psx) / float(target_sx)
+                        _gy_ref = float(_ref_psy) / float(target_sy)
+                        if _rel_delta(_gx_ref, 1.0) <= tol:
+                            _gx_ref = 1.0
+                        if _rel_delta(_gy_ref, 1.0) <= tol:
+                            _gy_ref = 1.0
+                        if (_gx_ref != 1.0) or (_gy_ref != 1.0):
+                            _ref_H_new = max(1, int(round(ref_H * _gy_ref)))
+                            _ref_W_new = max(1, int(round(ref_W * _gx_ref)))
+                            self.update_status(self.tr(
+                                f"📐 Normalize target shape {ref_W}×{ref_H} → "
+                                f"{_ref_W_new}×{_ref_H_new} (pixel-scale upscale)"
+                            ))
+                            ref_H, ref_W = _ref_H_new, _ref_W_new
+                except Exception as _e_thw:
+                    self.update_status(self.tr(
+                        f"⚠️ Could not derive post-normalize target shape from ref "
+                        f"({_e_thw}); using raw ref shape {ref_W}×{ref_H}."))
             self._norm_target_hw = (int(ref_H), int(ref_W))
 
             for idx, chunk in enumerate(chunks, 1):
@@ -21025,49 +26761,60 @@ class StackingSuiteDialog(QDialog):
                     gain_lo      = float(self.settings.value("stacking/grad_poly2/gain_lo", 0.20, type=float))
                     gain_hi      = float(self.settings.value("stacking/grad_poly2/gain_hi", 5.0, type=float))
 
-                scaled_images = []; scaled_paths = []; scaled_hdrs = []
+                # scaled_rot180 is parallel to scaled_paths/images/hdrs; it
+                # carries the per-frame "was pre-rotated 180° at normalize"
+                # flag through to the ABE write path so _sync_header_after_rot180
+                # can be invoked there too. Without this parallel list the flag
+                # would die with its _normalize_one local scope and ABE-written
+                # frames would ship with pre-flip WCS/PA keys.
+                scaled_images = []; scaled_paths = []; scaled_hdrs = []; scaled_rot180 = []
 
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 self.update_status(self.tr(f"🌍 Loading {len(chunk)} images in parallel for normalization (up to {io_workers} threads)…"))
-                with ThreadPoolExecutor(max_workers=io_workers) as ex:
-                    futs = {ex.submit(self._load_image_any, fp): fp for fp in chunk}
-                    for fut in as_completed(futs):
-                        if self._cancelled():
-                            raise StackCancelled()
-                        fp = futs[fut]
-                        try:
-                            img, hdr = fut.result()
-                            if img is None:
-                                self.update_status(self.tr(f"⚠️ No data for {fp}"))
-                                continue
+                # Parallel normalize-as-they-arrive: each worker LOADS and NORMALIZES a
+                # frame end-to-end so all cores stay busy. update_status is thread-safe
+                # (queued signal); the debayer path mutates a shared flag so it is
+                # serialized by _debayer_lock (mono skips it -> full parallelism); cv2 is
+                # pinned to 1 thread; processEvents() runs only on the main thread below.
+                import threading as _norm_threading
+                _debayer_lock = _norm_threading.Lock()
+                try:
+                    _cfa_pre = bool(getattr(self, "cfa_drizzle_cb", None) and self.cfa_drizzle_cb.isChecked())
+                except Exception:
+                    _cfa_pre = False
+                self._norm_dbg_on = False
 
-                            self._norm_dbg_seen = getattr(self, "_norm_dbg_seen", 0) + 1
-                            self._norm_dbg_on = (self._norm_dbg_seen <= 0)
-                            _ndbg("00 loaded", img, fp)
+                def _normalize_one(fp):
+                    try:
+                        img, hdr = self._load_image_any(fp)
+                        if img is None:
+                            self.update_status(self.tr(f"⚠️ No data for {fp}"))
+                            return
 
-                            img = _to_writable_f32(img)
-                            _ndbg("01 to_f32", img, fp)
+                        self._norm_dbg_seen = getattr(self, "_norm_dbg_seen", 0) + 1
+                        self._norm_dbg_on = (self._norm_dbg_seen <= 0)
+                        _ndbg("00 loaded", img, fp)
 
-                            bayerish = (
-                                self._hdr_get(hdr, 'BAYERPAT')
-                                or self._hdr_get(hdr, 'CFA_PATTERN')
-                                or self._hdr_get(hdr, 'BAYERPATN')
-                                or self._hdr_get(hdr, 'BAYER_PATTERN')
-                            )
-                            splitdb = bool(self._hdr_get(hdr, 'SPLITDB', False))
+                        img = _to_writable_f32(img)
+                        _ndbg("01 to_f32", img, fp)
 
-                            if bayerish and not splitdb and (img.ndim == 2 or (img.ndim == 3 and img.shape[-1] == 1)):
-                                self.update_status(self.tr(f"📦 Debayering {os.path.basename(fp)}…"))
-                                _cfa_active = (
-                                    bool(self._cfa_for_this_run)
-                                    if getattr(self, "_cfa_for_this_run", None) is not None
-                                    else bool(getattr(self, "cfa_drizzle_cb", None) and self.cfa_drizzle_cb.isChecked())
-                                )
-                                if _cfa_active and (img.ndim == 2 or (img.ndim == 3 and img.shape[-1] == 1)):
-                                    # CFA drizzle: main _n.fit is DENSE (for rejection /
-                                    # per-channel normalization); stash a SPARSE copy for
-                                    # drizzle, written later as _n_cfa.fit.
-                                    _saved_flag = self._cfa_for_this_run
+                        bayerish = (
+                            self._hdr_get(hdr, 'BAYERPAT')
+                            or self._hdr_get(hdr, 'CFA_PATTERN')
+                            or self._hdr_get(hdr, 'BAYERPATN')
+                            or self._hdr_get(hdr, 'BAYER_PATTERN')
+                        )
+                        splitdb = bool(self._hdr_get(hdr, 'SPLITDB', False))
+
+                        if bayerish and not splitdb and (img.ndim == 2 or (img.ndim == 3 and img.shape[-1] == 1)):
+                            self.update_status(self.tr(f"📦 Debayering {os.path.basename(fp)}…"))
+                            _cfa_active = _cfa_pre
+                            if _cfa_active and (img.ndim == 2 or (img.ndim == 3 and img.shape[-1] == 1)):
+                                # CFA drizzle: main _n.fit is DENSE (for rejection /
+                                # per-channel normalization); stash a SPARSE copy for
+                                # drizzle, written later as _n_cfa.fit.
+                                _saved_flag = self._cfa_for_this_run
+                                with _debayer_lock:
                                     try:
                                         self._cfa_for_this_run = True
                                         _img_sparse = self.debayer_image(img.copy(), fp, dict(hdr) if hasattr(hdr, "keys") else hdr)
@@ -21075,210 +26822,330 @@ class StackingSuiteDialog(QDialog):
                                         img = self.debayer_image(img, fp, hdr)
                                     finally:
                                         self._cfa_for_this_run = _saved_flag
-                                    if not hasattr(self, "_pending_cfa_sparse"):
-                                        self._pending_cfa_sparse = {}
-                                    self._pending_cfa_sparse[os.path.normcase(os.path.normpath(fp))] = _img_sparse
-                                else:
+                                if not hasattr(self, "_pending_cfa_sparse"):
+                                    self._pending_cfa_sparse = {}
+                                self._pending_cfa_sparse[os.path.normcase(os.path.normpath(fp))] = _img_sparse
+                            else:
+                                with _debayer_lock:
                                     img = self.debayer_image(img, fp, hdr)
-                            else:
-                                if img.ndim == 3 and img.shape[-1] == 1:
-                                    img = np.squeeze(img, axis=-1)
+                        else:
+                            if img.ndim == 3 and img.shape[-1] == 1:
+                                img = np.squeeze(img, axis=-1)
 
-                            _ndbg("02 debayer", img, fp)
+                        _ndbg("02 debayer", img, fp)
 
-                            # meridian flip assist
-                            if self.auto_rot180 and ref_pa is not None:
-                                pa = self._extract_pa_deg(hdr)
-                                img, did = self._maybe_rot180(img, pa, ref_pa, self.auto_rot180_tol_deg)
-                                if did:
-                                    self.update_status(self.tr(f"↻ 180° rotate (PA Δ≈180°): {os.path.basename(fp)}"))
+                        # ─────────────────────────────────────────────────────────────
+                        # Meridian-flip pre-rotation (restored).
+                        #
+                        # Astroalign's asterism matching DOES find correct ~180°
+                        # correspondences for a meridian-flipped frame, but the
+                        # downstream similarity LS fit carries a fractional-degree
+                        # rotation residual pulled by sub-pixel centroid noise, and
+                        # the Lanczos warp of that near-180° rotation then imprints a
+                        # position-dependent PSF variation per frame that stacks into
+                        # visible ghosting on flipped halves (see m17 OIII, 2026-07-09).
+                        # A bit-exact np.rot90(img, 2) collapses the warp to a
+                        # sub-pixel residual, which the resampler handles cleanly and
+                        # uniformly across the stack.
+                        #
+                        # The reason this was removed earlier — "pre-rotating the
+                        # pixels desynced the WCS/PA header" — is handled below:
+                        # when we write the normalized frame we also run
+                        # self._sync_header_after_rot180(orig_header, img.shape),
+                        # which flips CRPIX1/2 to the opposite corner, negates the
+                        # CD/PC matrix (R180 = -I), adds 180° to ANGLE/POSANGLE/
+                        # ROTSKYPA/ROTANGLE/CROTA, toggles FLIPPED, and stamps
+                        # SASROT180=True so any later stage knows. CRVAL stays
+                        # unchanged by construction (CRPIX moved to the diametric
+                        # opposite point, which still names the same sky position).
+                        # The write stage, not the detection stage, is where the
+                        # WCS/PA desync used to leak.
+                        #
+                        # star_alignment.py has its own silent meridian-flip wrapper
+                        # (pass 0 of refinement, bit-exact rot90, composed matrix),
+                        # which handles cases where the FITS header lacks ANGLE/
+                        # POSANGLE or lies about it. Doing BOTH is safe: once we
+                        # pre-rotate here the solver sees a near-identity transform
+                        # and its own 180° branch won't trigger. This is the belt
+                        # on top of the suspenders — cheaper, header-aware, and the
+                        # right place because the normalized file written here is
+                        # also what plate-solve/annotate read from.
+                        # ─────────────────────────────────────────────────────────────
+                        _pre_rotated_180 = False
+                        try:
+                            if bool(getattr(self, "auto_rot180", True)):
+                                pa_cur = self._extract_pa_deg(hdr)
+                                # PIERSIDE is the second signal — critical for
+                                # NINA frames where the rotator is on the mount
+                                # side of the pier and the parsed angle doesn't
+                                # change at the flip. See _maybe_rot180 docs.
+                                ps_cur = self._extract_pierside(hdr)
+                                tol_deg = float(getattr(self, "auto_rot180_tol_deg", 89.0))
+                                img, _pre_rotated_180 = self._maybe_rot180(
+                                    img, pa_cur, ref_pa, tol_deg,
+                                    ps_cur=ps_cur, ps_ref=ref_pierside)
+                                if _pre_rotated_180:
+                                    _ndbg("02b rot180", img, fp)
+                                    # The CFA drizzle sparse sibling was built
+                                    # BEFORE this rotation. Rotate it too, so the
+                                    # dense (_n.fit) and sparse (_n_cfa.fit) frames
+                                    # share the same geometry — otherwise drizzle
+                                    # would deposit flipped-vs-non-flipped planes
+                                    # on this frame and smear point sources.
                                     try:
-                                        if hasattr(hdr, "__setitem__"):
-                                            hdr['ROT180'] = (True, 'Rotated 180° pre-align by SAS')
+                                        _cfa_key = os.path.normcase(os.path.normpath(fp))
+                                        if hasattr(self, "_pending_cfa_sparse"):
+                                            _spk = self._pending_cfa_sparse.get(_cfa_key, None)
+                                            if _spk is not None:
+                                                self._pending_cfa_sparse[_cfa_key] = \
+                                                    np.ascontiguousarray(np.rot90(_spk, 2))
                                     except Exception:
+                                        # Non-fatal — only impacts CFA drizzle users
+                                        # on this particular meridian-flipped frame.
                                         pass
+                        except Exception as _e_rot:
+                            # Rotation is best-effort — never block normalization.
+                            self.update_status(self.tr(
+                                f"⚠️ Meridian-flip check failed for {os.path.basename(fp)}: {_e_rot}"))
+                            _pre_rotated_180 = False
 
-                            # --- ONE geometry normalization path ---
-                            if do_scale_norm:
-                                # We normalize to physical pixel scale (arcsec/px) → this ALSO compensates binning,
-                                # so we must NOT pre-resample to target bin.
-                                raw_psx, raw_psy = _robust_scale_from_header(hdr)  # arcsec/px as shot
-                                if raw_psx and raw_psy and target_sx and target_sy:
-                                    gx = float(raw_psx) / float(target_sx)
-                                    gy = float(raw_psy) / float(target_sy)
-                                    # clamp tiny jitter
-                                    if _rel_delta(gx, 1.0) <= tol:
-                                        gx = 1.0
-                                    if _rel_delta(gy, 1.0) <= tol:
-                                        gy = 1.0
-                                    if (gx != 1.0) or (gy != 1.0):
-                                        before_hw = img.shape[:2]
-                                        img = _resize_to_scale(img, gx, gy)
-                                        after_hw = img.shape[:2]
-                                        self.update_status(self.tr(
-                                            f"📏 Pixel-scale normalize {raw_psx:.3f}\"/{raw_psy:.3f}\" → "
-                                            f"{target_sx:.3f}\"/{target_sy:.3f}\" | "
-                                            f"size {before_hw[1]}×{before_hw[0]} → {after_hw[1]}×{after_hw[0]}"
-                                        ))
-                                        if not hasattr(self, "_upscale_factor_by_orig"):
-                                            self._upscale_factor_by_orig = {}
-                                        self._upscale_factor_by_orig[
-                                            os.path.normcase(os.path.normpath(fp))
-                                        ] = (gx, gy)
-                            else:
-                                # We are NOT doing physical/pixel-scale normalization (single group, within tol).
-                                # In that case we ONLY need to unify binning → simple pixel resample.
-                                xb, yb = bin_map.get(fp, (1, 1))
-                                sx = float(xb) / float(target_xbin)
-                                sy = float(yb) / float(target_ybin)
-                                if (abs(sx - 1.0) > 1e-6) or (abs(sy - 1.0) > 1e-6):
-                                    before = img.shape[:2]
-                                    img = _resize_to_scale(img, sx, sy)
-                                    after = img.shape[:2]
+                        # --- ONE geometry normalization path ---
+                        if do_scale_norm:
+                            # We normalize to physical pixel scale (arcsec/px) → this ALSO compensates binning,
+                            # so we must NOT pre-resample to target bin.
+                            raw_psx, raw_psy = _robust_scale_from_header(hdr)  # arcsec/px as shot
+                            if raw_psx and raw_psy and target_sx and target_sy:
+                                gx = float(raw_psx) / float(target_sx)
+                                gy = float(raw_psy) / float(target_sy)
+                                # clamp tiny jitter
+                                if _rel_delta(gx, 1.0) <= tol:
+                                    gx = 1.0
+                                if _rel_delta(gy, 1.0) <= tol:
+                                    gy = 1.0
+                                if (gx != 1.0) or (gy != 1.0):
+                                    before_hw = img.shape[:2]
+                                    img = _resize_to_scale(img, gx, gy)
+                                    after_hw = img.shape[:2]
                                     self.update_status(self.tr(
-                                        f"🔧 Resampled for binning {xb}×{yb} → {target_xbin}×{target_ybin} "
-                                        f"size {before[1]}×{before[0]} → {after[1]}×{after[0]}"
+                                        f"📏 Pixel-scale normalize {raw_psx:.3f}\"/{raw_psy:.3f}\" → "
+                                        f"{target_sx:.3f}\"/{target_sy:.3f}\" | "
+                                        f"size {before_hw[1]}×{before_hw[0]} → {after_hw[1]}×{after_hw[0]}"
                                     ))
                                     if not hasattr(self, "_upscale_factor_by_orig"):
                                         self._upscale_factor_by_orig = {}
                                     self._upscale_factor_by_orig[
                                         os.path.normcase(os.path.normpath(fp))
-                                    ] = (sx, sy)
-                            _ndbg("03 geom", img, fp)
+                                    ] = (gx, gy)
+                        else:
+                            # We are NOT doing physical/pixel-scale normalization (single group, within tol).
+                            # In that case we ONLY need to unify binning → simple pixel resample.
+                            xb, yb = bin_map.get(fp, (1, 1))
+                            sx = float(xb) / float(target_xbin)
+                            sy = float(yb) / float(target_ybin)
+                            if (abs(sx - 1.0) > 1e-6) or (abs(sy - 1.0) > 1e-6):
+                                before = img.shape[:2]
+                                img = _resize_to_scale(img, sx, sy)
+                                after = img.shape[:2]
+                                self.update_status(self.tr(
+                                    f"🔧 Resampled for binning {xb}×{yb} → {target_xbin}×{target_ybin} "
+                                    f"size {before[1]}×{before[0]} → {after[1]}×{after[0]}"
+                                ))
+                                if not hasattr(self, "_upscale_factor_by_orig"):
+                                    self._upscale_factor_by_orig = {}
+                                self._upscale_factor_by_orig[
+                                    os.path.normcase(os.path.normpath(fp))
+                                ] = (sx, sy)
+                        _ndbg("03 geom", img, fp)
 
-                            # 3) Brightness normalization / scale refine
-                            pm = float(preview_medians.get(fp, 0.0))
-                            if (ref_target_medians_rgb is not None
-                                    and img.ndim == 3 and img.shape[-1] == 3):
-                                # OSC: normalize each channel independently to
-                                # the reference's matching channel. A single
-                                # luma scale cannot correct color-varying sky
-                                # (LP drift, moonlight, airmass reddening), and
-                                # the leftover per-channel offsets between
-                                # frames weaken per-channel rejection.
-                                #
-                                # CFA-drizzle frames are SPARSE: each channel is
-                                # populated only at its Bayer sites (R~25%,
-                                # G~50%, B~25%), the rest are structural zeros.
-                                # Measuring the median across all pixels then
-                                # gives 0 for R/B and crushes those channels, so
-                                # for sparse frames we measure the median over
-                                # POPULATED pixels only and never add a pedestal
-                                # (structural zeros must stay exactly 0).
+                        # 3) Brightness normalization / scale refine
+                        pm = float(preview_medians.get(fp, 0.0))
+                        # Resolve this frame's PER-FILTER target (falls back to
+                        # the global reference target when unavailable).
+                        _pf_tgt = None
+                        try:
+                            _pf_tgt = self._norm_target_by_filter.get(
+                                self._norm_filter_by_frame.get(os.path.normpath(fp)))
+                        except Exception:
+                            _pf_tgt = None
+                        if _pf_tgt is not None:
+                            _tgt_med, _tgt_min, _tgt_rgb = _pf_tgt
+                        else:
+                            _tgt_med, _tgt_min, _tgt_rgb = ref_target_median, ref_min, ref_target_medians_rgb
+                        if (_tgt_rgb is not None
+                                and img.ndim == 3 and img.shape[-1] == 3):
+                            # OSC: normalize each channel independently to
+                            # the reference's matching channel. A single
+                            # luma scale cannot correct color-varying sky
+                            # (LP drift, moonlight, airmass reddening), and
+                            # the leftover per-channel offsets between
+                            # frames weaken per-channel rejection.
+                            #
+                            # CFA-drizzle frames are SPARSE: each channel is
+                            # populated only at its Bayer sites (R~25%,
+                            # G~50%, B~25%), the rest are structural zeros.
+                            # Measuring the median across all pixels then
+                            # gives 0 for R/B and crushes those channels, so
+                            # for sparse frames we measure the median over
+                            # POPULATED pixels only and never add a pedestal
+                            # (structural zeros must stay exactly 0).
+                            _cfa_sparse_frame = False
+                            try:
+                                _zfr = [float((img[..., _k] == 0.0).mean()) for _k in range(3)]
+                                _cfa_sparse_frame = max(_zfr) > 0.4
+                            except Exception:
                                 _cfa_sparse_frame = False
-                                try:
-                                    _zfr = [float((img[..., _k] == 0.0).mean()) for _k in range(3)]
-                                    _cfa_sparse_frame = max(_zfr) > 0.4
-                                except Exception:
-                                    _cfa_sparse_frame = False
 
-                                _ch_dbg = []
-                                for _c in range(3):
-                                    if _cfa_sparse_frame:
-                                        _plane = img[..., _c]
-                                        _nz = _plane[_plane != 0.0]
-                                        if _nz.size == 0:
+                            _ch_dbg = []
+                            for _c in range(3):
+                                if _cfa_sparse_frame:
+                                    _plane = img[..., _c]
+                                    _nz = _plane[np.isfinite(_plane) & (_plane != 0.0)]
+                                    if _nz.size == 0:
+                                        _s_c, _off_c = 1.0, 0.0
+                                    else:
+                                        _med = float(np.median(_nz))
+                                        if (not np.isfinite(_med)) or _med <= 1e-30:
                                             _s_c, _off_c = 1.0, 0.0
                                         else:
-                                            _med = float(np.median(_nz))
-                                            if (not np.isfinite(_med)) or _med <= 1e-30:
-                                                _s_c, _off_c = 1.0, 0.0
-                                            else:
-                                                _s_c = float(ref_target_medians_rgb[_c] / _med)
-                                                _off_c = 0.0
-                                        # apply scale to populated pixels only;
-                                        # structural zeros stay exactly 0
-                                        _m = img[..., _c] != 0.0
-                                        img[..., _c][_m] = img[..., _c][_m] * _s_c
-                                    else:
-                                        _s_c, _off_c = _compute_scale(
-                                            ref_target_medians_rgb[_c],
-                                            pm if pm > 0 else 1.0,
-                                            img[..., _c],
-                                            refine_stride=8,
-                                            refine_if_rel_err=0.10,
-                                            return_offset=True,
-                                        )
-                                        img[..., _c] = _apply_scale_inplace(img[..., _c], _s_c, offset=_off_c)
-                                    _ch_dbg.append(f"{'RGB'[_c]}: s={_s_c:.6g} off={_off_c:.6g}")
-                                if getattr(self, "_norm_dbg_on", False):
-                                    self.update_status(
-                                        f"🔬[04 scale-args] {os.path.basename(fp)} per-channel"
-                                        + (" [sparse/CFA]" if _cfa_sparse_frame else "") + "  "
-                                        + "  ".join(_ch_dbg)
-                                    )
-                            else:
-                                s, offset = _compute_scale(
-                                    ref_target_median,
-                                    pm if pm > 0 else 1.0,
-                                    img,
-                                    refine_stride=8,
-                                    refine_if_rel_err=0.10,
-                                    return_offset=True,
-                                )
-                                if getattr(self, "_norm_dbg_on", False):
-                                    self.update_status(
-                                        f"🔬[04 scale-args] {os.path.basename(fp)} "
-                                        f"ref_target_median={ref_target_median:.6g} pm={pm:.6g} "
-                                        f"→ s={s:.6g} offset={offset:.6g}"
-                                    )
-                                img = _apply_scale_inplace(img, s, offset=offset)
-                            _ndbg("05 after-scale", img, fp)
-
-                            # 🔒 4) Enforce canonical geometry BEFORE ABE / writing
-                            if hasattr(self, "_norm_target_hw") and self._norm_target_hw:
-                                img = _force_shape_hw(img, *self._norm_target_hw)
-                            _ndbg("06 force_hw", img, fp)
-
-                            if abe_enabled:
-                                scaled_images.append(img.astype(np.float32, copy=False))
-                                scaled_paths.append(fp)
-                                scaled_hdrs.append(hdr)
-                            else:
-                                # write out normalized FITS
-                                out_path = _norm_out_name(fp, norm_dir)
-
-                                try:
-                                    if os.path.splitext(fp)[1].lower() in (".fits", ".fit", ".fz"):
-                                        orig_header = fits.getheader(fp, ext=0)
-                                    else:
-                                        orig_header = fits.Header()
-                                except Exception:
-                                    orig_header = fits.Header()
-
-                                if isinstance(img, np.ndarray) and img.ndim == 3 and img.shape[-1] == 3:
-                                    orig_header["DEBAYERED"] = (True, "Color debayered normalized")
+                                            _s_c = float(_tgt_rgb[_c] / _med)
+                                            _off_c = 0.0
+                                    # apply scale to populated pixels only;
+                                    # structural zeros stay exactly 0
+                                    _m = img[..., _c] != 0.0
+                                    img[..., _c][_m] = img[..., _c][_m] * _s_c
                                 else:
-                                    orig_header["DEBAYERED"] = (False, "Mono normalized")
+                                    # Additive per-channel background match (nan-safe),
+                                    # mirroring the mono fix. Pure multiplicative scaling does
+                                    # NOT equalize an additive sky pedestal across sessions, so
+                                    # multi-night OSC would band exactly like mono did. NaN
+                                    # (satellite no-data) is preserved through the shift.
+                                    _pl   = img[..., _c]
+                                    _finc = _pl[np.isfinite(_pl) & (_pl != 0.0)]
+                                    _bg_c = float(np.median(_finc)) if _finc.size else 0.0
+                                    _tgt_c = float(_tgt_rgb[_c])
+                                    img[..., _c] = (_pl - _bg_c + _tgt_c).astype(np.float32, copy=False)
+                                    _s_c, _off_c = 1.0, float(_tgt_c - _bg_c)
+                                _ch_dbg.append(f"{'RGB'[_c]}: bg_shift={_off_c:.6g}")
+                            if getattr(self, "_norm_dbg_on", False):
+                                self.update_status(
+                                    f"🔬[04 scale-args] {os.path.basename(fp)} per-channel"
+                                    + (" [sparse/CFA]" if _cfa_sparse_frame else "") + "  "
+                                    + "  ".join(_ch_dbg)
+                                )
+                        else:
+                            # Additive background matching (nan-safe).
+                            # _compute_scale is purely MULTIPLICATIVE (s = target/median);
+                            # that equalizes signal above the floor but does NOT equalize an
+                            # additive sky pedestal, so subs from different-brightness sessions
+                            # landed at different background levels -> the 'trail' deficits in
+                            # the master. Subtract each frame's own background and re-level to
+                            # the reference sky, exactly like the standalone bgmatch that fixed
+                            # it. NaN (satellite no-data) is preserved through the shift.
+                            _fin = img[np.isfinite(img) & (img != 0.0)]
+                            _frame_bg = float(np.median(_fin)) if _fin.size else 0.0
+                            _target_bg = float(_tgt_med + _tgt_min)   # per-filter sky level
+                            img = (img - _frame_bg + _target_bg).astype(np.float32, copy=False)
+                            if getattr(self, "_norm_dbg_on", False):
+                                self.update_status(
+                                    f"🔬[04 bg-match] {os.path.basename(fp)} "
+                                    f"frame_bg={_frame_bg:.6g} target_bg={_target_bg:.6g}"
+                                )
+                        _ndbg("05 after-scale", img, fp)
 
-                                from os import path
-                                _key = path.normcase(path.normpath(fp))
-                                _val = path.normpath(out_path)
-                                self._orig2norm[_key] = _val
-                                _ndbg("07 pre-write", img, fp)
-                                fits.PrimaryHDU(data=img.astype(np.float32), header=orig_header).writeto(out_path, overwrite=True)
-                                normalized_files.append(out_path)
-                                # CFA drizzle: also write the sparse sibling for the
-                                # drizzle deposit (rejection uses the dense out_path).
-                                _cfa_key = os.path.normcase(os.path.normpath(fp))
-                                _cfa_sparse = getattr(self, "_pending_cfa_sparse", {}).pop(_cfa_key, None) if hasattr(self, "_pending_cfa_sparse") else None
-                                if _cfa_sparse is not None:
-                                    try:
-                                        _cfa_out = self._cfa_sibling_path(out_path)
-                                        _ch = fits.Header(orig_header)
-                                        _ch["DEBAYERED"] = (True, "Sparse CFA drizzle debayer")
-                                        _ch["CFADRIZ"] = (True, "Sparse CFA planes for drizzle deposit")
-                                        fits.PrimaryHDU(data=np.asarray(_cfa_sparse, np.float32), header=_ch).writeto(_cfa_out, overwrite=True)
-                                    except Exception as _e:
-                                        self.update_status(self.tr(f"⚠️ Failed to write CFA sparse sibling: {_e}"))
-                                # Carry the satellite-trail mask sidecar onto the
-                                # normalized frame so registration can find + warp it.
-                                _carry_satmask_sidecar(fp, out_path, log_fn=self.update_status)
+                        # 🔒 4) Enforce canonical geometry BEFORE ABE / writing
+                        if hasattr(self, "_norm_target_hw") and self._norm_target_hw:
+                            img = _force_shape_hw(img, *self._norm_target_hw)
+                        _ndbg("06 force_hw", img, fp)
 
-                        except Exception as e:
-                            self.update_status(self.tr(f"⚠️ Error normalizing {fp}: {e}"))
-                        finally:
-                            QApplication.processEvents()
+                        if abe_enabled:
+                            scaled_images.append(img.astype(np.float32, copy=False))
+                            scaled_paths.append(fp)
+                            scaled_hdrs.append(hdr)
+                            # Carry the rot180 flag out of this worker's local
+                            # scope so the ABE write stage can sync the header
+                            # the same way the inline write path does.
+                            scaled_rot180.append(bool(_pre_rotated_180))
+                        else:
+                            # write out normalized FITS
+                            out_path = _norm_out_name(fp, norm_dir)
+
+                            try:
+                                if os.path.splitext(fp)[1].lower() in (".fits", ".fit", ".fz"):
+                                    orig_header = fits.getheader(fp, ext=0)
+                                else:
+                                    orig_header = fits.Header()
+                            except Exception:
+                                orig_header = fits.Header()
+
+                            if isinstance(img, np.ndarray) and img.ndim == 3 and img.shape[-1] == 3:
+                                orig_header["DEBAYERED"] = (True, "Color debayered normalized")
+                            else:
+                                orig_header["DEBAYERED"] = (False, "Mono normalized")
+
+                            # Sync the header to the rotated pixels before writing
+                            # (CRPIX / CD / PC / ANGLE / POSANGLE / FLIPPED / sentinel).
+                            # Without this, every downstream reader of the _n file
+                            # (plate solve, annotate, a second normalization pass)
+                            # would see a header still describing the pre-flip
+                            # orientation. See _sync_header_after_rot180 for details.
+                            if _pre_rotated_180:
+                                try:
+                                    self._sync_header_after_rot180(orig_header, img.shape)
+                                except Exception as _e_hdr:
+                                    self.update_status(self.tr(
+                                        f"⚠️ WCS/PA header sync after rot180 failed for "
+                                        f"{os.path.basename(fp)}: {_e_hdr}"))
+
+                            from os import path
+                            _key = path.normcase(path.normpath(fp))
+                            _val = path.normpath(out_path)
+                            self._orig2norm[_key] = _val
+                            _ndbg("07 pre-write", img, fp)
+                            fits.PrimaryHDU(data=img.astype(np.float32), header=orig_header).writeto(out_path, overwrite=True)
+                            normalized_files.append(out_path)
+                            # CFA drizzle: also write the sparse sibling for the
+                            # drizzle deposit (rejection uses the dense out_path).
+                            _cfa_key = os.path.normcase(os.path.normpath(fp))
+                            _cfa_sparse = getattr(self, "_pending_cfa_sparse", {}).pop(_cfa_key, None) if hasattr(self, "_pending_cfa_sparse") else None
+                            if _cfa_sparse is not None:
+                                try:
+                                    _cfa_out = self._cfa_sibling_path(out_path)
+                                    _ch = fits.Header(orig_header)
+                                    _ch["DEBAYERED"] = (True, "Sparse CFA drizzle debayer")
+                                    _ch["CFADRIZ"] = (True, "Sparse CFA planes for drizzle deposit")
+                                    fits.PrimaryHDU(data=np.asarray(_cfa_sparse, np.float32), header=_ch).writeto(_cfa_out, overwrite=True)
+                                except Exception as _e:
+                                    self.update_status(self.tr(f"⚠️ Failed to write CFA sparse sibling: {_e}"))
+                            # Carry the satellite-trail mask sidecar onto the
+                            # normalized frame so registration can find + warp it.
+                            _carry_satmask_sidecar(fp, out_path, log_fn=self.update_status)
+
+                    except Exception as e:
+                        self.update_status(self.tr(f"⚠️ Error normalizing {fp}: {e}"))
+
+                with ThreadPoolExecutor(max_workers=io_workers) as ex:
+                    _prev_cv2n = None
+                    try:
+                        import cv2 as _cv2n
+                        _prev_cv2n = _cv2n.getNumThreads(); _cv2n.setNumThreads(1)
+                    except Exception:
+                        pass
+                    futs = {ex.submit(_normalize_one, fp): fp for fp in chunk}
+                    for fut in as_completed(futs):
+                        if self._cancelled():
+                            raise StackCancelled()
+                        try:
+                            fut.result()
+                        except StackCancelled:
+                            raise
+                        except Exception as _e:
+                            self.update_status(self.tr(f"⚠️ Error normalizing (worker): {_e}"))
+                        QApplication.processEvents()
+                    try:
+                        if _prev_cv2n is not None:
+                            _cv2n.setNumThreads(_prev_cv2n)
+                    except Exception:
+                        pass
 
                 # 2) ABE with canonical size lock
                 if abe_enabled and scaled_images:
@@ -21289,22 +27156,20 @@ class StackingSuiteDialog(QDialog):
                     ))
                     QApplication.processEvents()
 
-                    abe_stack = np.ascontiguousarray(np.stack(scaled_images, axis=0, dtype=np.float32))
-                    abe_stack = remove_gradient_stack_abe(
-                        abe_stack,
-                        target_hw=getattr(self, "_norm_target_hw", None),  # 🔒 enforce (H,W) for every frame
-                        mode=mode,
-                        num_samples=samples,
-                        downsample=downsample,
-                        patch_size=patch_size,
-                        min_strength=min_strength,
-                        gain_clip=(gain_lo, gain_hi),
-                        log_fn=(self._ui_log if hasattr(self, "_ui_log") else self.update_status),
-                    )
-                    QApplication.processEvents()
-
+                    # File-based ABE: write the normalized (pre-ABE) frames, then
+                    # run poly2 ABE over them in a process pool (rewrites each _n
+                    # in place) -- no GIL, no big-array IPC, all cores. Header /
+                    # _orig2norm / CFA-sparse handling is unchanged (pre-ABE).
+                    _abe_paths = []
                     for i, fp in enumerate(scaled_paths):
-                        img_out = abe_stack[i]; hdr = scaled_hdrs[i]
+                        img_out = scaled_images[i]; hdr = scaled_hdrs[i]
+                        # Was this frame rotated 180° at normalize time? If so,
+                        # the orig_header we just loaded from the RAW file still
+                        # describes the pre-flip orientation and needs the same
+                        # CRPIX / CD / angle sync the inline write path applies.
+                        _pre_rotated_180_i = bool(
+                            scaled_rot180[i] if i < len(scaled_rot180) else False
+                        )
                         out_path = _norm_out_name(fp, norm_dir)
 
                         try:
@@ -21317,12 +27182,21 @@ class StackingSuiteDialog(QDialog):
                         else:
                             orig_header["DEBAYERED"] = (False, "Mono normalized")
 
+                        if _pre_rotated_180_i:
+                            try:
+                                self._sync_header_after_rot180(orig_header, img_out.shape)
+                            except Exception as _e_hdr:
+                                self.update_status(self.tr(
+                                    f"⚠️ WCS/PA header sync after rot180 failed (ABE) for "
+                                    f"{os.path.basename(fp)}: {_e_hdr}"))
+
                         from os import path
                         _key = path.normcase(path.normpath(fp))
                         _val = path.normpath(out_path)
                         self._orig2norm[_key] = _val
                         fits.PrimaryHDU(data=img_out.astype(np.float32), header=orig_header).writeto(out_path, overwrite=True)
                         normalized_files.append(out_path)
+                        _abe_paths.append(out_path)
                         # CFA drizzle: also write the sparse sibling (ABE path).
                         _cfa_key = os.path.normcase(os.path.normpath(fp))
                         _cfa_sparse = getattr(self, "_pending_cfa_sparse", {}).pop(_cfa_key, None) if hasattr(self, "_pending_cfa_sparse") else None
@@ -21338,6 +27212,42 @@ class StackingSuiteDialog(QDialog):
                         # Carry the satellite-trail mask sidecar onto the
                         # normalized frame so registration can find + warp it.
                         _carry_satmask_sidecar(fp, out_path, log_fn=self.update_status)
+
+                    # ---- poly2 ABE over the just-written _n frames ----
+                    try:
+                        from setiastro.saspro.gradient_abe import run_abe_files_parallel, abe_one_file
+                        try:
+                            from setiastro.saspro.worker_env import process_pools_ok as _pp_ok
+                            _abe_pp = _pp_ok()
+                        except Exception:
+                            _abe_pp = True
+                        _abe_kw = dict(mode=mode, num_samples=samples, downsample=downsample,
+                                       patch_size=patch_size, min_strength=min_strength,
+                                       gain_clip=(gain_lo, gain_hi))
+                        _abe_thw = getattr(self, "_norm_target_hw", None)
+                        if _abe_pp:
+                            _n_ok, _n_skip, _n_err = run_abe_files_parallel(
+                                _abe_paths, kw=_abe_kw, target_hw=_abe_thw,
+                                log_fn=self.update_status,
+                            )
+                        else:
+                            # Broken worker env: run ABE single-process (still
+                            # removes gradients, just not across cores).
+                            _n_ok = _n_skip = _n_err = 0
+                            for _i, _p in enumerate(_abe_paths, 1):
+                                _st, _pp, _er = abe_one_file((_p, _abe_kw, _abe_thw))
+                                if _st == "ok":
+                                    _n_ok += 1
+                                elif _st == "skip":
+                                    _n_skip += 1
+                                else:
+                                    _n_err += 1
+                                self.update_status(self.tr(f"🌈 ABE (1-proc) {_i}/{len(_abe_paths)}"))
+                        self.update_status(self.tr(
+                            f"Gradient removal complete: {_n_ok} ok, {_n_skip} skipped, {_n_err} error(s)."))
+                    except Exception as _abe_e:
+                        self.update_status(self.tr(f"⚠️ ABE pass failed: {_abe_e}"))
+                    QApplication.processEvents()
 
             # restore OpenCV threads
             try:
@@ -21384,8 +27294,13 @@ class StackingSuiteDialog(QDialog):
             # ─────────────────────────────────────────────────────────────────────
             # Start alignment on the normalized files
             # ─────────────────────────────────────────────────────────────────────
-            align_dir = os.path.join(self.stacking_directory, "Aligned_Images")
+            if getattr(self, "_reg_current_set", "Default") and self._reg_current_set != "Default":
+                align_dir = os.path.join(self.stacking_directory, "Aligned_Images",
+                                         self._reg_current_set_slug or self._slugify_set(self._reg_current_set))
+            else:
+                align_dir = os.path.join(self.stacking_directory, "Aligned_Images")
             os.makedirs(align_dir, exist_ok=True)
+            self._last_align_dir = align_dir
 
             passes = self.settings.value("stacking/refinement_passes", 3, type=int)
             shift_tol = self.settings.value("stacking/shift_tolerance", 0.2, type=float)
@@ -21400,6 +27315,14 @@ class StackingSuiteDialog(QDialog):
                 self.update_status(self.tr(f"🚨 Reference file does not exist: {ref_path}"))
                 return
             
+
+            if _nan_probe_enabled():
+                try:
+                    _nan_probe("register: reference", _probe_load_first(ref_path), self.update_status, force=True)
+                    for _p in normalized_files[:3]:
+                        _nan_probe(f"register: input {os.path.basename(_p)}", _probe_load_first(_p), self.update_status, force=True)
+                except Exception as _e:
+                    self.update_status(f"🔎 NaN-probe (register inputs) failed: {_e}")
 
             self._set_registration_busy(True)
 
@@ -21456,6 +27379,7 @@ class StackingSuiteDialog(QDialog):
 
         except StackCancelled:
             self._abort_partial_reg_state()
+            self._reg_queue_abort()
             self._set_registration_busy(False)
             mon = getattr(self, "_exec_monitor", None)
             if mon is not None:
@@ -21521,6 +27445,20 @@ class StackingSuiteDialog(QDialog):
             self._set_registration_busy(False)
         except Exception:
             pass
+
+        # NaN carry-through spot check on the finished aligned frames (debug).
+        # "After alignment complete" checkpoint: the _n_r frames here are exactly
+        # what integration will read, so any NaN loss shows up now.
+        if success and _nan_probe_enabled():
+            try:
+                _ad = getattr(self, "_last_align_dir", None)
+                if _ad and os.path.isdir(_ad):
+                    _files = sorted(f for f in os.listdir(_ad) if f.endswith("_n_r.fit"))
+                    self.update_status(f"🔎 NaN-probe: alignment complete — {len(_files)} aligned frame(s)")
+                    for _f in _files[:3]:
+                        _nan_probe(f"post-align {_f}", _probe_load_first(os.path.join(_ad, _f)), self.update_status, force=True)
+            except Exception as _e:
+                self.update_status(f"🔎 NaN-probe (post-align) failed: {_e}")
 
         # Update any local label directly (avoid update_status to prevent feedback)
         try:
@@ -21792,6 +27730,336 @@ class StackingSuiteDialog(QDialog):
             hist[iy, ix] += 1
         return float(np.count_nonzero(hist)) / float(hist.size)
 
+    # ── Advanced Dual NB Split (empirical mixing-matrix) ──────────────────────
+
+    class _NBActiveDocShim:
+        """Wrap the real DocManager but force get_active_document() to a target doc."""
+        def __init__(self, real, doc):
+            object.__setattr__(self, "_real", real)
+            object.__setattr__(self, "_doc", doc)
+        def get_active_document(self):
+            return object.__getattribute__(self, "_doc")
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_real"), name)
+
+    class _NBScratchDoc:
+        """Minimal in-memory stand-in for a SASpro ImageDocument: just enough for
+        plate_solve_doc_inplace and the SFCC/NBExtract calibration to read the
+        image + WCS. NEVER registered with the DocManager, so it spawns no
+        window. Backed by a scratch temp FITS via `file_path` for any code path
+        that reopens the file."""
+        def __init__(self, image, metadata):
+            self.image = image
+            self.metadata = dict(metadata)
+            self.file_path = self.metadata.get("file_path")
+            self.display_name = self.metadata.get("display_name", "__nbcal__")
+            self.is_mono = (getattr(image, "ndim", 2) == 2)
+            self.wcs = None
+            self.changed = False
+
+    def _nb_data_path(self):
+        """Resolve the bundled SASP_data.fits (SFCC's sasp_data_path).
+
+        NBExtract's own calibration uses the Gaia XP spectra, NOT the sensor
+        curves in this file — the shared SFCC constructor / fetch_stars just
+        needs a real FITS to open (its Pickles-template list) — so resolve the
+        packaged resource directly rather than hunting for a lazily-set
+        main-window attribute."""
+        try:
+            from setiastro.saspro.resources import get_resources
+            p = get_resources().SASP_DATA
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            pass
+        try:
+            from setiastro.saspro.resources import _resource_path
+            p = _resource_path("data/SASP_data.fits")
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            pass
+        return None
+
+    def _nb_discard_doc(self, dm, doc):
+        for m in ("close_document", "remove_document", "delete_document", "close", "remove"):
+            fn = getattr(dm, m, None)
+            if callable(fn):
+                try:
+                    fn(doc)
+                    return
+                except Exception:
+                    pass
+
+    def _nb_rgb_hwc(self, arr, layout=None):
+        import numpy as np
+        a = np.asarray(arr)
+        if a.ndim != 3:
+            return None
+        if layout == "HWC":
+            hwc = a
+        elif layout == "CHW":
+            hwc = np.transpose(a, (1, 2, 0))
+        elif a.shape[-1] in (3, 4) and a.shape[0] > 8 and a.shape[1] > 8:
+            hwc = a
+        elif a.shape[0] in (3, 4) and a.shape[1] > 8 and a.shape[2] > 8:
+            hwc = np.transpose(a, (1, 2, 0))
+        else:
+            return None
+        if hwc.shape[-1] < 3:
+            return None
+        return np.ascontiguousarray(hwc[..., :3].astype(np.float32))
+
+    def _nb_throughput_scalar(self, recs):
+        import numpy as np
+        vals = [
+            (float(r["R_meas"]) + float(r["G_meas"]) + float(r["B_meas"])) / 3.0
+            for r in recs
+        ]
+        if not vals:
+            return 0.0
+        m = float(np.median(vals))
+        return m if m > 0 else 0.0
+
+    def _nb_calibrate_class(self, sample_files, preset_name, *, n_cal=5):
+        """Plate-solve ONCE (all subs share the aligned reference grid), then
+        calibrate NBExtract on up to n_cal subs reusing that WCS, QC, pool the
+        throughput-normalised star records, and fit ONE mixing matrix.
+
+        Runs entirely on SCRATCH TEMP FITS + in-memory stand-in docs — it never
+        calls doc_manager.create_document, so NO SASpro windows are spawned.
+        Returns the (3, 2) matrix, or None to signal 'use raw R/G split'."""
+        import os, tempfile, shutil
+        import numpy as np
+        from astropy.io import fits
+        try:
+            from setiastro.saspro.nbextract import (
+                calibrate_matrix_headless, fit_mixing_matrix, condition_number_warning,
+            )
+            from setiastro.saspro.plate_solver import plate_solve_doc_inplace
+            from setiastro.saspro.legacy.image_manager import save_image
+        except Exception as e:
+            self.update_status(self.tr(f"\u26a0\ufe0f Advanced NB split unavailable ({e}); raw split."))
+            return None
+
+        # Only used to back the active-doc shim; we NEVER create a document here.
+        real_dm = self._saspro_doc_manager()
+
+        data_path = self._nb_data_path()
+        if not data_path:
+            self.update_status(self.tr(
+                "\u26a0\ufe0f Advanced NB split: SASpro data path not found; raw split."))
+            return None
+
+        def _save_scratch(path, rgb_img, header):
+            save_image(img_array=rgb_img, filename=path, original_format="fit",
+                       bit_depth="32-bit floating point",
+                       original_header=header, is_mono=False)
+
+        tmpdir = tempfile.mkdtemp(prefix="sas_nbcal_")
+        pooled = []
+        n_ok = 0
+        ref_wcs = None
+        try:
+            for i, fp in enumerate(sample_files):
+                if n_ok >= n_cal:
+                    break
+                try:
+                    with fits.open(fp, memmap=False) as hdul:
+                        arr = np.asarray(hdul[0].data)
+                        hdr = hdul[0].header.copy()
+                except Exception as e:
+                    self.update_status(self.tr(f"   \u21b3 NB cal read failed {os.path.basename(fp)}: {e}"))
+                    continue
+
+                rgb = self._nb_rgb_hwc(arr, None)
+                if rgb is None:
+                    continue
+
+                scratch = os.path.join(tmpdir, f"nbcal_{i:03d}.fit")
+
+                if ref_wcs is None:
+                    # First usable sub: write scratch, solve it once via the waterfall.
+                    try:
+                        _save_scratch(scratch, rgb, hdr)
+                    except Exception as e:
+                        self.update_status(self.tr(f"   \u21b3 NB cal scratch write failed: {e}"))
+                        continue
+                    doc = self._NBScratchDoc(rgb, {"original_header": hdr, "file_path": scratch})
+                    try:
+                        ok, res = plate_solve_doc_inplace(self, doc, self.settings)
+                    except Exception as e:
+                        ok, res = False, str(e)
+                    if not ok:
+                        self.update_status(self.tr(
+                            f"   \u21b3 NB cal plate solve failed {os.path.basename(fp)}: {res}"))
+                        continue
+                    ref_wcs = {
+                        "original_header": doc.metadata.get("original_header"),
+                        "wcs_header":      doc.metadata.get("wcs_header"),
+                    }
+                    # Bake the solved WCS into the scratch header so any file reopen
+                    # sees a plate-solved image.
+                    try:
+                        _save_scratch(scratch, rgb, ref_wcs["original_header"])
+                    except Exception:
+                        pass
+                    self.update_status(self.tr(
+                        "   \u21b3 NB cal: solved reference grid once; reusing WCS for the rest."))
+                else:
+                    # Aligned to the same grid: write scratch with the solved WCS baked in.
+                    try:
+                        _save_scratch(scratch, rgb, ref_wcs["original_header"])
+                    except Exception as e:
+                        self.update_status(self.tr(f"   \u21b3 NB cal scratch write failed: {e}"))
+                        continue
+                    doc = self._NBScratchDoc(rgb, {
+                        "original_header": ref_wcs["original_header"],
+                        "wcs_header":      ref_wcs["wcs_header"],
+                        "file_path":       scratch,
+                    })
+
+                shim = self._NBActiveDocShim(real_dm, doc)
+                try:
+                    A_k, recs_k, cond_k = calibrate_matrix_headless(
+                        shim, data_path, doc=doc,
+                        preset={"preset": preset_name}, parent=self,
+                    )
+                except Exception as e:
+                    self.update_status(self.tr(
+                        f"   \u21b3 NB cal failed {os.path.basename(fp)}: {e}"))
+                    continue
+
+                _, sev = condition_number_warning(A_k)
+                if sev == "severe" or len(recs_k) < 30:
+                    self.update_status(self.tr(
+                        f"   \u21b3 NB cal rejected sub (cond={cond_k:.1f}, n={len(recs_k)})"))
+                    continue
+
+                t = self._nb_throughput_scalar(recs_k)
+                if t <= 0:
+                    continue
+                for r in recs_k:
+                    r["R_meas"] = float(r["R_meas"]) / t
+                    r["G_meas"] = float(r["G_meas"]) / t
+                    r["B_meas"] = float(r["B_meas"]) / t
+                    pooled.append(r)
+                n_ok += 1
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        if n_ok == 0 or len(pooled) < 6:
+            self.update_status(self.tr(
+                f"\u26a0\ufe0f Advanced NB split ({preset_name}): calibration failed "
+                f"({n_ok} usable subs); raw R/G split."))
+            return None
+
+        A, n_used = fit_mixing_matrix(pooled)
+        if A is None:
+            self.update_status(self.tr(
+                f"\u26a0\ufe0f Advanced NB split ({preset_name}): pooled fit failed; raw split."))
+            return None
+
+        _, sev = condition_number_warning(A)
+        if sev == "severe":
+            self.update_status(self.tr(
+                f"\u26a0\ufe0f Advanced NB split ({preset_name}): pooled matrix "
+                f"ill-conditioned (cond={np.linalg.cond(A):.1f}); raw split."))
+            return None
+
+        self.update_status(self.tr(
+            f"\u2705 Advanced NB matrix ({preset_name}): {n_ok} subs, {n_used} stars, "
+            f"cond={np.linalg.cond(A):.2f}"))
+        return np.asarray(A, dtype=np.float64)
+
+    def _nb_filter_recognized(self, filt_str) -> bool:
+        """True if the FILTER name carries any line / vendor / dual identifier
+        that _classify_filter keys on. When False, a DUAL_HA_OIII class came only
+        from the 'assume Ha/OIII' fallback — i.e. the header had no filter info.
+        (Token set mirrors _classify_filter; keep them in sync.)"""
+        try:
+            k = self._norm_filter_key(filt_str or "")
+        except Exception:
+            k = str(filt_str or "").strip().lower()
+        if not k:
+            return False
+        toks = (
+            "ha", "halpha", "sii", "s2", "oiii", "o3", "hb", "hbeta",
+            "sio3", "sioiii", "sihb",
+            "lextreme", "lenhance", "lultimate", "nbz", "nbzu", "alpt", "alp",
+            "duo-band", "duoband", "dual band", "dual-band", "dualband",
+            "dual", "duo", "2band", "2-band", "two band",
+            "bicolor", "bi-color", "bicolour", "bi-colour",
+            "dualnb", "dual-nb", "duo-nb", "duonb", "duo narrow", "dual narrow",
+        )
+        return any(t in k for t in toks)
+
+    def _nb_prepare_matrices_for_split(self, aligned_light_files, old_drizzle):
+        """Populate self._nb_matrices {class: A|None} once per split run.
+        Only non-drizzle subs are eligible calibration inputs (and only non-drizzle
+        groups will consume the matrix downstream)."""
+        self._nb_matrices = {}
+        self._nb_advanced_split = bool(
+            getattr(self, "adv_nb_split_cb", None) and self.adv_nb_split_cb.isChecked()
+        )
+        if not self._nb_advanced_split:
+            return
+
+        DUAL = ("DUAL_HA_OIII", "DUAL_SII_OIII", "DUAL_SII_HB")
+        preset_for = {
+            "DUAL_HA_OIII":  "Ha / OIII",
+            "DUAL_SII_OIII": "SII / OIII",
+            "DUAL_SII_HB":   "SII / H\u03b2",
+        }
+        buckets = {}
+        recognized = {}   # cls -> True if any sub carried an informative FILTER name
+        for group, files in aligned_light_files.items():
+            drizzled = self._group_is_drizzled(old_drizzle, group)
+            if drizzled:
+                continue  # drizzle groups keep the raw R/G split
+            for fp in files:
+                filt = self._get_filter_name(fp)
+                cls = self._classify_filter(filt)
+                if cls not in DUAL:
+                    continue
+                buckets.setdefault(cls, []).append(fp)
+                recognized[cls] = recognized.get(cls, False) or self._nb_filter_recognized(filt)
+
+        for cls in DUAL:
+            sample = buckets.get(cls) or []
+            if not sample:
+                continue
+            if cls == "DUAL_HA_OIII" and not recognized.get(cls, False):
+                self.update_status(self.tr(
+                    "\u26a0\ufe0f NB split: no usable FILTER in the headers \u2014 assuming "
+                    "Ha/OIII. If this is an SII/OIII set, set the FILTER keyword "
+                    "(acquisition software or the batch FITS header tool) and re-run."))
+            self.update_status(self.tr(
+                f"\U0001f9ea Advanced NB split: calibrating {cls} mixing matrix "
+                f"from up to 5 subs\u2026"))
+            self._nb_matrices[cls] = self._nb_calibrate_class(
+                sample, preset_for[cls], n_cal=5
+            )
+
+    def _group_is_drizzled(self, drizzle_map, group) -> bool:
+        """True only if drizzle is actually ENABLED for this group.
+        per_group_drizzle values are config dicts ({"enabled": bool, "scale":…,
+        "drop":…}), so bool(dict) is truthy even when drizzle is off — check the
+        flag explicitly. Tolerates a bare bool/None too."""
+        v = (drizzle_map or {}).get(group)
+        if isinstance(v, dict):
+            return bool(v.get("enabled", v.get("drizzle_enabled", False)))
+        return bool(v)
+
+    def _dual_split_requested(self) -> bool:
+        """True if EITHER the base dual-band split OR the advanced matrix split
+        is enabled. The advanced checkbox implies the split must run."""
+        base = bool(getattr(self, "split_dualband_cb", None)
+                    and self.split_dualband_cb.isChecked())
+        adv = bool(getattr(self, "adv_nb_split_cb", None)
+                   and self.adv_nb_split_cb.isChecked())
+        return base or adv
+
     def _split_dual_band_after_align(
         self,
         aligned_light_files: dict[str, list[str]]
@@ -21837,6 +28105,10 @@ class StackingSuiteDialog(QDialog):
 
         # Normalized aligned->original map (should exist from your registration pipeline)
         oba = getattr(self, "orig_by_aligned", {}) or {}
+
+        # Advanced Dual NB Split: fit one empirical mixing matrix per dual-band
+        # class from a few plate-solved subs (non-drizzle groups only).
+        self._nb_prepare_matrices_for_split(aligned_light_files, old_drizzle)
 
         # --- Pass 1: classify + split each aligned frame ---
         for group, files in aligned_light_files.items():
@@ -21930,45 +28202,82 @@ class StackingSuiteDialog(QDialog):
                     if parent_orig:
                         split_info[os.path.normpath(path_written)] = {"orig": parent_orig, "chan": chan}
 
-                if cls == "DUAL_HA_OIII":
-                    ha_path   = os.path.join(out_dir, f"{base}_Ha.fit")
-                    oiii_path = os.path.join(out_dir, f"{base}_OIII.fit")
-                    self._write_band_fit(ha_path,   R, hdr, "Ha",   src_filter=filt)
-                    self._write_band_fit(oiii_path, G, hdr, "OIII", src_filter=filt)
-
-                    ha_files.append(ha_path);     parent_of[ha_path]   = group
-                    oiii_files.append(oiii_path); parent_of[oiii_path] = group
-
-                    _map_split(ha_path, "R")
-                    _map_split(oiii_path, "G")
-
-                elif cls == "DUAL_SII_OIII":
-                    sii_path  = os.path.join(out_dir, f"{base}_SII.fit")
-                    oiii_path = os.path.join(out_dir, f"{base}_OIII.fit")
-                    self._write_band_fit(sii_path,  R, hdr, "SII",  src_filter=filt)
-                    self._write_band_fit(oiii_path, G, hdr, "OIII", src_filter=filt)
-
-                    sii_files.append(sii_path);     parent_of[sii_path]  = group
-                    oiii_files.append(oiii_path);   parent_of[oiii_path] = group
-
-                    _map_split(sii_path, "R")
-                    _map_split(oiii_path, "G")
-
-                elif cls == "DUAL_SII_HB":
-                    sii_path = os.path.join(out_dir, f"{base}_SII.fit")
-                    hb_path  = os.path.join(out_dir, f"{base}_Hb.fit")
-                    self._write_band_fit(sii_path, R, hdr, "SII", src_filter=filt)
-                    self._write_band_fit(hb_path,  G, hdr, "Hb",  src_filter=filt)
-
-                    sii_files.append(sii_path); parent_of[sii_path] = group
-                    hb_files.append(hb_path);   parent_of[hb_path]  = group
-
-                    _map_split(sii_path, "R")
-                    _map_split(hb_path, "G")
-
-                else:
+                # ── Per-class band mapping + NBExtract preset ─────────────────
+                _dual_map = {
+                    "DUAL_HA_OIII":  ("Ha",  "OIII", "Ha / OIII"),
+                    "DUAL_SII_OIII": ("SII", "OIII", "SII / OIII"),
+                    "DUAL_SII_HB":   ("SII", "Hb",   "SII / Hβ"),
+                }
+                if cls not in _dual_map:
                     # UNKNOWN dual → ignore
                     continue
+                band1, band2, _preset = _dual_map[cls]
+
+                _band_lists = {
+                    "Ha": ha_files, "SII": sii_files,
+                    "OIII": oiii_files, "Hb": hb_files,
+                }
+                p1 = os.path.join(out_dir, f"{base}_{band1}.fit")
+                p2 = os.path.join(out_dir, f"{base}_{band2}.fit")
+
+                # Advanced matrix split only for non-drizzle groups that produced a
+                # good matrix; drizzle groups keep the raw R/G split (the deposit loop
+                # re-pulls a single original plane, which a matrix mix cannot provide).
+                A_nb = None
+                rgb_hwc = None
+                if (getattr(self, "_nb_advanced_split", False)
+                        and not self._group_is_drizzled(old_drizzle, group)):
+                    A_nb = (getattr(self, "_nb_matrices", {}) or {}).get(cls)
+                if A_nb is not None:
+                    rgb_hwc = self._nb_rgb_hwc(arr, layout)
+
+                if A_nb is not None and rgb_hwc is not None:
+                    from setiastro.saspro.nbextract import extract_channels_regularized
+                    # Conditioning-aware Q-blend (q*NNLS + (1-q)*raw prior) — the same
+                    # regularisation NBExtract uses, kept LINEAR (no stretch / unity
+                    # rescale) for normalise/reject/integrate. Pure NNLS was too
+                    # aggressive: it amplifies noise (esp. the faint line) and widens
+                    # the sigma-clip thresholds, hurting rejection. Q auto-derives from
+                    # the matrix conditioning (auto_q_per_channel).
+                    line1, line2 = extract_channels_regularized(rgb_hwc, A_nb)
+                    self._write_band_fit(p1, line1, hdr, band1, src_filter=filt)
+                    self._write_band_fit(p2, line2, hdr, band2, src_filter=filt)
+                    # Matrix-mixed -> no single source plane. chan=None keeps the
+                    # non-drizzle path (integration reads these mono files directly).
+                    # For matrix-mixed DRIZZLE, thread the pseudo-inverse rows through
+                    # and honour ent["mix"] in the deposit loop, e.g.:
+                    #     import numpy as _np
+                    #     Ainv = _np.linalg.pinv(A_nb)            # (2, 3)
+                    #     _map_split(p1, None)
+                    #     split_info[os.path.normpath(p1)]["mix"] = Ainv[0].tolist()
+                    #     _map_split(p2, None)
+                    #     split_info[os.path.normpath(p2)]["mix"] = Ainv[1].tolist()
+                    # then in the drizzle deposit: if ent.get("mix"): img_data =
+                    #     (orig_rgb_hwc @ _np.asarray(ent["mix"], _np.float32))
+                    _map_split(p1, None)
+                    _map_split(p2, None)
+                else:
+                    # Raw split (unchanged behaviour): R->band1, G->band2.
+                    self._write_band_fit(p1, R, hdr, band1, src_filter=filt)
+                    self._write_band_fit(p2, G, hdr, band2, src_filter=filt)
+                    _map_split(p1, "R")
+                    _map_split(p2, "G")
+
+                _band_lists[band1].append(p1); parent_of[p1] = group
+                _band_lists[band2].append(p2); parent_of[p2] = group
+
+                # Daughters inherit the parent frame's integration weight — else
+                # they default to 1.0 and the split stacks lose PSF weighting.
+                # Resolve the parent weight the same way integration does:
+                # direct hit, then via the parent original (orig_by_aligned).
+                _fw = getattr(self, "frame_weights", None)
+                if isinstance(_fw, dict):
+                    _pw = _fw.get(fpn, _fw.get(fp))
+                    if _pw is None and parent_orig:
+                        _pw = _fw.get(parent_orig, _fw.get(os.path.normpath(parent_orig)))
+                    if _pw is not None:
+                        _fw[os.path.normpath(p1)] = _pw
+                        _fw[os.path.normpath(p2)] = _pw
 
         # --- Pass 2: group the new files using the SAME exposure-tolerance helper
         #              used by populate_calibrated_lights() ---
@@ -22126,6 +28435,21 @@ class StackingSuiteDialog(QDialog):
             })
             return out
 
+        # Masters are on disk — drop the in-RAM prepass so a queued next set
+        # does not start with this panel's stacks still resident.
+        try:
+            for g in (prepass.get("groups") or {}).values():
+                g.pop("integrated_image", None)
+                g.pop("rejection_map", None)
+                g.pop("rej_maps", None)
+            prepass["groups"] = {}
+        except Exception:
+            pass
+        try:
+            self._rej_maps = {}
+        except Exception:
+            pass
+
         if isinstance(finalize_result, dict):
             finalize_result = dict(finalize_result)
             finalize_result["summary_lines"] = combined_summary
@@ -22181,6 +28505,7 @@ class StackingSuiteDialog(QDialog):
         # (it's a black-box thread), but we refuse to start the next phase.
         if self._cancelled():
             self._abort_partial_reg_state()
+            self._reg_queue_abort()
             self._set_registration_busy(False)
             self.alignment_thread = None
             mon = getattr(self, "_exec_monitor", None)
@@ -22285,6 +28610,25 @@ class StackingSuiteDialog(QDialog):
         accepted = [k for k in keys if _accept(k)]
         rejected = [k for k in keys if not _accept(k)]
 
+        # A solved frame whose aligned output was never written (the finalize
+        # pass failed) has no usable solution either; the output map still
+        # points at its own unaligned input.
+        _out_map = alignment_thread.file_key_to_current_path
+        unwritten = [
+            k for k in accepted
+            if os.path.normcase(os.path.normpath(_out_map.get(k, k)))
+            == os.path.normcase(os.path.normpath(k))
+        ]
+        if unwritten:
+            _unwritten = set(unwritten)
+            accepted = [k for k in accepted if k not in _unwritten]
+            self.update_status(self.tr(
+                f"🚫 Rejected {len(unwritten)} frame(s) whose aligned output "
+                f"wasn't written (finalize failed):"
+            ))
+            for rf in unwritten:
+                self.update_status(f"  ❌ {os.path.basename(rf)}")
+
         # ----------------------------
         # Persist numeric transforms we accepted (for drizzle, etc.)
         # ----------------------------
@@ -22371,6 +28715,13 @@ class StackingSuiteDialog(QDialog):
 
         self.matrix_by_aligned = {}
         self.orig_by_aligned   = {}
+        # Normal registration solves real transforms; a missing SASD entry in the
+        # drizzle deposit is a genuine error here, not an identity pass. Clear any
+        # pre-registered reconstruction state from a previous "Skip Registration"
+        # run so it can't leak into this run's drizzle.
+        self._drizzle_pre_registered = False
+        self._pre_reg_xforms = {}
+        self._pre_reg_ref_shape = None
         for norm_path, aligned_path in self.valid_transforms.items():
             M = self.valid_matrices.get(norm_path)
             if M is not None:
@@ -22386,7 +28737,9 @@ class StackingSuiteDialog(QDialog):
 
         # Status
         prefix = "⚡ Fast mode: " if fast_mode else ""
-        self.update_status(self.tr(f"{prefix}Alignment summary: {len(accepted)} succeeded, {len(rejected)} rejected."))
+        n_rejected = len(rejected) + len(unwritten)
+        self.update_status(self.tr(
+            f"{prefix}Alignment summary: {len(accepted)} succeeded, {n_rejected} rejected."))
         QApplication.processEvents()
         if (not fast_mode) and rejected:
             self.update_status(self.tr(f"🚨 Rejected {len(rejected)} frame(s) due to shift > {accept_thresh}px."))
@@ -22395,6 +28748,9 @@ class StackingSuiteDialog(QDialog):
 
         if not self.valid_transforms:
             self.update_status(self.tr("⚠️ No frames to stack; aborting."))
+            # Like a cancel: the next run rebuilds from the tree and asks again.
+            self._abort_partial_reg_state()
+            self._reg_queue_abort()
             self._set_registration_busy(False)
             return
 
@@ -22417,11 +28773,11 @@ class StackingSuiteDialog(QDialog):
                 if aligned and os.path.exists(aligned):
                     new_list.append(aligned)
                 else:
-                    self.update_status(self.tr(f"DEBUG: File '{aligned}' does not exist on disk."))
+                    self.update_status(self.tr(f"File '{aligned}' does not exist on disk."))
             aligned_light_files[group] = new_list
 
-        # ----Split dual-band if requested----
-        if self.split_dualband_cb.isChecked():
+        # ----Split dual-band if requested (base checkbox OR advanced matrix)----
+        if self._dual_split_requested():
             self.update_status(self.tr("🌈 Splitting aligned dual-band OSC frames into Ha / OIII…"))
             aligned_light_files = self._split_dual_band_after_align(aligned_light_files)
 
@@ -22697,6 +29053,13 @@ class StackingSuiteDialog(QDialog):
 
             # --- Restore the full tree and hand off to integrate ---
             self.light_files = {g: list(lst) for g, lst in _full_tree.items()}
+            # The new frames that failed this run have no registered twin;
+            # tell integration to leave them out rather than stack them as-is.
+            _registered = {os.path.normcase(k) for k in self.valid_transforms}
+            self._integrate_leave_out = {
+                k for k, norm in self._orig2norm.items()
+                if os.path.normcase(os.path.normpath(norm)) not in _registered
+            }
             self.update_status(self.tr(
                 "🔗 New frames registered. Integrating the full set "
                 "(existing + newly registered)…"
@@ -22796,6 +29159,12 @@ class StackingSuiteDialog(QDialog):
             except Exception:
                 group_rej_maps = {}
 
+            # Store the EFFECTIVE frame count — soft-rejected (weight=0)
+            # subs are still in file_list for bookkeeping but don't
+            # contribute to the integrated master. Everything downstream
+            # that stamps "N stacked" into the filename or NCOMBINE
+            # header reads from this field.
+            effective_n = self._count_contributing_frames(file_list, frame_weights)
             prepass["groups"][group_key] = {
                 "group_key": group_key,
                 "file_list": list(file_list),
@@ -22803,14 +29172,18 @@ class StackingSuiteDialog(QDialog):
                 "rejection_map": rejection_map,
                 "ref_header": ref_header,
                 "rej_maps": group_rej_maps,
-                "n_frames": len(file_list),
+                "n_frames": effective_n,
+                "n_total": len(file_list),  # pre-rejection count, for logs
             }
 
             dt = perf_counter() - t0
+            rejected_here = len(file_list) - effective_n
+            rej_note = (f" ({rejected_here} soft-rejected)" if rejected_here else "")
             line = (
                 f"Prepass '{group_key}': "
                 f"{integrated_image.shape[1]}×{integrated_image.shape[0]}, "
-                f"{len(file_list)} frame(s), {dt:.1f}s"
+                f"{effective_n}/{len(file_list)} frame(s) contributing{rej_note}, "
+                f"{dt:.1f}s"
             )
             prepass["summary_lines"].append(line)
             log(f"✅ {line}")
@@ -22934,19 +29307,26 @@ class StackingSuiteDialog(QDialog):
             hdr_orig["CREATOR"] = "SetiAstroSuite"
             hdr_orig["DATE-OBS"] = datetime.utcnow().isoformat()
 
-            n_frames_group = len(file_list)
-            hdr_orig["NCOMBINE"] = (int(n_frames_group), "Number of frames combined")
+            # Effective count = frames with weight > 0 (sub rejection may
+            # have zeroed some). Reflect that in the filename AND header
+            # so a 245-frame set that soft-rejected 3 says "242" in both.
+            n_frames_group = self._count_contributing_frames(file_list)
+            n_frames_pool  = len(file_list)
+            hdr_orig["NCOMBINE"] = (int(n_frames_group), "Number of frames combined (weight > 0)")
             hdr_orig["NSTACK"] = (int(n_frames_group), "Alias of NCOMBINE (SetiAstro)")
+            if n_frames_pool != n_frames_group:
+                hdr_orig["NPOOL"] = (int(n_frames_pool),
+                                     "Pre-rejection frame pool size (SetiAstro)")
+                hdr_orig["NREJECT"] = (int(n_frames_pool - n_frames_group),
+                                       "Frames soft-rejected (weight=0) by score outlier pass")
 
             # Correct header fields if frames were upscaled during normalization
-            # (e.g. bin2 RGB upscaled to match bin1 L — binning, pixscale, CRPIX all wrong otherwise)
-            upscale_map = getattr(self, "_upscale_factor_by_orig", {})
-            if upscale_map and file_list:
-                rep_key = os.path.normcase(os.path.normpath(file_list[0]))
-                uf = upscale_map.get(rep_key)
-                if uf and (abs(uf[0] - 1.0) > 1e-4 or abs(uf[1] - 1.0) > 1e-4):
-                    hdr_orig = self._fix_header_for_upscale(hdr_orig, uf[0], uf[1])
-                    log(f"📐 Header corrected for {uf[0]:.3f}×{uf[1]:.3f} upscale (binning/pixscale/CRPIX).")
+            # (e.g. bin2 RGB upscaled to match bin1 L — binning, pixscale, CRPIX
+            # all wrong otherwise). Uses the robust reverse-lookup helper that
+            # walks aligned → orig_by_aligned → self.reference_frame → stems.
+            hdr_orig = self._apply_upscale_fix_to_header(
+                hdr_orig, file_list, label=f"'{group_key}' master", status_cb=log
+            )
 
             is_mono_orig = (integrated_image.ndim == 2)
             if is_mono_orig:
@@ -22963,11 +29343,18 @@ class StackingSuiteDialog(QDialog):
 
             H, W = integrated_image.shape[:2]
             display_group = self._label_with_dims(group_key, W, H)
-            base = f"MasterLight_{display_group}_{n_frames_group}stacked"
+            _set_pref = (f"{self._reg_current_set_slug}_"
+                         if getattr(self, "_reg_current_set", "Default") not in (None, "Default")
+                         else "")
+            base = f"MasterLight_{_set_pref}{display_group}_{n_frames_group}stacked"
             base = self._normalize_master_stem(base)
             out_path_orig = self._build_out(self._master_light_dir(), base, "fit")
             out_path_orig = self._dedupe_out_path(out_path_orig)
-            # ── NEW: plate solve before saving ──────────────────────────
+            # ── NEW: ensure WCS CD matrix exists (synth from PIXSCALE/POSANGLE
+            #        when the ref frame only had a seed WCS), then plate solve.
+            hdr_orig = self._ensure_wcs_matrix(
+                hdr_orig, label=f"'{group_key}' master", status_cb=log
+            )
             hdr_orig = self._maybe_plate_solve_master(
                 integrated_image, hdr_orig, label=f"'{group_key}' master", status_cb=log
             )
@@ -23066,20 +29453,34 @@ class StackingSuiteDialog(QDialog):
                     scale=1.0,
                     rect_override=group_rect if group_rect is not None else global_rect
                 )
-                hdr_crop["NCOMBINE"] = (int(n_frames_group), "Number of frames combined")
+                # Cropped master uses the SAME contributing frames as the
+                # full master (crop is spatial-only); carry the same
+                # NCOMBINE/NPOOL/NREJECT values across so both files tell
+                # the same story.
+                hdr_crop["NCOMBINE"] = (int(n_frames_group), "Number of frames combined (weight > 0)")
                 hdr_crop["NSTACK"] = (int(n_frames_group), "Alias of NCOMBINE (SetiAstro)")
-                if upscale_map and file_list:
-                    rep_key = os.path.normcase(os.path.normpath(file_list[0]))
-                    uf = upscale_map.get(rep_key)
-                    if uf and (abs(uf[0] - 1.0) > 1e-4 or abs(uf[1] - 1.0) > 1e-4):
-                        hdr_crop = self._fix_header_for_upscale(hdr_crop, uf[0], uf[1])                
+                if n_frames_pool != n_frames_group:
+                    hdr_crop["NPOOL"]   = (int(n_frames_pool),
+                                           "Pre-rejection frame pool size (SetiAstro)")
+                    hdr_crop["NREJECT"] = (int(n_frames_pool - n_frames_group),
+                                           "Frames soft-rejected (weight=0) by score outlier pass")
+                hdr_crop = self._apply_upscale_fix_to_header(
+                    hdr_crop, file_list,
+                    label=f"'{group_key}' auto-cropped master", status_cb=log
+                )
                 is_mono_crop = (cropped_img.ndim == 2)
+                hdr_crop = self._ensure_wcs_matrix(
+                    hdr_crop, label=f"'{group_key}' auto-cropped master", status_cb=log
+                )
                 hdr_crop = self._maybe_plate_solve_master(
                     cropped_img, hdr_crop, label=f"'{group_key}' auto-cropped master", status_cb=log
                 )
                 Hc, Wc = (cropped_img.shape[:2] if cropped_img.ndim >= 2 else (H, W))
                 display_group_crop = self._label_with_dims(group_key, Wc, Hc)
-                base_crop = f"MasterLight_{display_group_crop}_{n_frames_group}stacked_autocrop"
+                _set_pref = (f"{self._reg_current_set_slug}_"
+                             if getattr(self, "_reg_current_set", "Default") not in (None, "Default")
+                             else "")
+                base_crop = f"MasterLight_{_set_pref}{display_group_crop}_{n_frames_group}stacked_autocrop"
                 base_crop = self._normalize_master_stem(base_crop)
                 out_path_crop = self._build_out(self._master_light_dir(), base_crop, "fit")
                 out_path_crop = self._dedupe_out_path(out_path_crop)
@@ -23124,6 +29525,14 @@ class StackingSuiteDialog(QDialog):
                 if op:
                     orig_list.append(op)
             originals_by_group[group] = orig_list
+
+        # Reset the session-level buffers drizzle_stack_one_group appends
+        # to on each successful save. This finalize call owns the drizzle
+        # loop below, so the lists reflect THIS run only — the next run
+        # starts fresh and won't inherit stale paths from an earlier
+        # click of Integrate.
+        self._drizzle_master_paths = []
+        self._drizzle_crop_paths   = []
 
         for group_key, file_list in grouped_files.items():
             if not drizzle_enabled_global:
@@ -23197,11 +29606,32 @@ class StackingSuiteDialog(QDialog):
             for g, p in autocrop_outputs:
                 summary_lines.append(f"  • {g} → {p}")
 
-        # Primary integrated masters + any auto-cropped variants, for the
-        # "Open Saved Masters" button in the completion popup.
-        crop_paths = [p for (_g, p) in autocrop_outputs]
+        _driz_outs      = getattr(self, "_drizzle_master_paths", []) or []
+        _driz_crop_outs = getattr(self, "_drizzle_crop_paths",   []) or []
+        if _driz_outs:
+            summary_lines.append("")
+            summary_lines.append("Drizzle masters saved:")
+            for g, p in _driz_outs:
+                summary_lines.append(f"  • {g} → {p}")
+        if _driz_crop_outs:
+            summary_lines.append("")
+            summary_lines.append("Drizzle auto-cropped files saved:")
+            for g, p in _driz_crop_outs:
+                summary_lines.append(f"  • {g} → {p}")
+
+        # Primary integrated masters + any auto-cropped variants + any
+        # DRIZZLE outputs (both the full drizzle master and its auto-crop
+        # if drizzle+autocrop were on), for the "Open Saved Masters"
+        # button in the completion popup. Before this, drizzle outputs
+        # were saved to disk and logged but never surfaced in the summary
+        # payload — "N master(s)" counted only the normal-integration
+        # files and the Open button only opened those.
+        crop_paths         = [p for (_g, p) in autocrop_outputs]
+        drizzle_paths      = [p for (_g, p) in _driz_outs]
+        drizzle_crop_paths = [p for (_g, p) in _driz_crop_outs]
         seen, master_files_out = set(), []
-        for p in list(master_files) + crop_paths:
+        for p in (list(master_files) + crop_paths
+                  + drizzle_paths + drizzle_crop_paths):
             if p and p not in seen:
                 seen.add(p)
                 master_files_out.append(p)
@@ -23209,6 +29639,8 @@ class StackingSuiteDialog(QDialog):
         return {
             "summary_lines": summary_lines,
             "autocrop_outputs": autocrop_outputs,
+            "drizzle_outputs": list(_driz_outs),
+            "drizzle_crop_outputs": list(_driz_crop_outs),
             "master_files": master_files_out,
         }
 
@@ -23311,26 +29743,44 @@ class StackingSuiteDialog(QDialog):
                     self._set_registration_busy(False)
                     return
 
+            more_sets = self._reg_queue_has_more()
             if getattr(self, "_mf_failures", None):
                 lines = [f"{g}: {m}" for g, m in self._mf_failures]
                 log("⚠️ MFDeconv finished with failures:\n" + "\n".join(lines))
-                # ↓ ADD THIS
-                try:
-                    if self._exec_monitor is not None:
-                        self._exec_monitor.finish_all(False)
-                    self._exec_monitor_pipeline_active = False
-                except Exception:
-                    pass
+                if not more_sets:
+                    try:
+                        if self._exec_monitor is not None:
+                            self._exec_monitor.finish_all(False)
+                        self._exec_monitor_pipeline_active = False
+                    except Exception:
+                        pass
             else:
                 log("✅ MFDeconv complete for all groups.")
-                # ↓ ADD THIS
-                try:
-                    if self._exec_monitor is not None:
-                        self._exec_monitor.finish_run(True)
-                    self._exec_monitor_pipeline_active = False
-                except Exception:
-                    pass
+                if not more_sets:
+                    try:
+                        if self._exec_monitor is not None:
+                            self._exec_monitor.finish_run(True)
+                        self._exec_monitor_pipeline_active = False
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self._exec_monitor_pipeline_active = True
+                    except Exception:
+                        pass
             self._set_registration_busy(False)
+            # Registration-set queue: advance once this set's MF phase is done.
+            if getattr(self, "_reg_queue", None):
+                if getattr(self, "_mf_cancelled", False) or getattr(self, "_mf_failures", None):
+                    self._reg_queue_abort("MFDeconv did not complete for a set")
+                else:
+                    if more_sets:
+                        set_name = getattr(self, "_reg_current_set", "") or ""
+                        n_left = len(self._reg_queue) - self._reg_queue_pos - 1
+                        log(self.tr(
+                            "✅ Set '{0}' complete. Continuing with {1} remaining set(s)…"
+                        ).format(set_name, n_left))
+                    self._reg_queue_advance()
 
         def _start_next_mf_job():
             if self._mf_cancelled or not self._mf_queue:
@@ -23549,6 +29999,8 @@ class StackingSuiteDialog(QDialog):
     def _on_after_align_finished(self, success: bool, message: str):
         # Stop thread/progress UI first (whatever you already do)
 
+        self._play_completion_chime(success=bool(success))
+
         if success:
             QMessageBox.information(
                 self,
@@ -23622,6 +30074,654 @@ class StackingSuiteDialog(QDialog):
         if opened:
             try:
                 self.update_status(self.tr(f"🖼 Opened {opened} master(s) in SASpro."))
+            except Exception:
+                pass
+
+    def _accumulate_reg_set_masters(self, payload) -> None:
+        """Append this set's masters onto the multi-set accumulator."""
+        acc = getattr(self, "_reg_queue_master_paths", None)
+        if acc is None:
+            acc = []
+            self._reg_queue_master_paths = acc
+        for p in self._collect_master_paths(payload):
+            if p not in acc:
+                acc.append(p)
+
+    # ------------------------------------------------------------------
+    # Rich acquisition-summary helpers (used by both single- and multi-set
+    # completion popups). Reads FITS headers from the light-frame paths and
+    # builds a human-readable, copy-friendly text block covering nights,
+    # per-filter integration, and (for mosaic runs) per-set breakdowns.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        """Format a duration in seconds as e.g. '5h 42m 00s' / '42m 10s' / '45s'."""
+        try:
+            s = float(seconds or 0.0)
+        except Exception:
+            s = 0.0
+        if s <= 0:
+            return "0s"
+        hrs = int(s // 3600)
+        rem = s - hrs * 3600
+        mins = int(rem // 60)
+        secs = int(round(rem - mins * 60))
+        # roll-over if rounding bumped us past 60
+        if secs == 60:
+            secs = 0; mins += 1
+        if mins == 60:
+            mins = 0; hrs += 1
+        if hrs:
+            return f"{hrs}h {mins:02d}m {secs:02d}s"
+        if mins:
+            return f"{mins}m {secs:02d}s"
+        return f"{secs}s"
+
+    @staticmethod
+    def _fmt_exp(x: float) -> str:
+        """Format a single exposure length."""
+        try:
+            x = float(x)
+        except Exception:
+            x = 0.0
+        if abs(x - round(x)) < 1e-3:
+            return f"{int(round(x))}s"
+        return f"{x:.2f}s"
+
+    def _read_light_frame_meta(self, paths):
+        """Read FITS headers for a list of light-frame paths.
+        Returns (records, skipped) where each record is a dict with
+        set/filter/exposure/date_obs/object/path keys. Any file that
+        can't be opened as a FITS still contributes a frame record with
+        'Unknown' metadata so the total count stays honest."""
+        records = []
+        skipped = 0
+        for p in (paths or []):
+            if not p:
+                continue
+            filt = "Unknown"; exp = 0.0; dateobs = ""; obj = ""
+            try:
+                # getheader avoids memory-mapping the full data block —
+                # much cheaper than fits.open when all we want is header
+                # cards and we're walking hundreds of files.
+                h = fits.getheader(p)
+                exp = h.get("EXPTIME", h.get("EXPOSURE", 0.0))
+                try:
+                    exp = float(exp)
+                except Exception:
+                    exp = 0.0
+                filt = str(h.get("FILTER", "Unknown") or "Unknown").strip() or "Unknown"
+                dateobs = str(h.get("DATE-OBS", "") or "").strip()
+                obj = str(h.get("OBJECT", "") or "").strip()
+            except Exception:
+                skipped += 1
+            records.append({
+                "filter": filt,
+                "exposure": exp,
+                "date_obs": dateobs,
+                "object": obj,
+                "path": p,
+            })
+        return records, skipped
+
+    def _night_from_dateobs(self, date_obs: str):
+        """Return a 'YYYY-MM-DD' label for a FITS DATE-OBS, using the
+        same noon-to-noon local-night rule SASpro already applies to
+        session tags. Falls back to 'Unknown date' when the string
+        can't be parsed.
+
+        Why delegate to _session_from_dateobs_local_night + _parse_date_obs
+        rather than roll our own:
+
+        - _parse_date_obs tries dateutil first, then four strptime
+          fallbacks, including date-only strings — much more forgiving
+          than a bare datetime.fromisoformat (which pre-Python-3.11
+          chokes on 7-digit microseconds, trailing 'Z' in some combos,
+          and lots of real-world DATE-OBS values).
+
+        - _session_from_dateobs_local_night pulls the site timezone
+          from stacking/site_timezone (QSettings), not the processing
+          machine's clock. An observer imaging in US/Central who then
+          processes on a UTC workstation would otherwise see nights
+          snap on UTC midnight boundaries — i.e. the exact bug: one
+          night cut in half, the pre-midnight hours labeled one date
+          and the post-midnight hours labeled the next.
+
+        - It honors stacking/night_cutoff_hour (default 12 = noon), so
+          the "night" shown in the summary matches the SessionN tags in
+          the Lights tree the user already sees.
+
+        A fake header dict is enough to drive the helper — it only
+        reads the DATE-OBS key.
+        """
+        s = (date_obs or "").strip()
+        if not s:
+            return "Unknown date"
+        try:
+            label = self._session_from_dateobs_local_night({"DATE-OBS": s})
+        except Exception:
+            label = None
+        if label:
+            return label
+        # Last-resort fallback: just the date portion. Reaches here only
+        # if the string couldn't be parsed by any format in
+        # _parse_date_obs (dateutil + four strptime patterns).
+        return s.split("T")[0] if "T" in s else s
+
+    def _build_acquisition_summary(self, sets_map, *, title_suffix: str = ""):
+        """Compute an acquisition summary from one or more sets of light
+        files and return a dict:
+            {
+              'text':   multi-line summary ready to paste anywhere,
+              'totals': {'frames', 'integration_s', 'nights', 'filters'}
+            }
+
+        ``sets_map`` is either:
+          - {set_name: {group_key: [paths]}}  — multi-set
+          - {group_key: [paths]}              — flat (treated as 1 set)
+          - None/empty                        — returns None
+        """
+        if not sets_map:
+            return None
+
+        # Normalize to {set_name: {group_key: [paths]}}
+        first_val = next(iter(sets_map.values()))
+        if isinstance(first_val, (list, tuple)):
+            sets_map = {self.tr("Default"): sets_map}
+
+        from collections import defaultdict
+
+        # Walk every path once; carry the set tag through.
+        per_set_records = []
+        total_skipped = 0
+        # Reuse the same aligned→original resolver the stacked-count helper
+        # uses so the summary ALWAYS reports the same number as the
+        # filename/NCOMBINE header. Two separate direct-lookup codepaths
+        # would silently disagree the first time Register-and-Integrate
+        # ran — frame_weights there is keyed by original (not aligned)
+        # paths, and self.light_files can be either.
+        _resolve_summary_w = self._make_weight_resolver()
+        def _effective_in(paths):
+            n = 0
+            for p in (paths or []):
+                try:
+                    if _resolve_summary_w(p) > 0.0:
+                        n += 1
+                except Exception:
+                    n += 1
+            return n
+        n_total_files = sum(_effective_in(p) for g in sets_map.values() for p in g.values())
+        if n_total_files > 200:
+            try:
+                self.update_status(self.tr(
+                    "📖 Reading headers from {0} frame(s) for the summary…"
+                ).format(n_total_files))
+                QApplication.processEvents()
+            except Exception:
+                pass
+
+        # Honour soft rejection: a sub whose frame_weights was zeroed by
+        # the score-outlier pass didn't contribute to the integrated
+        # master, so it must not inflate the "N frames / M hours" numbers.
+        # Uses the same aligned→original resolver as the count above.
+        def _contributes(fp):
+            try:
+                return _resolve_summary_w(fp) > 0.0
+            except Exception:
+                return True
+
+        for set_name, groups in sets_map.items():
+            flat_paths = []
+            for _gk, paths in (groups or {}).items():
+                flat_paths.extend(p for p in (paths or []) if _contributes(p))
+            recs, skipped = self._read_light_frame_meta(flat_paths)
+            for r in recs:
+                r["set"] = set_name
+            per_set_records.append((set_name, recs))
+            total_skipped += skipped
+
+        all_records = [r for _, recs in per_set_records for r in recs]
+        if not all_records:
+            return None
+
+        for r in all_records:
+            r["night"] = self._night_from_dateobs(r["date_obs"])
+
+        # ---- aggregates ----
+        objects = sorted({r["object"] for r in all_records if r["object"]})
+        total_frames = len(all_records)
+        total_integration = sum(r["exposure"] for r in all_records)
+
+        def _blank_filter_bucket():
+            return {"count": 0, "integration": 0.0, "exposures": defaultdict(int)}
+
+        by_filter = defaultdict(_blank_filter_bucket)
+        for r in all_records:
+            b = by_filter[r["filter"]]
+            b["count"] += 1
+            b["integration"] += r["exposure"]
+            b["exposures"][round(r["exposure"], 3)] += 1
+
+        # Preserve set order from caller (OrderedDict / insertion order).
+        by_set = {}
+        for set_name, recs in per_set_records:
+            if not recs:
+                continue
+            buckets = defaultdict(_blank_filter_bucket)
+            for r in recs:
+                b = buckets[r["filter"]]
+                b["count"] += 1
+                b["integration"] += r["exposure"]
+                b["exposures"][round(r["exposure"], 3)] += 1
+            by_set[set_name] = buckets
+
+        by_night = defaultdict(lambda: {"count": 0, "integration": 0.0,
+                                        "filters": defaultdict(int)})
+        for r in all_records:
+            n = r["night"]
+            by_night[n]["count"] += 1
+            by_night[n]["integration"] += r["exposure"]
+            by_night[n]["filters"][r["filter"]] += 1
+
+        # Date-sorted, with "Unknown date" (if any) last.
+        known_nights = sorted(k for k in by_night.keys() if k != "Unknown date")
+        all_nights = known_nights + (["Unknown date"] if "Unknown date" in by_night else [])
+
+        # ---- formatting ----
+        def _exps_breakdown(info):
+            parts = []
+            for exp in sorted(info["exposures"].keys()):
+                n = info["exposures"][exp]
+                parts.append(f"{n} × {self._fmt_exp(exp)}")
+            return ", ".join(parts)
+
+        # Pad filter names so columns line up — monospace, so this prints clean.
+        filt_width = max((len(k) for k in by_filter), default=4)
+        filt_width = max(filt_width, 4)
+
+        lines = []
+        heading = self.tr("Acquisition Summary")
+        if title_suffix:
+            heading = f"{heading} — {title_suffix}"
+        lines.append(heading)
+        lines.append("─" * max(32, len(heading)))
+        lines.append("")
+
+        if objects:
+            label = self.tr("Target(s):")
+            lines.append(f"{label:<20}{', '.join(objects)}")
+
+        nights_label = self.tr("Nights of data:")
+        if known_nights:
+            lines.append(f"{nights_label:<20}{len(known_nights)}  "
+                         f"({', '.join(known_nights)})")
+        else:
+            lines.append(f"{nights_label:<20}{self.tr('(no DATE-OBS in headers)')}")
+
+        lines.append(f"{self.tr('Total frames:'):<20}{total_frames}")
+        lines.append(f"{self.tr('Total integration:'):<20}{self._fmt_duration(total_integration)}")
+        lines.append("")
+
+        # By filter
+        lines.append(self.tr("── By filter ──"))
+        for f in sorted(by_filter.keys(), key=lambda s: s.lower()):
+            info = by_filter[f]
+            lines.append(
+                f"  {f:<{filt_width}}  "
+                f"{info['count']:>4} frames,  "
+                f"{self._fmt_duration(info['integration']):>12}   "
+                f"({_exps_breakdown(info)})"
+            )
+        lines.append("")
+
+        # By set (only if more than one set has frames)
+        if len(by_set) > 1:
+            lines.append(self.tr("── By set ──"))
+            for s, buckets in by_set.items():
+                set_total = sum(info["integration"] for info in buckets.values())
+                set_count = sum(info["count"] for info in buckets.values())
+                lines.append(
+                    f"  {s}:  {set_count} frames,  "
+                    f"{self._fmt_duration(set_total)}"
+                )
+                for f in sorted(buckets.keys(), key=lambda x: x.lower()):
+                    info = buckets[f]
+                    lines.append(
+                        f"     {f:<{filt_width}} "
+                        f"{info['count']:>4} × ({_exps_breakdown(info)})  =  "
+                        f"{self._fmt_duration(info['integration'])}"
+                    )
+            lines.append("")
+
+        # By night
+        lines.append(self.tr("── By night ──"))
+        for n in all_nights:
+            info = by_night[n]
+            parts = sorted(info["filters"].items(), key=lambda kv: kv[0].lower())
+            filt_breakdown = ", ".join(f"{k} ×{v}" for k, v in parts)
+            lines.append(
+                f"  {n}:  {info['count']:>4} frames,  "
+                f"{self._fmt_duration(info['integration']):>12}   "
+                f"({filt_breakdown})"
+            )
+        lines.append("")
+
+        if total_skipped:
+            lines.append(self.tr(
+                "(Note: FITS header could not be read for {0} file(s); "
+                "those frames are counted but have 'Unknown' metadata.)"
+            ).format(total_skipped))
+
+        return {
+            "text": "\n".join(lines),
+            "totals": {
+                "frames": total_frames,
+                "integration_s": total_integration,
+                "nights": len(known_nights),
+                "filters": len(by_filter),
+            },
+        }
+
+    def _completion_sound_path(self):
+        """Path to the completion chime, or None if this build ships none."""
+        # A user-chosen file wins, so anyone can swap in their own chime.
+        try:
+            custom = (self.settings.value("stacking/completion_sound_file", "", type=str) or "").strip()
+            if custom and os.path.exists(custom):
+                return custom
+        except Exception:
+            pass
+        try:
+            from setiastro.saspro.resources import _resource_path
+            for rel in ("sounds/complete.wav", "data/complete.wav"):
+                p = _resource_path(rel)
+                if p and os.path.exists(p):
+                    return p
+        except Exception:
+            pass
+        return None
+
+    def _play_completion_chime(self, success: bool = True,
+                               path_override: str | None = None,
+                               force: bool = False):
+        """
+        Audible nudge when a run finishes and the summary appears.
+
+        A long stack is something you walk away from, so the summary is easy
+        to miss. Opt out with 'stacking/completion_sound'.
+
+        Tries a bundled WAV, then the platform's own notification sound, then
+        Qt's beep. Every layer is guarded: a build without QtMultimedia, a
+        machine with no audio device, or a remote session must never stop the
+        summary dialog from appearing.
+        """
+        if not force:
+            try:
+                if not self.settings.value("stacking/completion_sound", True, type=bool):
+                    return
+            except Exception:
+                pass
+
+        # 1) User-supplied (or bundled) sound file.
+        try:
+            path = path_override or self._completion_sound_path()
+            if path and os.path.exists(path):
+                from PyQt6.QtMultimedia import QSoundEffect
+                from PyQt6.QtCore import QUrl
+                eff = getattr(self, "_completion_effect", None)
+                if eff is None or getattr(self, "_completion_effect_path", None) != path:
+                    # Keep a reference on self: a local QSoundEffect gets
+                    # garbage-collected before it finishes playing.
+                    eff = QSoundEffect(self)
+                    eff.setSource(QUrl.fromLocalFile(path))
+                    self._completion_effect = eff
+                    self._completion_effect_path = path
+                try:
+                    vol = float(self.settings.value("stacking/completion_sound_volume", 0.6, type=float))
+                except Exception:
+                    vol = 0.6
+                eff.setVolume(max(0.0, min(1.0, vol)))
+                # A file Qt can't decode (a renamed mp3, a compressed wav)
+                # would otherwise play nothing at all; fall through to the
+                # system chime instead of leaving the user in silence.
+                bad = False
+                try:
+                    bad = (eff.status() == QSoundEffect.Status.Error)
+                except Exception:
+                    bad = False
+                if not bad:
+                    eff.play()
+                    return
+                self._completion_effect = None
+                self._completion_effect_path = None
+        except Exception:
+            pass
+
+        # 2) Native notification sound — nicer than a raw bell.
+        try:
+            if sys.platform.startswith("win"):
+                import winsound
+                winsound.MessageBeep(
+                    winsound.MB_ICONASTERISK if success else winsound.MB_ICONHAND
+                )
+                return
+            if sys.platform == "darwin":
+                import subprocess
+                snd = ("/System/Library/Sounds/Glass.aiff" if success
+                       else "/System/Library/Sounds/Basso.aiff")
+                if os.path.exists(snd):
+                    subprocess.Popen(["afplay", snd],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                    return
+        except Exception:
+            pass
+
+        # 3) Last resort: Qt's own beep.
+        try:
+            QApplication.beep()
+        except Exception:
+            pass
+
+    def _show_rich_summary_dialog(self, *, title, lead_text, summary_text,
+                                  master_paths=None, sasd_paths=None):
+        """Shared completion dialog with a copyable acquisition summary
+        plus Open Masters / Open Dither / Open Both buttons.
+
+        Returns a dict {'open_masters': bool, 'open_dither': bool}. The
+        caller does the actual opening, so this helper has no coupling
+        to the dither-analysis module.
+        """
+        master_paths = [p for p in (master_paths or []) if p]
+        sasd_paths = [p for p in (sasd_paths or []) if p and os.path.exists(p)]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setMinimumSize(680, 560)
+        dlg.setWindowFlag(Qt.WindowType.Window, True)
+
+        outer = QVBoxLayout(dlg)
+
+        if lead_text:
+            lead = QLabel(lead_text, dlg)
+            lead.setWordWrap(True)
+            lead.setStyleSheet("font-weight: 600; font-size: 11pt;")
+            outer.addWidget(lead)
+
+        # Copyable monospaced summary.
+        txt = QPlainTextEdit(dlg)
+        txt.setReadOnly(True)
+        txt.setPlainText(summary_text or "")
+        try:
+            from PyQt6.QtGui import QFontDatabase
+            txt.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        except Exception:
+            f = txt.font(); f.setFamily("Monospace"); txt.setFont(f)
+        txt.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        outer.addWidget(txt, 1)
+
+        # Row: Copy
+        cp_row = QHBoxLayout()
+        btn_copy = QPushButton(self.tr("📋  Copy Summary"), dlg)
+        cp_row.addWidget(btn_copy)
+        cp_row.addStretch(1)
+        outer.addLayout(cp_row)
+
+        def _do_copy():
+            try:
+                QApplication.clipboard().setText(txt.toPlainText())
+                btn_copy.setText(self.tr("✓  Copied"))
+                QTimer.singleShot(1500, lambda: btn_copy.setText(self.tr("📋  Copy Summary")))
+            except Exception:
+                pass
+        btn_copy.clicked.connect(_do_copy)
+
+        # Row: actions + OK
+        actions = {"open_masters": False, "open_dither": False}
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+
+        btn_masters = btn_dither = btn_both = None
+        if master_paths:
+            label = self.tr("🖼  Open Master{0} ({1})").format(
+                "s" if len(master_paths) > 1 else "", len(master_paths))
+            btn_masters = QPushButton(label, dlg)
+            btn_row.addWidget(btn_masters)
+        if sasd_paths:
+            if len(sasd_paths) > 1:
+                dlabel = self.tr("📊  Open Dither Analysis ({0})").format(len(sasd_paths))
+            else:
+                dlabel = self.tr("📊  Open Dither Analysis")
+            btn_dither = QPushButton(dlabel, dlg)
+            btn_row.addWidget(btn_dither)
+        if master_paths and sasd_paths:
+            btn_both = QPushButton(self.tr("🖼 📊  Open Both"), dlg)
+            btn_row.addWidget(btn_both)
+
+        btn_ok = QPushButton(self.tr("OK"), dlg)
+        btn_ok.setDefault(True)
+        btn_row.addWidget(btn_ok)
+        outer.addLayout(btn_row)
+
+        def _choose_masters():
+            actions["open_masters"] = True; dlg.accept()
+        def _choose_dither():
+            actions["open_dither"] = True;  dlg.accept()
+        def _choose_both():
+            actions["open_masters"] = True
+            actions["open_dither"] = True
+            dlg.accept()
+        if btn_masters is not None: btn_masters.clicked.connect(_choose_masters)
+        if btn_dither  is not None: btn_dither.clicked.connect(_choose_dither)
+        if btn_both    is not None: btn_both.clicked.connect(_choose_both)
+        btn_ok.clicked.connect(dlg.accept)
+
+        # exec() blocks, so chime first — this is the moment the user
+        # who walked away needs to hear.
+        self._play_completion_chime(success=True)
+
+        dlg.exec()
+        return actions
+
+    def _show_post_alignment_complete_popup(self, message: str, master_paths: list[str]) -> None:
+        sasd_path = os.path.join(self.stacking_directory, "alignment_transforms.sasd")
+        sasd_exists = os.path.exists(sasd_path)
+
+        def _open_masters():
+            self._open_saved_masters(master_paths)
+
+        def _open_dither():
+            try:
+                from setiastro.saspro.dither_analysis import DitherAnalysisWindow
+                dlg = DitherAnalysisWindow(parent=self)
+                dlg.setWindowFlag(Qt.WindowType.Window, True)
+                dlg.load_sasd(sasd_path)
+                dlg.show()
+                dlg.raise_()
+                dlg.activateWindow()
+                if not hasattr(self, "_dither_windows"):
+                    self._dither_windows = []
+                self._dither_windows.append(dlg)
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Dither Analysis",
+                    f"Could not open Dither Analysis:\n{e}"
+                )
+
+        # Build the acquisition summary from the just-stacked light frames.
+        # At this point in the pipeline self.light_files holds the aligned
+        # paths for the finished (single) set — those files retain the
+        # original FITS headers, which is what we need for DATE-OBS /
+        # FILTER / EXPTIME. If something upstream has emptied this (e.g.
+        # a partial pipeline), the summary is simply omitted.
+        summary = None
+        try:
+            summary = self._build_acquisition_summary(getattr(self, "light_files", None))
+        except Exception as e:
+            try: self.update_status(self.tr(f"(summary skipped: {e})"))
+            except Exception: pass
+
+        if summary and summary.get("text"):
+            # Shrink the kernel message a bit so the big banner isn't
+            # the lead when there's a real summary to show.
+            lead = message.strip() if message else self.tr("Post-alignment complete.")
+            actions = self._show_rich_summary_dialog(
+                title=self.tr("Post-Alignment Complete"),
+                lead_text=lead,
+                summary_text=summary["text"],
+                master_paths=master_paths,
+                sasd_paths=[sasd_path] if sasd_exists else [],
+            )
+            if actions["open_masters"]:
+                _open_masters()
+            if actions["open_dither"]:
+                _open_dither()
+        else:
+            # Fallback: the old plain QMessageBox path, used when we can't
+            #sasproduce any summary (e.g. headers all unreadable).
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle(self.tr("Post-Alignment Complete"))
+            msg_box.setText(message)
+            msg_box.setIcon(QMessageBox.Icon.Information)
+            msg_box.addButton(QMessageBox.StandardButton.Ok)
+
+            masters_btn = None
+            if master_paths:
+                masters_btn = msg_box.addButton(
+                    self.tr("🖼 Open Saved Master{0}").format("s" if len(master_paths) > 1 else ""),
+                    QMessageBox.ButtonRole.ActionRole
+                )
+            dither_btn = None
+            if sasd_exists:
+                dither_btn = msg_box.addButton(
+                    self.tr("📊 Open Dither Analysis"),
+                    QMessageBox.ButtonRole.ActionRole
+                )
+            both_btn = None
+            if master_paths and sasd_exists:
+                both_btn = msg_box.addButton(
+                    self.tr("🖼 📊 Open Both"),
+                    QMessageBox.ButtonRole.ActionRole
+                )
+
+            msg_box.exec()
+            clicked = msg_box.clickedButton()
+            if both_btn is not None and clicked == both_btn:
+                _open_masters(); _open_dither()
+            elif masters_btn is not None and clicked == masters_btn:
+                _open_masters()
+            elif dither_btn is not None and clicked == dither_btn:
+                _open_dither()
+
+        if sasd_exists:
+            try:
+                from setiastro.saspro.dither_analysis import _save_pixscale_for_sasd
+                ps = getattr(self, "_ref_pixscale_arcsec", None)
+                if ps:
+                    _save_pixscale_for_sasd(
+                        QSettings("SetiAstro", "SASpro"), sasd_path, ps
+                    )
             except Exception:
                 pass
 
@@ -23704,23 +30804,29 @@ class StackingSuiteDialog(QDialog):
             (isinstance(payload, dict) and payload.get("cancelled"))
             or (not ok and isinstance(message, str) and "cancel" in message.lower())
         )
+        more_sets = self._reg_queue_has_more()
         try:
             if self._exec_monitor is not None:
                 if was_cancelled:
                     self._exec_monitor.mark_stopped()
+                    self._exec_monitor_pipeline_active = False
+                elif more_sets and ok:
+                    # Keep the monitor (and Stop) alive across remaining sets.
+                    self._exec_monitor_pipeline_active = True
                 else:
                     summary = ""
                     if isinstance(payload, dict):
                         lines = payload.get("summary_lines") or []
                         summary = "  ".join(str(l) for l in lines if l and not l.startswith("•"))[:80]
                     self._exec_monitor.finish_run(ok, summary)
-                self._exec_monitor_pipeline_active = False
+                    self._exec_monitor_pipeline_active = False
         except Exception:
             pass
 
         if was_cancelled:
             self._cfa_for_this_run = None
             self.update_status(self.tr("⏹ Stacking stopped by user."))
+            self._reg_queue_abort()
             try:
                 QMessageBox.information(self, self.tr("Stopped"),
                                         self.tr("Stacking was cancelled. Any partial master was discarded."))
@@ -23738,6 +30844,7 @@ class StackingSuiteDialog(QDialog):
                 except Exception:
                     pass
                 self.update_status(self.tr("⏹ Stopped before MFDeconv (cancel requested)."))
+                self._reg_queue_abort()
                 self._cfa_for_this_run = None
                 return
             try:
@@ -23766,99 +30873,61 @@ class StackingSuiteDialog(QDialog):
                 self._cfa_for_this_run = None
                 QApplication.processEvents()
             return
-        
+
+        if ok:
+            q = getattr(self, "_reg_queue", None)
+            if q and len(q) > 1:
+                sasd_path = os.path.join(self.stacking_directory, "alignment_transforms.sasd")
+                self._buffer_set_summary(
+                    self._collect_master_paths(payload),
+                    sasd_path,
+                    os.path.exists(sasd_path),
+                )
+            else:
+                self._accumulate_reg_set_masters(payload)
+
+        # Intermediate sets: no completion popup — chain immediately.
+        if more_sets and ok:
+            set_name = getattr(self, "_reg_current_set", "") or ""
+            n_left = len(self._reg_queue) - self._reg_queue_pos - 1
+            self.update_status(self.tr(
+                "✅ Set '{0}' complete. Continuing with {1} remaining set(s)…"
+            ).format(set_name, n_left))
+            self._cfa_for_this_run = None
+            QApplication.processEvents()
+            self._reg_queue_advance()
+            return
+
         try:
             if self._exec_monitor is not None:
                 self._exec_monitor.finish_all(ok, "")
         except Exception:
             pass
-        # ---- normal popup summary ----
+        # ---- popup once, after the last set (or a single-set run) ----
         if ok:
-            sasd_path = os.path.join(self.stacking_directory, "alignment_transforms.sasd")
-            sasd_exists = os.path.exists(sasd_path)
-
-            master_paths = self._collect_master_paths(payload)
-
-            # --- helpers so a single button can trigger one action, or "Both" can trigger both ---
-            def _open_masters():
-                self._open_saved_masters(master_paths)
-
-            def _open_dither():
-                try:
-                    from setiastro.saspro.dither_analysis import DitherAnalysisWindow
-                    dlg = DitherAnalysisWindow(parent=self)
-                    dlg.setWindowFlag(Qt.WindowType.Window, True)
-                    dlg.load_sasd(sasd_path)
-                    dlg.show()
-                    dlg.raise_()
-                    dlg.activateWindow()
-                    # keep a reference so it doesn't get garbage collected
-                    if not hasattr(self, "_dither_windows"):
-                        self._dither_windows = []
-                    self._dither_windows.append(dlg)
-                except Exception as e:
-                    QMessageBox.warning(
-                        self, "Dither Analysis",
-                        f"Could not open Dither Analysis:\n{e}"
-                    )
-
-            msg_box = QMessageBox(self)
-            msg_box.setWindowTitle(self.tr("Post-Alignment Complete"))
-            msg_box.setText(message)
-            msg_box.setIcon(QMessageBox.Icon.Information)
-
-            ok_btn = msg_box.addButton(QMessageBox.StandardButton.Ok)
-
-            masters_btn = None
-            if master_paths:
-                masters_btn = msg_box.addButton(
-                    self.tr("🖼 Open Saved Master{0}").format("s" if len(master_paths) > 1 else ""),
-                    QMessageBox.ButtonRole.ActionRole
+            q = getattr(self, "_reg_queue", None)
+            if q and len(q) > 1:
+                # Last mosaic set is already in `_reg_summary_buffer`;
+                # `_reg_queue_advance` shows the combined All Sets Complete dialog.
+                pass
+            else:
+                self._show_post_alignment_complete_popup(
+                    message, self._collect_master_paths(payload)
                 )
-
-            dither_btn = None
-            if sasd_exists:
-                dither_btn = msg_box.addButton(
-                    self.tr("📊 Open Dither Analysis"),
-                    QMessageBox.ButtonRole.ActionRole
-                )
-
-            both_btn = None
-            if master_paths and sasd_exists:
-                both_btn = msg_box.addButton(
-                    self.tr("🖼 📊 Open Both"),
-                    QMessageBox.ButtonRole.ActionRole
-                )
-
-            msg_box.exec()
-            clicked = msg_box.clickedButton()
-
-            # Order matters: check `both_btn` first so it doesn't fall through to
-            # one of the singles by accident.
-            if both_btn is not None and clicked == both_btn:
-                _open_masters()
-                _open_dither()
-            elif masters_btn is not None and clicked == masters_btn:
-                _open_masters()
-            elif dither_btn is not None and clicked == dither_btn:
-                _open_dither()
-
-            if sasd_exists:
-                try:
-                    from setiastro.saspro.dither_analysis import _save_pixscale_for_sasd
-                    ps = getattr(self, "_ref_pixscale_arcsec", None)
-                    if ps:
-                        _save_pixscale_for_sasd(
-                            QSettings("SetiAstro", "SASpro"), sasd_path, ps
-                        )
-                except Exception:
-                    pass
-
         else:
             QMessageBox.critical(self, self.tr("Post-Alignment Failed"), message)
 
         self._cfa_for_this_run = None
         QApplication.processEvents()
+
+        # Registration-set queue: advance to the next set, or finish. When
+        # MFDeconv is enabled this point isn't reached (that path returns after
+        # launching MF); the chain fires from _finish_mf_phase_and_exit instead.
+        if getattr(self, "_reg_queue", None):
+            if ok:
+                self._reg_queue_advance()
+            else:
+                self._reg_queue_abort("a set failed during integration")
 
 
     def save_rejection_map_sasr(self, rejection_map: dict, out_path: str):
@@ -24237,13 +31306,252 @@ class StackingSuiteDialog(QDialog):
 
     def _maybe_plate_solve_master(self, img_array, header, *, label="master", status_cb=None):
         log = status_cb or self.update_status
-
         if not self.settings.value("stacking/platesolve_master_enabled", False, type=bool):
             return header
+        ok, result = self._plate_solve_waterfall(img_array, header, label=label, status_cb=log)
+        return result if ok else header
 
+    # ──────────────────────────────────────────────────────────────────
+    # WCS integrity helpers for master-light save paths.
+    #
+    # Camera-capture pipelines (SGP/NINA/APT) typically write a seed WCS
+    # consisting of CTYPE1/2, CRPIX1/2, CRVAL1/2 and the non-standard
+    # PIXSCALE / POSANGLE / FLIPPED — but NO CD/PC/CDELT matrix. When
+    # astropy.wcs.WCS() reads such a header it silently fills in PC=I and
+    # CDELT=1.0 deg, which looks like a 3600"/px, rot=0 plate scale. That
+    # falsified WCS poisons every downstream geometry step (crop, SIP
+    # refit, dialogs) because residual-sanity checks have nothing to
+    # notice. See wcs_update.py:update_wcs_after_crop.
+    #
+    # _ensure_wcs_matrix synthesizes a real CD matrix from PIXSCALE +
+    # POSANGLE + FLIPPED whenever the seed is present but the matrix is
+    # missing. Called BEFORE _maybe_plate_solve_master so the solver has
+    # a decent seed (and so masters saved with plate-solving disabled
+    # still carry a correct WCS matrix).
+    # ──────────────────────────────────────────────────────────────────
+    def _ensure_wcs_matrix(self, header, *, label="master", status_cb=None):
+        """
+        If the header carries a seed WCS (CTYPE+CRPIX+CRVAL) but no CD or
+        PC+CDELT matrix, synthesize a CD matrix from PIXSCALE + POSANGLE +
+        FLIPPED so downstream tools see a real plate scale instead of
+        astropy's PC=I, CDELT=1.0 deg fallback. Returns the header.
+        """
+        log = status_cb or self.update_status
+        try:
+            import numpy as _np
+            from astropy.io import fits as _fits
+        except Exception:
+            return header
+
+        if header is None:
+            return header
+        if not isinstance(header, _fits.Header):
+            try:
+                tmp = _fits.Header()
+                for k, v in dict(header).items():
+                    try:
+                        tmp[k] = v
+                    except Exception:
+                        pass
+                header = tmp
+            except Exception:
+                return header
+
+        # Already has a usable matrix? Nothing to do.
+        has_cd    = all(k in header for k in ("CD1_1", "CD1_2", "CD2_1", "CD2_2"))
+        has_pc    = all(k in header for k in ("PC1_1", "PC1_2", "PC2_1", "PC2_2"))
+        has_cdelt = ("CDELT1" in header) and ("CDELT2" in header)
+        if has_cd:
+            return header
+        if has_pc and has_cdelt:
+            # Reject the astropy-default PC=I, CDELT=1.0 deg sentinel
+            # (that header can only have come from a prior broken write).
+            try:
+                cdelt1 = float(header["CDELT1"]); cdelt2 = float(header["CDELT2"])
+                pc11   = float(header["PC1_1"]);  pc22   = float(header["PC2_2"])
+                default_sentinel = (
+                    abs(cdelt1 - 1.0) < 1e-9 and abs(cdelt2 - 1.0) < 1e-9
+                    and abs(pc11) < 10.0 and abs(pc22) < 10.0
+                    # If PIXSCALE disagrees by >20% with CDELT, PC+CDELT is garbage
+                    and (
+                        "PIXSCALE" not in header
+                        or abs(float(header["PIXSCALE"]) / 3600.0 - abs(cdelt1)) / max(1e-12, abs(cdelt1)) > 0.2
+                    )
+                )
+                if not default_sentinel:
+                    return header
+                # Fall through: scrub and rebuild.
+            except Exception:
+                return header
+
+        # Need the seed WCS keys to anchor it.
+        need = ("CTYPE1", "CTYPE2", "CRPIX1", "CRPIX2", "CRVAL1", "CRVAL2")
+        if not all(k in header for k in need):
+            return header
+
+        # Need a plate scale from somewhere.
+        def _ff(keys):
+            for k in keys:
+                if k in header:
+                    try:
+                        v = float(header[k])
+                        if _np.isfinite(v) and v != 0.0:
+                            return v
+                    except (TypeError, ValueError):
+                        continue
+            return None
+
+        pixscale = _ff(("PIXSCALE", "SCALE", "SECPIX", "SECPIX1", "PIXSZ"))
+        if pixscale is None or pixscale <= 0:
+            return header
+
+        posang = _ff(("POSANGLE", "ORIENTAT", "CROTA2", "ANGLE"))
+        if posang is None:
+            posang = 0.0
+
+        flipped_raw = header.get("FLIPPED", False)
+        if isinstance(flipped_raw, str):
+            flipped = flipped_raw.strip().lower() in ("true", "t", "yes", "y", "1")
+        else:
+            flipped = bool(flipped_raw)
+
+        s  = float(pixscale) / 3600.0        # arcsec/px -> deg/px
+        th = _np.radians(float(posang))
+        c, sn = _np.cos(th), _np.sin(th)
+        sx = s if flipped else -s            # RA increases east → CD1_1 negative when not flipped
+        sy = s
+        cd11, cd12 =  sx * c, -sx * sn
+        cd21, cd22 =  sy * sn,  sy * c
+
+        # Scrub any half-written matrix leftovers before writing a clean CD.
+        for k in ("PC1_1", "PC1_2", "PC2_1", "PC2_2",
+                  "CDELT1", "CDELT2"):
+            if k in header:
+                try: del header[k]
+                except Exception: pass
+
+        header["CD1_1"]  = (float(cd11), "WCS matrix (SASpro-synth from PIXSCALE/POSANGLE)")
+        header["CD1_2"]  = (float(cd12), "WCS matrix (SASpro-synth from PIXSCALE/POSANGLE)")
+        header["CD2_1"]  = (float(cd21), "WCS matrix (SASpro-synth from PIXSCALE/POSANGLE)")
+        header["CD2_2"]  = (float(cd22), "WCS matrix (SASpro-synth from PIXSCALE/POSANGLE)")
+        if "CUNIT1"  not in header: header["CUNIT1"]  = "deg"
+        if "CUNIT2"  not in header: header["CUNIT2"]  = "deg"
+        if "RADESYS" not in header: header["RADESYS"] = "ICRS"
+        if "EQUINOX" not in header: header["EQUINOX"] = 2000.0
+        header["SASWCSSY"] = (True, "WCS CD matrix synthesized from PIXSCALE/POSANGLE")
+
+        try:
+            log(f"🧭 WCS matrix synthesized for {label} "
+                f"(PIXSCALE={pixscale:.5f}\"/px, POSANGLE={posang:.3f}°, FLIPPED={flipped}).")
+        except Exception:
+            pass
+        return header
+
+    def _resolve_upscale_factor(self, file_list, ref_header=None):
+        """
+        Return (ux, uy) upscale factors for the master whose reference frame
+        is the first alignment target, or (1.0, 1.0) if nothing matches.
+
+        _upscale_factor_by_orig is keyed by the ORIGINAL raw/calibrated path
+        from the normalization pass. The save sites only have aligned paths
+        (and self.reference_frame). This helper walks all plausible keys
+        before giving up: aligned → orig_by_aligned → self.reference_frame
+        → every entry of file_list → every stem match in the map.
+        """
+        import os as _os
+        upscale_map = getattr(self, "_upscale_factor_by_orig", {}) or {}
+        if not upscale_map:
+            return (1.0, 1.0)
+
+        def _norm(p):
+            try:
+                return _os.path.normcase(_os.path.normpath(p))
+            except Exception:
+                return p
+
+        def _look(p):
+            if not p:
+                return None
+            k = _norm(p)
+            return upscale_map.get(k)
+
+        # 1) self.reference_frame — the master's actual coord-space source
+        uf = _look(getattr(self, "reference_frame", None))
+        if uf:
+            return (float(uf[0]), float(uf[1]))
+
+        # 2) First aligned path, then its orig_by_aligned mapping
+        oba = getattr(self, "orig_by_aligned", {}) or {}
+        if file_list:
+            first = file_list[0]
+            uf = _look(first)
+            if uf:
+                return (float(uf[0]), float(uf[1]))
+            op = oba.get(_norm(first))
+            uf = _look(op) if op else None
+            if uf:
+                return (float(uf[0]), float(uf[1]))
+
+        # 3) Any entry in file_list (aligned OR via orig_by_aligned)
+        for ap in (file_list or []):
+            uf = _look(ap)
+            if uf:
+                return (float(uf[0]), float(uf[1]))
+            op = oba.get(_norm(ap))
+            uf = _look(op) if op else None
+            if uf:
+                return (float(uf[0]), float(uf[1]))
+
+        # 4) Stem-match fallback — in case normcase/normpath mismatches.
+        try:
+            ref = getattr(self, "reference_frame", None)
+            stems = []
+            if ref:
+                stems.append(_os.path.splitext(_os.path.basename(ref))[0].lower())
+            if file_list:
+                stems.append(_os.path.splitext(_os.path.basename(file_list[0]))[0].lower())
+            for key, uf in upscale_map.items():
+                try:
+                    kstem = _os.path.splitext(_os.path.basename(key))[0].lower()
+                    if any(s and (s == kstem or s in kstem or kstem in s) for s in stems):
+                        return (float(uf[0]), float(uf[1]))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return (1.0, 1.0)
+
+    def _apply_upscale_fix_to_header(self, hdr, file_list, *, label="master", status_cb=None):
+        """
+        Resolve the upscale factor for this master and apply _fix_header_for_upscale
+        when non-trivial. Centralizes the lookup so the four prepass/non-prepass
+        save sites can't drift from each other.
+        """
+        log = status_cb or self.update_status
+        ux, uy = self._resolve_upscale_factor(file_list, ref_header=hdr)
+        if (abs(ux - 1.0) > 1e-4) or (abs(uy - 1.0) > 1e-4):
+            try:
+                hdr = self._fix_header_for_upscale(hdr, ux, uy)
+                try:
+                    log(f"📐 Header corrected for {ux:.3f}×{uy:.3f} upscale on {label} "
+                        f"(PIXSCALE/XPIXSZ/XBINNING/CRPIX scaled).")
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    log(f"⚠️ Upscale header fix failed for {label}: {e}")
+                except Exception:
+                    pass
+        return hdr
+
+    def _plate_solve_waterfall(self, img_array, header, *, label="frame", status_cb=None):
+        """Run the Gaia DR3 → ASTAP → Astrometry.net solver waterfall, UNGATED by the
+        master-solve setting. Returns (ok, solved_header | error_msg). Thread-safe:
+        hops to the GUI thread when required."""
+        log = status_cb or self.update_status
         log(self.tr(f"🔭 Plate solving {label} (Gaia DR3 → ASTAP → Astrometry.net)…"))
         QApplication.processEvents()
-
         try:
             if QThread.currentThread() is self._gui_thread:
                 from setiastro.saspro.plate_solver import plate_solve_numpy_headless, _status_popup_close
@@ -24261,14 +31569,12 @@ class StackingSuiteDialog(QDialog):
                 result = holder.get("result", "plate solve failed (no result returned)")
         except Exception as e:
             log(self.tr(f"⚠️ Plate solve error for {label}: {e}"))
-            return header
-
+            return False, str(e)
         if ok:
             log(self.tr(f"✅ Plate solve succeeded for {label}."))
-            return result
         else:
             log(self.tr(f"⚠️ Plate solve failed for {label}: {result}"))
-            return header
+        return ok, result
 
     def stack_images_mixed_drizzle(
         self,
@@ -24380,9 +31686,18 @@ class StackingSuiteDialog(QDialog):
             hdr_orig["CREATOR"]  = "SetiAstroSuite"
             hdr_orig["DATE-OBS"] = datetime.utcnow().isoformat()
 
-            n_frames_group = len(file_list)
-            hdr_orig["NCOMBINE"] = (int(n_frames_group), "Number of frames combined")
+            # Count soft-rejected (weight = 0) subs out of the stacked
+            # tally so the filename and NCOMBINE header reflect only
+            # the frames that actually contributed photons.
+            n_frames_group = self._count_contributing_frames(file_list)
+            n_frames_pool  = len(file_list)
+            hdr_orig["NCOMBINE"] = (int(n_frames_group), "Number of frames combined (weight > 0)")
             hdr_orig["NSTACK"]   = (int(n_frames_group), "Alias of NCOMBINE (SetiAstro)")
+            if n_frames_pool != n_frames_group:
+                hdr_orig["NPOOL"]   = (int(n_frames_pool),
+                                       "Pre-rejection frame pool size (SetiAstro)")
+                hdr_orig["NREJECT"] = (int(n_frames_pool - n_frames_group),
+                                       "Frames soft-rejected (weight=0) by score outlier pass")
 
             is_mono_orig = (integrated_image.ndim == 2)
             if is_mono_orig:
@@ -24397,14 +31712,25 @@ class StackingSuiteDialog(QDialog):
                 hdr_orig["NAXIS2"] = integrated_image.shape[0]
                 hdr_orig["NAXIS3"] = integrated_image.shape[2]
 
-            n_frames_group = len(file_list)
+            # Already computed above; keep variable in scope for the
+            # filename stem construction a few lines below.
             H, W = integrated_image.shape[:2]
             display_group = self._label_with_dims(group_key, W, H)
-            base = f"MasterLight_{display_group}_{n_frames_group}stacked"
+            _set_pref = (f"{self._reg_current_set_slug}_"
+                         if getattr(self, "_reg_current_set", "Default") not in (None, "Default")
+                         else "")
+            base = f"MasterLight_{_set_pref}{display_group}_{n_frames_group}stacked"
             base = self._normalize_master_stem(base)
             out_path_orig = self._build_out(self._master_light_dir(), base, "fit")
             out_path_orig = self._dedupe_out_path(out_path_orig)
-            # ── NEW: plate solve before saving ──────────────────────────
+            # ── NEW: upscale fix (binning/pixscale/CRPIX/CD) → ensure WCS CD
+            #        matrix → plate solve. Mirrors stack_images_mixed_drizzle_from_prepass.
+            hdr_orig = self._apply_upscale_fix_to_header(
+                hdr_orig, file_list, label=f"'{group_key}' master", status_cb=log
+            )
+            hdr_orig = self._ensure_wcs_matrix(
+                hdr_orig, label=f"'{group_key}' master", status_cb=log
+            )
             hdr_orig = self._maybe_plate_solve_master(
                 integrated_image, hdr_orig, label=f"'{group_key}' master", status_cb=log
             )
@@ -24512,16 +31838,32 @@ class StackingSuiteDialog(QDialog):
                     scale=1.0,
                     rect_override=group_rect if group_rect is not None else global_rect
                 )
-                hdr_crop["NCOMBINE"] = (int(n_frames_group), "Number of frames combined")
+                hdr_crop["NCOMBINE"] = (int(n_frames_group), "Number of frames combined (weight > 0)")
                 hdr_crop["NSTACK"]   = (int(n_frames_group), "Alias of NCOMBINE (SetiAstro)")
-                # ── NEW: plate solve the cropped master separately (geometry/CRPIX differ) ──
+                if n_frames_pool != n_frames_group:
+                    hdr_crop["NPOOL"]   = (int(n_frames_pool),
+                                           "Pre-rejection frame pool size (SetiAstro)")
+                    hdr_crop["NREJECT"] = (int(n_frames_pool - n_frames_group),
+                                           "Frames soft-rejected (weight=0) by score outlier pass")
+                # ── NEW: upscale fix → ensure WCS CD matrix → plate solve
+                #        the cropped master separately (geometry/CRPIX differ) ──
+                hdr_crop = self._apply_upscale_fix_to_header(
+                    hdr_crop, file_list,
+                    label=f"'{group_key}' auto-cropped master", status_cb=log
+                )
+                hdr_crop = self._ensure_wcs_matrix(
+                    hdr_crop, label=f"'{group_key}' auto-cropped master", status_cb=log
+                )
                 hdr_crop = self._maybe_plate_solve_master(
                     cropped_img, hdr_crop, label=f"'{group_key}' auto-cropped master", status_cb=log
-                )                
+                )
                 is_mono_crop = (cropped_img.ndim == 2)
                 Hc, Wc = (cropped_img.shape[:2] if cropped_img.ndim >= 2 else (H, W))
                 display_group_crop = self._label_with_dims(group_key, Wc, Hc)
-                base_crop = f"MasterLight_{display_group_crop}_{n_frames_group}stacked_autocrop"
+                _set_pref = (f"{self._reg_current_set_slug}_"
+                             if getattr(self, "_reg_current_set", "Default") not in (None, "Default")
+                             else "")
+                base_crop = f"MasterLight_{_set_pref}{display_group_crop}_{n_frames_group}stacked_autocrop"
                 base_crop = self._normalize_master_stem(base_crop)
                 out_path_crop = self._build_out(self._master_light_dir(), base_crop, "fit")
                 out_path_crop = self._dedupe_out_path(out_path_crop)
@@ -24828,6 +32170,14 @@ class StackingSuiteDialog(QDialog):
                     orig_list.append(op)
             originals_by_group[group] = orig_list
         # ---- Drizzle pass (only for groups with drizzle enabled) ----
+        # Reset the session-level drizzle output buffers so this run's
+        # list reflects only its own saves (drizzle_stack_one_group
+        # appends to these on each successful write, and finalize's
+        # summary payload reads them to tell the user both the normal
+        # AND drizzle masters are available to open).
+        self._drizzle_master_paths = []
+        self._drizzle_crop_paths   = []
+
         for group_key, file_list in grouped_files.items():
             if not drizzle_enabled_global:
                 log(f"✅ Drizzle disabled (checkbox off). Group '{group_key}' integrated image already saved.")
@@ -24904,11 +32254,28 @@ class StackingSuiteDialog(QDialog):
             for g, p in autocrop_outputs:
                 summary_lines.append(f"  • {g} → {p}")
 
-        # Primary masters (star + comet-only + comet-blend) plus star autocrop
-        # variants, for the "Open Saved Masters" button in the completion popup.
-        crop_paths = [p for (_g, p) in autocrop_outputs]
+        _driz_outs      = getattr(self, "_drizzle_master_paths", []) or []
+        _driz_crop_outs = getattr(self, "_drizzle_crop_paths",   []) or []
+        if _driz_outs:
+            summary_lines.append("")
+            summary_lines.append("Drizzle masters saved:")
+            for g, p in _driz_outs:
+                summary_lines.append(f"  • {g} → {p}")
+        if _driz_crop_outs:
+            summary_lines.append("")
+            summary_lines.append("Drizzle auto-cropped files saved:")
+            for g, p in _driz_crop_outs:
+                summary_lines.append(f"  • {g} → {p}")
+
+        # Primary masters (star + comet-only + comet-blend) + star
+        # autocrop variants + any drizzle masters / drizzle autocrop
+        # variants, for the "Open Saved Masters" button.
+        crop_paths         = [p for (_g, p) in autocrop_outputs]
+        drizzle_paths      = [p for (_g, p) in _driz_outs]
+        drizzle_crop_paths = [p for (_g, p) in _driz_crop_outs]
         seen, master_files_out = set(), []
-        for p in list(master_files) + crop_paths:
+        for p in (list(master_files) + crop_paths
+                  + drizzle_paths + drizzle_crop_paths):
             if p and p not in seen:
                 seen.add(p)
                 master_files_out.append(p)
@@ -24916,6 +32283,8 @@ class StackingSuiteDialog(QDialog):
         return {
             "summary_lines": summary_lines,
             "autocrop_outputs": autocrop_outputs,
+            "drizzle_outputs": list(_driz_outs),
+            "drizzle_crop_outputs": list(_driz_crop_outs),
             "master_files": master_files_out,
         }
 
@@ -25056,7 +32425,10 @@ class StackingSuiteDialog(QDialog):
 
         # --- Determine algo and GPU availability ONCE before tile loop ---
         algo = (algo_override or self.rejection_algorithm)
-        use_gpu = bool(self._hw_accel_enabled()) and _torch_ok() and _gpu_algo_supported(algo)
+        use_gpu = (
+            bool(self._hw_accel_enabled()) and _torch_ok()
+            and _gpu_algo_supported(algo) and _rejection_gpu_ok(status_cb=log)
+        )
         log(f"📊 Comet integration: algo={algo}  GPU={'yes' if use_gpu else 'no'}")
 
         # --- CPU fallback reducer (comet-aware) ---
@@ -25080,7 +32452,7 @@ class StackingSuiteDialog(QDialog):
             elif algo == "Trimmed Mean":
                 return trimmed_mean_weighted_np(ts, weights_array, trim_fraction=self.trim_fraction)
             elif algo == "Extreme Studentized Deviate (ESD)":
-                return esd_clip_weighted_np(ts, weights_array, threshold=self.esd_threshold)
+                return esd_clip_weighted_np(ts, weights_array, threshold=self.esd_threshold, esd_bonferroni=bool(getattr(self, "esd_bonferroni", False)))
             elif algo == "Biweight Estimator":
                 return biweight_location_weighted_np(ts, weights_array, tuning_constant=self.biweight_constant)
             elif algo == "Modified Z-Score Clipping":
@@ -25394,6 +32766,7 @@ class StackingSuiteDialog(QDialog):
                 try: shutil.rmtree(tmp_root, ignore_errors=True)
                 except Exception: pass
 
+        reduce_maps = (not collect_per_file) and (not DEBUG_INTEGRATION_ONLY)
         _ctx_instance = _safe_torch_inference_ctx() if use_gpu else contextlib.nullcontext()
 
         with _ctx_instance:
@@ -25432,6 +32805,7 @@ class StackingSuiteDialog(QDialog):
                             sigma_high=float(self.sigma_high),
                             trim_fraction=float(self.trim_fraction),
                             esd_threshold=float(self.esd_threshold),
+                            esd_bonferroni=bool(getattr(self, "esd_bonferroni", False)),
                             biweight_constant=float(self.biweight_constant),
                             modz_threshold=float(self.modz_threshold),
                             comet_hclip_k=float(self.settings.value("stacking/comet_hclip_k", 1.30, type=float)),
@@ -25450,17 +32824,25 @@ class StackingSuiteDialog(QDialog):
 
                 integrated_image[y0:y1, x0:x1, :] = tile_result
 
-                trm = np.asarray(tile_rej_map, dtype=bool)
-                if trm.ndim == 4:
-                    trm = np.any(trm, axis=-1)
-                rej_any[y0:y1, x0:x1]   |= np.any(trm, axis=0)
-                rej_count[y0:y1, x0:x1] += trm.sum(axis=0).astype(np.uint16)
+                if not DEBUG_INTEGRATION_ONLY:
+                    if isinstance(tile_rej_map, tuple):
+                        # GPU already reduced to (any-rejected, reject-count);
+                        # copy the two small (th,tw) maps straight in.
+                        tr_any, tr_cnt = tile_rej_map
+                        rej_any[y0:y1, x0:x1]   |= tr_any
+                        rej_count[y0:y1, x0:x1] += tr_cnt.astype(np.uint16)
+                    else:
+                        trm = np.asarray(tile_rej_map, dtype=bool)
+                        if trm.ndim == 4:
+                            trm = np.any(trm, axis=-1)
+                        rej_any[y0:y1, x0:x1]   |= np.any(trm, axis=0)
+                        rej_count[y0:y1, x0:x1] += trm.sum(axis=0).astype(np.uint16)
 
-                if collect_per_file:
-                    for i, fpath in enumerate(file_list):
-                        m = trm[i]
-                        if np.any(m):
-                            per_file_rejections[fpath].append((x0, y0, m.copy()))
+                        if collect_per_file:
+                            for i, fpath in enumerate(file_list):
+                                m = trm[i]
+                                if np.any(m):
+                                    per_file_rejections[fpath].append((x0, y0, m.copy()))
 
                 dt = _time.perf_counter() - t0_tile
                 work_px = th * tw * len(file_list) * C
@@ -25585,6 +32967,7 @@ class StackingSuiteDialog(QDialog):
 
     def _start_after_align_worker(self, aligned_light_files: dict[str, list[str]]):
         if self._cancelled():
+            self._reg_queue_abort()
             self._set_registration_busy(False)
             mon = getattr(self, "_exec_monitor", None)
             if mon is not None:
@@ -25830,13 +33213,59 @@ class StackingSuiteDialog(QDialog):
             return None
 
         aligned_files = []
+        seen_al = set()
         for d in aligned_dirs:
+            # "Sets" now nest each set's registered frames in a daughter folder
+            # under Aligned_Images (…/Aligned_Images/<set>/<frame>_r.fit), so a
+            # flat os.listdir(d) would only see the sub-folder *names* and miss
+            # every aligned frame. Walk the tree so per-set daughters (and the
+            # legacy flat layout) are both discovered.
             try:
-                for name in os.listdir(d):
-                    if name.lower().endswith(self._COUNTERPART_EXTS):
-                        aligned_files.append(os.path.normpath(os.path.join(d, name)))
+                for root, _dirs, names in os.walk(d):
+                    for name in names:
+                        if name.lower().endswith(self._COUNTERPART_EXTS):
+                            ap = os.path.normpath(os.path.join(root, name))
+                            # De-dup across overlapping candidate dirs; recursion
+                            # makes double-discovery (which would look like an
+                            # ambiguous core-key collision) more likely.
+                            key = os.path.normcase(ap)
+                            if key in seen_al:
+                                continue
+                            seen_al.add(key)
+                            aligned_files.append(ap)
             except Exception:
                 pass
+
+        # Collapse duplicate registered twins to a single FRESHEST file per
+        # core-key. Aligned_Images now holds BOTH pre-"Sets" loose _n_r files at
+        # the root AND the current set's _n_r files in a daughter subfolder, so
+        # the recursive walk finds two copies per source. Two files sharing a
+        # core-key are the same source registered twice (core-key = unique raw
+        # stem, dir-independent), not a real collision -- but the duplicates make
+        # every core-key look ambiguous, so the matcher bails and the
+        # "already registered?" prompt silently stops appearing. Keeping the
+        # newest also prefers the current set over the stale leftovers.
+        _by_core = {}
+        for _ap in aligned_files:
+            _k = self._pipeline_core_key(_ap)
+            _cur = _by_core.get(_k)
+            if _cur is None:
+                _by_core[_k] = _ap
+            else:
+                try:
+                    if os.path.getmtime(_ap) > os.path.getmtime(_cur):
+                        _by_core[_k] = _ap
+                except Exception:
+                    pass
+        _raw_n = len(aligned_files)
+        aligned_files = list(_by_core.values())
+
+        try:
+            self.update_status(self.tr(
+                f"🔎 reg-precheck: {len(aligned_dirs)} aligned dir(s), "
+                f"{_raw_n} registered file(s) -> {len(aligned_files)} unique source(s)"))
+        except Exception:
+            pass
 
         if not aligned_files:
             return None
@@ -26193,11 +33622,30 @@ class StackingSuiteDialog(QDialog):
         # Partition each group into matched (fresh twin) vs unmatched.
         matched_lf, unmatched_lf = {}, {}
         n_matched = n_unmatched = 0
+        _dbg_none = _dbg_missing = _dbg_stale = 0
+        _dbg_sample = []
         for g, lst in light_files.items():
             mkeep, ukeep = [], []
             for p in lst:
                 twin = matcher(p)
-                if twin and os.path.exists(twin) and self._twin_is_fresh(p, twin):
+                fresh = bool(twin and os.path.exists(twin) and self._twin_is_fresh(p, twin))
+                if not fresh:
+                    if not twin:
+                        _dbg_none += 1
+                        _why = "no-twin (matcher returned None: ambiguous or unmatched)"
+                    elif not os.path.exists(twin):
+                        _dbg_missing += 1
+                        _why = f"twin-missing: {os.path.basename(twin)}"
+                    else:
+                        _dbg_stale += 1
+                        try:
+                            _dt = os.path.getmtime(twin) - os.path.getmtime(p)
+                        except Exception:
+                            _dt = float("nan")
+                        _why = f"stale (twin−tree mtime = {_dt:+.0f}s): {os.path.basename(twin)}"
+                    if len(_dbg_sample) < 4:
+                        _dbg_sample.append(f"{os.path.basename(p)} → {_why}")
+                if fresh:
                     mkeep.append(p); n_matched += 1
                 else:
                     ukeep.append(p); n_unmatched += 1
@@ -26208,6 +33656,13 @@ class StackingSuiteDialog(QDialog):
 
         n_total = n_matched + n_unmatched
         if n_matched == 0:
+            try:
+                self.update_status(self.tr(
+                    f"🔎 reg-precheck: 0/{n_total} usable twins "
+                    f"(no-twin={_dbg_none}, missing={_dbg_missing}, stale={_dbg_stale}). "
+                    + " | ".join(_dbg_sample)))
+            except Exception:
+                pass
             return None  # nothing already registered → nothing to offer
 
         drizzle_on = False
@@ -26218,6 +33673,16 @@ class StackingSuiteDialog(QDialog):
 
         # ── Case 1: everything already registered ───────────────────────────
         if n_unmatched == 0:
+            # Reuse the first set's decision on later sets instead of asking
+            # again. "reuse" here means "everything's registered → integrate".
+            cached = getattr(self, "_reg_precheck_choice", None)
+            if cached is not None:
+                if cached == "register_all":
+                    return "register_all"
+                if cached == "cancel":
+                    return "cancel"
+                return "integrate"  # cached == "reuse"
+
             msg = self.tr(
                 f"Found already-registered versions for all {n_total} frame(s) "
                 f"in Aligned_Images.\n\nSkip registration and integrate them now?"
@@ -26240,9 +33705,12 @@ class StackingSuiteDialog(QDialog):
             box.exec()
             clicked = box.clickedButton()
             if clicked is skip_btn:
+                self._reg_precheck_choice = "reuse"
                 return "integrate"
             if clicked is reg_btn:
+                self._reg_precheck_choice = "register_all"
                 return "register_all"
+            self._reg_precheck_choice = "cancel"
             return "cancel"
 
         # ── Case 2: some registered, some not ───────────────────────────────
@@ -26277,6 +33745,14 @@ class StackingSuiteDialog(QDialog):
                     can_merge_append = False
 
         if drizzle_on and not can_merge_append:
+            # Only Register-All or Cancel are meaningful here. On a later set,
+            # honor the cached choice: a prior "cancel" cancels; anything else
+            # (including a "reuse" intent that can't be satisfied under drizzle
+            # without a mergeable .sasd) falls back to a full re-registration.
+            cached = getattr(self, "_reg_precheck_choice", None)
+            if cached is not None:
+                return "cancel" if cached == "cancel" else "register_all"
+
             # Drizzle wants uniform coverage. Without a mergeable .sasd we'd
             # end up with per-frame transforms only for the newly-registered
             # stragglers, so tell the user honestly and offer full re-reg.
@@ -26295,38 +33771,55 @@ class StackingSuiteDialog(QDialog):
             box.addButton(QMessageBox.StandardButton.Cancel)
             box.exec()
             role = box.buttonRole(box.clickedButton())
-            return "register_all" if role == QMessageBox.ButtonRole.AcceptRole else "cancel"
+            if role == QMessageBox.ButtonRole.AcceptRole:
+                self._reg_precheck_choice = "register_all"
+                return "register_all"
+            self._reg_precheck_choice = "cancel"
+            return "cancel"
 
         # Drizzle-off partial, or drizzle-on with a mergeable .sasd → offer
         # the real time-saver: register only the stragglers, then integrate
         # (and, if drizzle is on, merge-append into the existing .sasd first).
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle(self.tr("Partially Registered"))
-        _dz_note = ""
-        if drizzle_on and can_merge_append:
-            _dz_note = self.tr(
-                "\n\nDrizzle is enabled: the new transforms will be merged "
-                "into the existing alignment_transforms.sasd so all frames "
-                "are drizzled uniformly."
-            )
-        box.setText(self.tr(
-            f"{n_matched} of {n_total} frame(s) already have registered "
-            f"versions in Aligned_Images.\n\nRegister only the {n_unmatched} "
-            f"new frame(s) and then integrate all {n_total} together?"
-        ) + _dz_note)
-        new_btn = box.addButton(self.tr(f"Register {n_unmatched} New → Integrate All"),
-                                QMessageBox.ButtonRole.AcceptRole)
-        all_btn = box.addButton(self.tr("Register All"),
-                                QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(new_btn)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is all_btn:
-            return "register_all"
-        if clicked is not new_btn:
-            return "cancel"
+        # On a later set, reuse the first set's decision: "reuse" falls through
+        # to the register-new setup below, the others return immediately.
+        cached = getattr(self, "_reg_precheck_choice", None)
+        if cached is not None:
+            if cached == "register_all":
+                return "register_all"
+            if cached == "cancel":
+                return "cancel"
+            # cached == "reuse" → fall through to the register-new setup.
+        else:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle(self.tr("Partially Registered"))
+            _dz_note = ""
+            if drizzle_on and can_merge_append:
+                _dz_note = self.tr(
+                    "\n\nDrizzle is enabled: the new transforms will be merged "
+                    "into the existing alignment_transforms.sasd so all frames "
+                    "are drizzled uniformly."
+                )
+            box.setText(self.tr(
+                f"{n_matched} of {n_total} frame(s) already have registered "
+                f"versions in Aligned_Images.\n\nRegister only the {n_unmatched} "
+                f"new frame(s) and then integrate all {n_total} together?"
+            ) + _dz_note)
+            new_btn = box.addButton(self.tr(f"Register {n_unmatched} New → Integrate All"),
+                                    QMessageBox.ButtonRole.AcceptRole)
+            all_btn = box.addButton(self.tr("Register All"),
+                                    QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(new_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is all_btn:
+                self._reg_precheck_choice = "register_all"
+                return "register_all"
+            if clicked is not new_btn:
+                self._reg_precheck_choice = "cancel"
+                return "cancel"
+            self._reg_precheck_choice = "reuse"
 
         # Resolve the aligned (_n_r) twin the NEW frames will align to. Every
         # _n_r frame sits on the stack grid by construction, so any twin is a
@@ -26376,11 +33869,443 @@ class StackingSuiteDialog(QDialog):
         ))
         return "register_new"
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # "Calibrate Lights" pre-check — already-calibrated counterpart resolution
+    #
+    # Mirrors the registered-twin pre-check above but for the calibration
+    # stage. When the user re-runs calibration after adding new raw lights
+    # to the tree (or re-opening a stacking directory), many of the selected
+    # lights usually already have a calibrated frame sitting in the shared
+    # <stacking_directory>/Calibrated folder from the previous run. Re-doing
+    # the calibration of those frames is wasted GPU/CPU time, so we offer to
+    # skip them and only calibrate the new ones.
+    #
+    # Matching is cheap and exact (no fuzzy stem logic needed) because the
+    # calibrated name is a deterministic function of the source light's
+    # directory + stem, computed by the module-level `_cal_out_name()`:
+    #   /src/dir/foo.fit    ->   {Calibrated}/{md5(/src/dir)[:6]}_foo_c.fit
+    # so we just compute the expected twin path per light and stat it. Both
+    # the GPU and CPU calibration paths write through `_cal_out_name()`, so
+    # the twin we check is byte-for-byte the one the pipeline would produce.
+    #
+    # Freshness: the twin must be at least as new as the source light
+    # (`_twin_is_fresh`, reused from the registration pre-check). This
+    # catches the "re-ingested lights" case where a user re-copies the raw
+    # files but keeps the old Calibrated folder in place.
+    # ─────────────────────────────────────────────────────────────────────────
+    def _precheck_calibrated_counterparts(self, calibrated_dir: str):
+        """
+        Run at the top of calibrate_lights (before any heavy work).
+
+        Returns one of:
+          "skip"           – every selected light has a fresh calibrated
+                             twin; caller should return without calibrating.
+          "calibrate_new"  – self.light_files has been pruned to the
+                             unmatched (uncalibrated) frames; caller
+                             calibrates only those. The tree walk inside
+                             calibrate_lights filters frame_infos by the
+                             pruned `leaf_paths`, so the matched frames
+                             are skipped cleanly.
+          "calibrate_all"  – user chose to recalibrate everything; caller
+                             proceeds with a normal full calibration (no
+                             change to self.light_files).
+          "cancel"         – user cancelled; caller should stop.
+          None             – nothing already calibrated / check unusable;
+                             caller proceeds normally.
+        """
+        light_files = getattr(self, "light_files", None)
+        if not light_files:
+            return None
+
+        # Consume the Full-Pipeline latches BEFORE any early-return path so a
+        # stale True can't leak into the user's next manual click. Full
+        # Pipeline sets exactly one of these per invocation (they're mutually
+        # exclusive); a one-shot consume here keeps the "silent reuse" /
+        # "silent force full" behavior scoped to this invocation only.
+        auto_reuse = bool(getattr(self, "_pipeline_auto_reuse_cal", False))
+        if auto_reuse:
+            self._pipeline_auto_reuse_cal = False
+        force_recal = bool(getattr(self, "_pipeline_force_recal", False))
+        if force_recal:
+            self._pipeline_force_recal = False
+
+        # Force clean slate wins over everything else — don't even bother
+        # scanning for twins. "calibrate_all" is the sentinel the caller
+        # treats as "fall through to a normal full calibration", which is
+        # exactly what clean slate wants.
+        if force_recal:
+            try:
+                self.update_status(self.tr(
+                    "🧹 Full Pipeline (clean slate): skipping already-"
+                    "calibrated check — recalibrating every selected light."
+                ))
+            except Exception:
+                pass
+            return "calibrate_all"
+
+        if not calibrated_dir or not os.path.isdir(calibrated_dir):
+            # No Calibrated folder yet → first run, nothing to match against.
+            return None
+
+        # Partition each group into matched (fresh twin) vs unmatched.
+        matched_lf, unmatched_lf = {}, {}
+        n_matched = n_unmatched = 0
+        _dbg_missing = _dbg_stale = _dbg_err = 0
+        _dbg_sample = []
+        for g, lst in light_files.items():
+            mkeep, ukeep = [], []
+            for p in lst:
+                cal = None
+                try:
+                    cal = _cal_out_name(p, calibrated_dir)
+                except Exception:
+                    _dbg_err += 1
+                    cal = None
+
+                if cal and os.path.exists(cal) and self._twin_is_fresh(p, cal):
+                    mkeep.append(p); n_matched += 1
+                else:
+                    ukeep.append(p); n_unmatched += 1
+                    if cal is None:
+                        if len(_dbg_sample) < 4:
+                            _dbg_sample.append(
+                                f"{os.path.basename(p)} → could not derive twin name"
+                            )
+                    elif not os.path.exists(cal):
+                        _dbg_missing += 1
+                        if len(_dbg_sample) < 4:
+                            _dbg_sample.append(
+                                f"{os.path.basename(p)} → no twin "
+                                f"({os.path.basename(cal)})"
+                            )
+                    else:
+                        _dbg_stale += 1
+                        try:
+                            _dt = os.path.getmtime(cal) - os.path.getmtime(p)
+                        except Exception:
+                            _dt = float("nan")
+                        if len(_dbg_sample) < 4:
+                            _dbg_sample.append(
+                                f"{os.path.basename(p)} → stale "
+                                f"(twin−light mtime = {_dt:+.0f}s)"
+                            )
+            if mkeep:
+                matched_lf[g] = mkeep
+            if ukeep:
+                unmatched_lf[g] = ukeep
+
+        n_total = n_matched + n_unmatched
+        if n_matched == 0:
+            try:
+                self.update_status(self.tr(
+                    f"🔎 cal-precheck: 0/{n_total} usable twins "
+                    f"(missing={_dbg_missing}, stale={_dbg_stale}, "
+                    f"err={_dbg_err}). "
+                    + " | ".join(_dbg_sample)))
+            except Exception:
+                pass
+            return None  # nothing already calibrated → nothing to offer
+
+        try:
+            self.update_status(self.tr(
+                f"🔎 cal-precheck: {n_matched}/{n_total} selected light(s) "
+                f"already have calibrated frames in "
+                f"{os.path.basename(calibrated_dir)}."))
+        except Exception:
+            pass
+
+        # `auto_reuse` was consumed at the top; when True, the Quick-tab
+        # Full-Pipeline button asked for a silent resume on top of what's
+        # already on disk, so both the "all matched" and "partial" branches
+        # below bypass the dialog.
+
+        # ── Case 1: everything already calibrated ───────────────────────
+        if n_unmatched == 0:
+            if auto_reuse:
+                self.update_status(self.tr(
+                    f"⏭️ Full Pipeline: all {n_total} light(s) already "
+                    f"calibrated — reusing existing calibrated frames."))
+                return "skip"
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle(self.tr("Already Calibrated"))
+            box.setText(self.tr(
+                f"Found calibrated versions for all {n_total} selected "
+                f"light(s) in the Calibrated folder.\n\nSkip calibration "
+                f"and keep the existing calibrated frames?"
+            ))
+            skip_btn = box.addButton(self.tr("Skip Calibration"),
+                                     QMessageBox.ButtonRole.AcceptRole)
+            cal_btn  = box.addButton(self.tr("Recalibrate All"),
+                                     QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(skip_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is skip_btn:
+                return "skip"
+            if clicked is cal_btn:
+                return "calibrate_all"
+            return "cancel"
+
+        # ── Case 2: some calibrated, some not ───────────────────────────
+        if auto_reuse:
+            self.update_status(self.tr(
+                f"⏭️ Full Pipeline: {n_matched}/{n_total} light(s) already "
+                f"calibrated — calibrating only the {n_unmatched} new "
+                f"frame(s)."))
+            # Prune self.light_files to the unmatched (uncalibrated) frames.
+            # The calibrate_lights tree-walk filters by `leaf_paths`, so the
+            # caller must also prune leaf_paths after this returns.
+            self.light_files = unmatched_lf
+            return "calibrate_new"
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(self.tr("Partially Calibrated"))
+        box.setText(self.tr(
+            f"{n_matched} of {n_total} selected light(s) already have "
+            f"calibrated versions in the Calibrated folder.\n\n"
+            f"Calibrate only the {n_unmatched} new frame(s) and reuse "
+            f"the existing calibrated frames for the rest?"
+        ))
+        new_btn = box.addButton(
+            self.tr(f"Calibrate {n_unmatched} New Only"),
+            QMessageBox.ButtonRole.AcceptRole)
+        all_btn = box.addButton(self.tr("Recalibrate All"),
+                                QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(new_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is all_btn:
+            return "calibrate_all"
+        if clicked is not new_btn:
+            return "cancel"
+
+        # Prune self.light_files to the unmatched (uncalibrated) frames.
+        # The calibrate_lights tree-walk filters by `leaf_paths`, so the
+        # caller must also prune leaf_paths after this returns.
+        self.light_files = unmatched_lf
+        return "calibrate_new"
+
+    def _read_drizzle_stamp(self, path: str) -> dict | None:
+        """Reconstruct a drizzle entry from an aligned frame's SASDZ* header stamp.
+
+        star_alignment stamps every aligned frame it writes with the source
+        original, the transform kind + matrix, and the reference grid. This
+        recovers that so "Skip Registration and Integrate" can drizzle from the
+        original pixels even when no (or a stale) .sasd exists.
+
+        Returns {"kind","matrix"(np or None),"ref_shape"(H,W)|None,"orig_path"|None}
+        or None if the frame carries no stamp.
+        """
+        try:
+            hdr = fits.getheader(path, ext=0)
+        except Exception:
+            return None
+        if not bool(hdr.get("SASDZ", False)):
+            return None
+
+        kind = hdr.get("SASDZKND", None)
+        if kind is not None:
+            kind = str(kind).strip().lower() or None
+
+        ref_shape = None
+        try:
+            rh = int(hdr.get("SASDZRFH", 0) or 0)
+            rw = int(hdr.get("SASDZRFW", 0) or 0)
+            if rh > 0 and rw > 0:
+                ref_shape = (rh, rw)
+        except Exception:
+            ref_shape = None
+
+        # Recover the full original path from the COMMENT sidecar if present,
+        # else fall back to the stored basename (resolved against the tree later).
+        # A COMMENT card holds 72 characters, so astropy splits a longer path over
+        # consecutive COMMENT cards and strips each card's trailing spaces on read.
+        # Re-join the cards, padding each full one back to 72, until the text ends
+        # with the SASDZORG basename; never guess past it.
+        _bn = hdr.get("SASDZORG", None)
+        _bn = str(_bn).strip() if _bn else None
+        orig_path = None
+        try:
+            cards = list(hdr.cards)
+            for i, card in enumerate(cards):
+                cs = str(card.value) if card.keyword == "COMMENT" else ""
+                if not cs.startswith("SASDZORGPATH="):
+                    continue
+                joined = cs
+                j = i + 1
+                while (_bn and not joined.rstrip().endswith(_bn)
+                       and j < len(cards) and cards[j].keyword == "COMMENT"):
+                    joined = joined.ljust(72 * (j - i)) + str(cards[j].value)
+                    j += 1
+                joined = joined.split("=", 1)[1].strip()
+                if _bn is None or joined.endswith(_bn):
+                    orig_path = joined
+                break
+        except Exception:
+            orig_path = None
+        if not orig_path:
+            orig_path = _bn
+
+        # Rebuild the matrix for the small-matrix kinds.
+        matrix = None
+        if kind in ("affine", "similarity", "homography"):
+            try:
+                nr = int(hdr.get("SASDZNR", 0) or 0)
+                nc = int(hdr.get("SASDZNC", 0) or 0)
+                if nr > 0 and nc > 0:
+                    vals = []
+                    for i in range(nr * nc):
+                        v = hdr.get(f"SASDZ{i:02d}", None)
+                        if v is None:
+                            vals = []
+                            break
+                        vals.append(float(v))
+                    if len(vals) == nr * nc:
+                        matrix = np.asarray(vals, np.float64).reshape(nr, nc)
+            except Exception:
+                matrix = None
+            # affine/homography with no usable matrix is not reconstructable →
+            # treat as unstamped so the caller uses identity rather than a
+            # silently-wrong transform.
+            if matrix is None:
+                return None
+
+        return {"kind": kind, "matrix": matrix, "ref_shape": ref_shape, "orig_path": orig_path}
+
+    def _infer_ref_shape_from_first(self, grouped_files: dict) -> tuple | None:
+        """Reference grid = pixel dims of the first aligned frame (all frames in
+        the pre-registered set share the same grid). Returns (H, W) or None."""
+        try:
+            for _g, _lst in (grouped_files or {}).items():
+                for _p in _lst:
+                    try:
+                        h = fits.getheader(_p, ext=0)
+                        ht = int(h.get("NAXIS2", 0) or 0)
+                        wd = int(h.get("NAXIS1", 0) or 0)
+                        if ht > 0 and wd > 0:
+                            return (ht, wd)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return None
+
+    def _write_sasd_from_pre_registered(self, status_cb=None) -> bool:
+        """Persist a complete alignment_transforms.sasd for the pre-registered
+        ("Skip Registration and Integrate") path from transforms reconstructed
+        out of the aligned frames' SASDZ* header stamps.
+
+        The .sasd is a first-class artifact — dither analysis and other tooling
+        read it, and its absence on the skip path is why the Dither button never
+        appeared and drizzle had nothing to load. We rebuild it here so those
+        consumers work again.
+
+        Clobber-safety (the crux of the 5-of-100 problem): we NEVER blindly
+        overwrite. If a compatible .sasd already exists (same REF_SHAPE) we
+        merge-append into it so no prior entries are lost; only when there is no
+        file (or an incompatible-geometry one) do we write a fresh complete file.
+        If we reconstructed no real transforms (all frames unstamped), we leave
+        any existing .sasd untouched rather than replace it with an empty one.
+
+        Returns True if a .sasd was written or updated.
+        """
+        log = status_cb or (lambda *_: None)
+
+        xf = getattr(self, "_pre_reg_xforms", None) or {}
+        # Keep only entries that carry a real, reconstructable transform. Unstamped
+        # frames map to (None, None) and must not be written as bogus entries.
+        real = {os.path.normpath(k): v for k, v in xf.items()
+                if isinstance(v, tuple) and v[0]}
+        if not real:
+            log("ℹ️ No stamped transforms recovered; leaving existing .sasd untouched.")
+            return False
+
+        rs = getattr(self, "ref_shape_for_drizzle", None)
+        try:
+            Href, Wref = int(rs[0]), int(rs[1])
+        except Exception:
+            log("⚠️ No usable reference shape; cannot write .sasd for pre-registered set.")
+            return False
+        if Href <= 0 or Wref <= 0:
+            log("⚠️ Reference shape is degenerate; cannot write .sasd.")
+            return False
+
+        sasd_path = os.path.join(self.stacking_directory, "alignment_transforms.sasd")
+        ref_path = getattr(self, "reference_frame", None) or "__PRE_REGISTERED__"
+
+        # Split reconstructed transforms into the writer's two inputs:
+        #   drizzle_xforms {orig: (kind, matrix|None)}   — all kinds
+        #   fallback_affine {orig: 2x3}                  — affine/similarity only
+        drizzle_xforms = {}
+        fallback_affine = {}
+        for orig, (kind, mat) in real.items():
+            drizzle_xforms[orig] = (kind, mat)
+            if kind in ("affine", "similarity") and mat is not None:
+                try:
+                    fallback_affine[orig] = np.asarray(mat, np.float64).reshape(2, 3)
+                except Exception:
+                    pass
+
+        # If a compatible SASD already exists, merge-append (never clobber).
+        old_H, old_W, _ = self._sasd_read_header(sasd_path)
+        try:
+            if old_H and old_W and (old_H, old_W) == (Href, Wref):
+                ok = self._merge_append_sasd_v2(
+                    existing_path=sasd_path,
+                    out_path=sasd_path,
+                    ref_shape=(Href, Wref),
+                    ref_path=ref_path,
+                    new_drizzle_xforms=drizzle_xforms,
+                    new_fallback_affine=fallback_affine,
+                )
+                if ok:
+                    log(f"✅ Merge-appended {len(real)} reconstructed transform(s) "
+                        f"into existing alignment_transforms.sasd.")
+                    return True
+                # Merge refused (e.g. geometry drift mid-read): fall through to a
+                # fresh write below rather than leaving the skip path with nothing.
+                log("ℹ️ Merge-append declined; writing a fresh .sasd from stamps.")
+            elif old_H and old_W:
+                log(f"ℹ️ Existing .sasd REF_SHAPE {old_H}×{old_W} ≠ this set "
+                    f"{Href}×{Wref}; writing a fresh .sasd from stamps.")
+
+            self._save_alignment_transforms_sasd_v2(
+                out_path=sasd_path,
+                ref_shape=(Href, Wref),
+                ref_path=ref_path,
+                drizzle_xforms=drizzle_xforms,
+                fallback_affine=fallback_affine,
+            )
+            log(f"✅ Wrote alignment_transforms.sasd from {len(real)} reconstructed "
+                f"transform(s) (pre-registered set).")
+
+            # Preserve the pixscale sidecar dither analysis relies on, when known.
+            try:
+                from setiastro.saspro.dither_analysis import _save_pixscale_for_sasd
+                ps = getattr(self, "_ref_pixscale_arcsec", None)
+                if ps:
+                    from PyQt6.QtCore import QSettings as _QS
+                    _save_pixscale_for_sasd(_QS("SetiAstro", "SASpro"), sasd_path, ps)
+            except Exception:
+                pass
+
+            return True
+        except Exception as e:
+            log(f"⚠️ Failed writing .sasd for pre-registered set: {e!r}")
+            return False
+
     def integrate_registered_images(self):
         """
         Integrate frames that are already aligned (and typically normalized).
         We only do fast measurements for weights; no re-normalization, no re-alignment.
         """
+        # Set only by the "Register N New → Integrate All" hand-off.
+        _leave_out = getattr(self, "_integrate_leave_out", None) or set()
+        self._integrate_leave_out = None
         if getattr(self, "_registration_busy", False):
             self.update_status(self.tr("⏸ Another job is running; ignoring extra click."))
             return
@@ -26393,6 +34318,47 @@ class StackingSuiteDialog(QDialog):
 
             # 1) Pull files from the tree
             self.extract_light_files_from_tree()
+
+            # 1a) Multi-Set runs narrow self.light_files to the current Set in
+            # register_images (line ~22772), but extract_light_files_from_tree()
+            # above rebuilds from the WHOLE tree and discards that scoping. If
+            # we don't re-apply the Set scope here, every Set's integration
+            # pass restacks frames belonging to OTHER Sets — labeled with the
+            # current Set's prefix — producing duplicate masters (e.g. a
+            # "MasterLight_m17_SII_..." twin of a frame that belongs to the
+            # SNR set). Default is scoped too: it holds only the frames with no
+            # Set of their own.
+            cur_set = getattr(self, "_reg_current_set", None)
+            if cur_set:
+                scoped_lf = {}
+                dropped = 0
+                for g, lst in self.light_files.items():
+                    kept = [p for p in lst if self._set_of_frame(p) == cur_set]
+                    if kept:
+                        scoped_lf[g] = kept
+                    dropped += (len(lst) - len(kept))
+                self.light_files = scoped_lf
+                if dropped:
+                    self.update_status(self.tr(
+                        f"🧩 Set '{cur_set}': scoped integration to this set "
+                        f"({dropped} frame(s) from other sets held back)."
+                    ))
+
+            # 1a') After "Register N New → Integrate All": leave out the new
+            # frames that failed registration in that run.
+            if _leave_out:
+                _n_before = sum(len(lst) for lst in self.light_files.values())
+                self.light_files = {
+                    g: [p for p in lst
+                        if os.path.normcase(os.path.normpath(p)) not in _leave_out]
+                    for g, lst in self.light_files.items()
+                }
+                _n_left_out = _n_before - sum(len(lst) for lst in self.light_files.values())
+                if _n_left_out:
+                    self.update_status(self.tr(
+                        f"🚫 Leaving out {_n_left_out} new frame(s) that failed registration."
+                    ))
+
             if not self.light_files:
                 self.update_status(self.tr("⚠️ No registered images found!"))
                 self._set_registration_busy(False)
@@ -26402,8 +34368,17 @@ class StackingSuiteDialog(QDialog):
             # their registered counterparts already exist in a sibling
             # Aligned_Images / aligned_images folder, integrate *those* instead.
             # Frames with no counterpart fall back to the tree frame as-is.
+            _tree_files = self.light_files
             self.light_files, _n_swapped, _n_total, _align_matcher = \
                 self._resolve_aligned_counterparts(self.light_files)
+            # Registered twin -> the tree frame it replaced. The weights below
+            # measure that original, exactly as Register and Integrate does.
+            _twin_to_tree = {
+                twin: orig
+                for g, lst in self.light_files.items()
+                for twin, orig in zip(lst, _tree_files.get(g, []))
+                if twin != orig
+            }
             if _align_matcher is None:
                 self.update_status(self.tr(
                     f"ℹ️ No Aligned_Images folder found near the tree — "
@@ -26458,6 +34433,76 @@ class StackingSuiteDialog(QDialog):
                 cand = all_files[:]
 
             self.update_status(self.tr(f"📊 Found {len(cand)} aligned/normalized frames. Measuring in parallel previews…"))
+
+            # ── disk-space pre-flight ─────────────────────────────────────
+            # Integration writes one master light per group (plus optional
+            # rejection layers, drizzle upscaling, and an auto-cropped copy),
+            # and converts any XISF inputs to float32 FITS first. Masters are
+            # small next to the registered set, but drizzle at high scale over
+            # several groups can still be sizeable — so we estimate it too.
+            try:
+                rep_geo = None
+                for _p in cand[:16]:
+                    rep_geo = self._frame_geometry(_p)
+                    if rep_geo:
+                        break
+
+                plan = []
+                if rep_geo:
+                    _h, _w, _n3, _bayer = rep_geo
+                    _ch = 3 if _n3 == 3 else 1  # registered frames are already debayered
+                    n_groups = max(1, len([g for g, l in self.light_files.items() if l]))
+
+                    drizzle_on = bool(self.settings.value(
+                        "stacking/drizzle_enabled", False, type=bool))
+                    try:
+                        scale = float(self._get_drizzle_scale()) if drizzle_on else 1.0
+                    except Exception:
+                        scale = 1.0
+                    if scale <= 0:
+                        scale = 1.0
+
+                    per_master = _frame_out_bytes(_h * scale, _w * scale, _ch)
+
+                    # Rejection layers add REJ_COMB (uint8) + REJ_FRAC (f32) +
+                    # REJ_CNT (u32) = ~9 bytes/pixel on top of each master.
+                    save_rej = bool(self.settings.value(
+                        "stacking/save_rejection_layers", True, type=bool))
+                    if save_rej:
+                        per_master += int(round(_h * scale)) * int(round(_w * scale)) * (1 + 4 + 4)
+
+                    # Auto-crop writes a second (slightly smaller) copy per group.
+                    autocrop_on = bool(self.settings.value(
+                        "stacking/autocrop_enabled", False, type=bool))
+                    copies = 2 if autocrop_on else 1
+
+                    label = f"Master light(s) (× {n_groups}"
+                    if drizzle_on:
+                        label += f", {scale:g}× drizzle"
+                    if save_rej:
+                        label += ", +rejection layers"
+                    if autocrop_on:
+                        label += ", +auto-crop"
+                    label += ")"
+                    plan.append((label, per_master * n_groups * copies))
+
+                # XISF → FITS prep copies written up-front, before integration.
+                xisf_paths = [p for p in cand if str(p).lower().endswith(".xisf")]
+                if xisf_paths:
+                    prep_bytes, _, _ = self._estimate_frames_bytes(xisf_paths, mode="as_is")
+                    plan.append(
+                        (f"Prepared FITS from XISF (× {len(xisf_paths)})", prep_bytes)
+                    )
+
+                if plan and not self._confirm_disk_budget(
+                    self.stacking_directory, plan,
+                    title=self.tr("Integrate — disk space"),
+                ):
+                    self.update_status(self.tr("🛑 Integration cancelled."))
+                    self._set_registration_busy(False)
+                    return
+            except Exception as _dse:
+                self.update_status(self.tr(f"⚠️ Disk-space check skipped: {_dse}"))
 
             # ─────────────────────────────────────────────────────────────────────
             # XISF safety: convert any .xisf to float32 FITS once up-front so the
@@ -26564,12 +34609,182 @@ class StackingSuiteDialog(QDialog):
                 for i in range(0, len(lst), size):
                     yield lst[i:i+size]
 
-            chunks = list(chunk_list(cand, chunk_size))
-            total_chunks = len(chunks)
+            # `chunks` is defined further down, AFTER we classify every frame
+            # as either (a) a twin of a calibrated original we've already
+            # measured in processes (just-coverage fast path) or (b) something
+            # we need to measure via a preview (slow path). Only the slow-path
+            # frames get chunked, so a run that matches every twin skips the
+            # preview-based chunk loop entirely.
 
             # For already registered images, we don’t need to rescale to a target bin.
             # We can just make small previews directly from the FITS (debayer-aware superpixel).
             from concurrent.futures import ThreadPoolExecutor, as_completed
+            from setiastro.saspro.stacking_measure_worker import measure_file
+
+            # Registered twins are measured on their calibrated originals with
+            # measure_file. It is CPU/GIL-bound, so measure the originals up
+            # front in worker processes, the way Register and Integrate does;
+            # in threads it runs several times slower. Same function, so the
+            # numbers don't change. Anything the pool didn't measure is
+            # measured in-thread by _star_job below.
+            orig_measured = {}
+            _origs = sorted({_twin_to_tree[fp] for fp in cand if fp in _twin_to_tree})
+            # Register measures every frame at the smallest binning in the set.
+            _bins = ([self._bin_from_header_fast_any(f)
+                      for lst in _tree_files.values() for f in lst]
+                     if _origs else [])
+            _xbin = min((b[0] for b in _bins), default=1)
+            _ybin = min((b[1] for b in _bins), default=1)
+            try:
+                use_processes = bool(self.settings.value(
+                    "stacking/measure_use_processes", True, type=bool))
+            except Exception:
+                use_processes = True
+            try:
+                from setiastro.saspro.worker_env import (check_process_pools,
+                                                         process_pools_ok as _pp_ok)
+                check_process_pools(log_fn=self.update_status)
+            except Exception:
+                def _pp_ok():
+                    return True
+            if _origs and use_processes and _pp_ok():
+                try:
+                    import multiprocessing as _mp
+                    from concurrent.futures import ProcessPoolExecutor
+                    proc_workers = max(2, os.cpu_count() or 4)
+                    report_every = max(1, len(_origs) // 20)
+                    self.update_status(self.tr(
+                        f"\U0001F30D Measuring {len(_origs)} calibrated original(s) across "
+                        f"{proc_workers} processes…"))
+                    with ProcessPoolExecutor(max_workers=proc_workers,
+                                             mp_context=_mp.get_context("spawn")) as executor:
+                        futs = [executor.submit(measure_file, o, _xbin, _ybin) for o in _origs]
+                        for done, fut in enumerate(as_completed(futs), 1):
+                            if self._cancelled():
+                                executor.shutdown(wait=False, cancel_futures=True)
+                                raise StackCancelled()
+                            status, o, payload = fut.result()
+                            orig_measured[o] = (status, o, payload)
+                            if done == len(_origs) or done % report_every == 0:
+                                self.update_status(self.tr(
+                                    f"\U0001F4E6 Measured {done}/{len(_origs)} originals"))
+                                QApplication.processEvents()
+                except StackCancelled:
+                    raise
+                except Exception as e:
+                    self.update_status(self.tr(
+                        f"⚠️ Multi-process measurement unavailable "
+                        f"({type(e).__name__}: {e}); using threads instead."))
+                    orig_measured.clear()
+
+            # ─────────────────────────────────────────────────────────────
+            # Classify every aligned frame:
+            #   • twinned_frames   — we already measured the calibrated
+            #     original via the process pool above; every quality metric
+            #     (star count, FWHM, ecc, noise, mean, median) comes from
+            #     that measurement. The only thing we still need per aligned
+            #     frame is its coverage (fraction of non-zero, finite pixels)
+            #     — a warp-border artifact that lives on the ALIGNED frame,
+            #     not the original — so we take a cheap preview per twin
+            #     and compute cov from it. No star detection, no FWHM re-fit,
+            #     no noise re-estimate.
+            #   • untwinned_frames — anything we couldn't process-measure
+            #     (missing twin link, measure_file returned a non-ok status,
+            #     or the ProcessPoolExecutor errored and we cleared the
+            #     cache). These go through the full chunked preview-based
+            #     measurement path below.
+            # Before this split the chunk loop re-measured EVERY aligned
+            # frame on a small preview even when the originals were already
+            #sasprocessed, which produced the "⚡ Measured 245/245 originals
+            # → 📦 Measuring chunk 1/7…" double-pass the user flagged.
+            # ─────────────────────────────────────────────────────────────
+            twinned_frames = []
+            untwinned_frames = []
+            for _fp in cand:
+                _orig = _twin_to_tree.get(_fp)
+                _rec = orig_measured.get(_orig) if _orig is not None else None
+                if _rec is not None and _rec[0] == "ok":
+                    twinned_frames.append(_fp)
+                else:
+                    untwinned_frames.append(_fp)
+
+            if twinned_frames:
+                self.update_status(self.tr(
+                    "⚡ {0} aligned frame(s) carry an already-measured original "
+                    "— computing coverage only, skipping redundant preview "
+                    "measurement."
+                ).format(len(twinned_frames)))
+                QApplication.processEvents()
+
+                def _cov_job(fp: str):
+                    """Build the aligned preview and read a single stat off
+                    it: coverage. Everything else comes from the pre-measured
+                    original. One tiny preview load per frame vs. preview +
+                    valid-region stats + star detection + FWHM + MAD-noise."""
+                    try:
+                        prev = self._quick_preview_any(
+                            fp, target_xbin=1, target_ybin=1
+                        )
+                        if prev is None:
+                            return fp, 0.0, None
+                        a = np.asarray(prev, dtype=np.float32)
+                        if a.size == 0:
+                            return fp, 0.0, None
+                        valid = np.isfinite(a) & (a != 0.0)
+                        return fp, float(valid.mean()), None
+                    except Exception as _ce:
+                        return fp, 0.0, f"{type(_ce).__name__}: {_ce}"
+
+                _cov_report_every = max(1, len(twinned_frames) // 20)
+                _cov_done = 0
+                with ThreadPoolExecutor(max_workers=max_workers) as _ex:
+                    for fp, cov, err in _ex.map(_cov_job, twinned_frames):
+                        if self._cancelled():
+                            raise StackCancelled()
+                        if err is not None:
+                            # Treat it as untwinned so the slow path will
+                            # try to recover it rather than silently
+                            # dropping it with a dead-weight 0 coverage.
+                            untwinned_frames.append(fp)
+                            self.update_status(self.tr(
+                                "⚠️ Coverage read failed for {0}: {1} — "
+                                "falling back to preview measurement."
+                            ).format(os.path.basename(fp), err))
+                            continue
+                        _orig = _twin_to_tree[fp]
+                        _status, _o, payload = orig_measured[_orig]
+                        mean_v, med, c, ecc, size, noise = payload
+                        mean_values[fp]      = float(mean_v)
+                        preview_medians[fp]  = med
+                        star_counts[fp] = {
+                            "count":        int(c),
+                            "eccentricity": float(ecc),
+                            "fwhm":         float(size),
+                            "noise":        float(noise),
+                        }
+                        frame_coverage[fp]   = float(cov)
+                        measured_frames.append(fp)
+                        _cov_done += 1
+                        if _cov_done == len(twinned_frames) or \
+                                _cov_done % _cov_report_every == 0:
+                            self.update_status(self.tr(
+                                "⚡ Coverage computed {0}/{1}"
+                            ).format(_cov_done, len(twinned_frames)))
+                            QApplication.processEvents()
+                self.update_status(self.tr(
+                    "✅ {0} twinned frame(s) measured without preview "
+                    "double-pass."
+                ).format(_cov_done))
+                QApplication.processEvents()
+
+            # Only non-twinned frames need the preview-based chunk loop.
+            chunks = list(chunk_list(untwinned_frames, chunk_size))
+            total_chunks = len(chunks)
+            if not chunks:
+                self.update_status(self.tr(
+                    "⏭️ All aligned frames handled by the fast path — "
+                    "skipping chunked preview measurement."
+                ))
 
             for idx, chunk in enumerate(chunks, 1):
                 if self._cancelled():
@@ -26654,6 +34869,23 @@ class StackingSuiteDialog(QDialog):
                     i, fp = i_fp
                     try:
                         prev = previews[i]
+                        # coverage = fraction of finite, non-zero pixels over
+                        # the whole (pre-crop) preview → 1.0 for a
+                        # borderless reference
+                        _a = np.asarray(prev, dtype=np.float32)
+                        _valid = np.isfinite(_a) & (_a != 0.0)
+                        cov = float(_valid.mean()) if _a.size else 0.0
+                        # A registered twin is measured on the calibrated
+                        # original it replaced, with Register's own
+                        # measure_file: same frame, same numbers, and no
+                        # warp border in front of the star detector.
+                        orig = _twin_to_tree.get(fp)
+                        if orig is not None:
+                            status, _fp, payload = (orig_measured.get(orig)
+                                                    or measure_file(orig, _xbin, _ybin))
+                            if status == "ok":
+                                mean_v, med, c, ecc, size, noise = payload
+                                return fp, float(mean_v), med, c, ecc, size, noise, cov, None
                         core, mean_v, _med_full = _valid_region_stats(prev)
                         pmin = float(np.nanmin(core))
                         c, ecc, _blind_size = _star_count_ecc_size(core - pmin)
@@ -26664,12 +34896,6 @@ class StackingSuiteDialog(QDialog):
                         size = self._measure_fwhm_halfres(core)
                         med = float(np.median(core - pmin))
                         noise = self._mad_noise(core)
-                        # coverage = fraction of finite, non-zero pixels over
-                        # the whole (pre-crop) preview → 1.0 for a
-                        # borderless reference
-                        _a = np.asarray(prev, dtype=np.float32)
-                        _valid = np.isfinite(_a) & (_a != 0.0)
-                        cov = float(_valid.mean()) if _a.size else 0.0
                         return fp, float(mean_v), med, c, ecc, size, noise, cov, None
                     except Exception as _job_e:
                         return (fp, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0,
@@ -26749,6 +34975,36 @@ class StackingSuiteDialog(QDialog):
             _noise_pos = [v for v in _noise_pos if v > 1e-9]
             _noise_ref = float(np.median(_noise_pos)) if _noise_pos else 0.0
 
+            # Exposure-time scaling (linear) — mirror the Register path. See
+            # the matching block there for the long-form rationale. For
+            # already-aligned frames, EXPTIME is preserved from calibration
+            # through registration, so the header lookup works for _n_r.fit
+            # inputs here just as it does for raw/calibrated inputs on the
+            # Register side.
+            _exp_scaling_on = bool(self.settings.value(
+                "stacking/exposure_weighted", True, type=bool
+            ))
+            if _exp_scaling_on:
+                _exp_factors, _exp_max = self._exposure_factors_for_frames(measured_frames)
+            else:
+                _exp_factors, _exp_max = ({fp: 1.0 for fp in measured_frames}, 0.0)
+
+            if _exp_scaling_on and _exp_max > 0.0:
+                _n_short = sum(1 for f in _exp_factors.values() if f < 0.999)
+                if _n_short > 0:
+                    dbg.append(
+                        f"⏱️ Exposure scaling ON — max exposure in group "
+                        f"{_exp_max:g}s; {_n_short}/{len(measured_frames)} "
+                        f"frame(s) carry < max exposure and will be down-"
+                        f"weighted linearly."
+                    )
+            elif not _exp_scaling_on:
+                dbg.append(
+                    "⏱️ Exposure scaling OFF — frames weighted purely on "
+                    "quality terms; mixed-exposure groups will over-weight "
+                    "the shorter-exposure subs."
+                )
+
             for fp in measured_frames:
                 c   = star_counts[fp]["count"]
                 ecc = star_counts[fp]["eccentricity"]
@@ -26765,13 +35021,15 @@ class StackingSuiteDialog(QDialog):
                     count=c, ecc=ecc, bg=bg, fwhm=fwhm, noise=noise,
                     fwhm_ref=_fwhm_ref, noise_ref=_noise_ref, exps=_wexps,
                 )
+                exp_f = float(_exp_factors.get(fp, 1.0))
+                scaled_w = raw_w * exp_f
 
-                self.frame_weights[fp] = raw_w
+                self.frame_weights[fp] = scaled_w
                 dbg.append(
                     f"📂 {os.path.basename(fp)} → StarCount={c}, Ecc={ecc:.4f}, "
                     f"Bg={bg:.4f}, FWHM~{fwhm:.2f}, "
                     f"Sharp={terms['sharp']:.3f}, SNR={terms['snr']:.3f}, "
-                    f"Weight={raw_w:.4f}"
+                    f"ExpScale={exp_f:.3f}, Weight={scaled_w:.4f}"
                 )
 
             # Normalize weights the same way the Register-and-Integrate path
@@ -26815,6 +35073,18 @@ class StackingSuiteDialog(QDialog):
 
             self.update_status(self.tr("✅ Frame weights computed!"))
             QApplication.processEvents()
+
+            # Score-outlier sub rejection (soft; see Register-and-Integrate
+            # path for the full rationale). Shares the same helper so both
+            # entry points behave identically.
+            try:
+                self._apply_sub_rejection(
+                    measured_frames,
+                    star_counts=star_counts,
+                    preview_medians=preview_medians,
+                )
+            except Exception as _e:
+                self.update_status(self.tr(f"⚠️ Sub rejection skipped: {_e}"))
 
             # 4) Choose reference (used for MFDeconv masks, autocrop base,
             #    display, and logging). Priority:
@@ -26866,8 +35136,83 @@ class StackingSuiteDialog(QDialog):
             # 6) Build aligned file groups from tree (they're already aligned/normalized)
             aligned_light_files = {g: lst for g, lst in self.light_files.items() if lst}
 
+            # 6b) Reconstruct drizzle geometry from aligned-frame header stamps.
+            # These frames are already in the reference grid; there is no live
+            # .sasd we can trust (a later registration run overwrites it, and a
+            # partial run may describe only a handful of frames). Instead, read
+            # the per-frame SASDZ* stamp written at alignment time to recover each
+            # frame's ORIGINAL source, transform kind+matrix, and reference grid.
+            # From those we synthesize the same structures a fresh registration
+            # would hand drizzle: orig_by_aligned, a drizzle xforms map, and
+            # ref_shape_for_drizzle. Frames with no stamp fall back to identity
+            # (deposit the aligned pixels as-is) so drizzle still runs, just
+            # without deposit-from-original for those specific frames.
+            self.orig_by_aligned = {}
+            self._pre_reg_xforms = {}          # orig_path(norm) -> (kind, matrix|None)
+            self._pre_reg_ref_shape = None     # (H, W) recovered from stamps
+            _n_stamped = 0
+            _n_unstamped = 0
+            for _g, _lst in aligned_light_files.items():
+                for _p in _lst:
+                    _pn = os.path.normpath(_p)
+                    stamp = self._read_drizzle_stamp(_pn)
+                    if stamp is not None:
+                        # Map aligned → recovered ORIGINAL so the dual-band split
+                        # and the entry builder deposit from original pixels.
+                        orig_norm = stamp.get("orig_path") or _pn
+                        self.orig_by_aligned[_pn] = os.path.normpath(orig_norm)
+                        self._pre_reg_xforms[os.path.normpath(orig_norm)] = (
+                            stamp.get("kind"), stamp.get("matrix")
+                        )
+                        if self._pre_reg_ref_shape is None and stamp.get("ref_shape"):
+                            self._pre_reg_ref_shape = stamp["ref_shape"]
+                        _n_stamped += 1
+                    else:
+                        # Unstamped: identity deposit from the aligned pixels.
+                        self.orig_by_aligned[_pn] = _pn
+                        self._pre_reg_xforms[_pn] = (None, None)
+                        _n_unstamped += 1
+
+            # Reference grid for the drizzle canvas: prefer a stamp-recovered
+            # shape; else fall back to the actual pixel dimensions of the first
+            # aligned frame (they are all on the same grid by definition here).
+            if self._pre_reg_ref_shape is not None:
+                self.ref_shape_for_drizzle = tuple(self._pre_reg_ref_shape)
+            else:
+                self.ref_shape_for_drizzle = self._infer_ref_shape_from_first(aligned_light_files)
+
+            # Mark this run as pre-registered so the drizzle deposit knows a
+            # missing/None transform means "identity deposit", not "skip".
+            self._drizzle_pre_registered = True
+
+            if _n_stamped or _n_unstamped:
+                self.update_status(self.tr(
+                    f"🧭 Drizzle geometry from aligned headers: "
+                    f"{_n_stamped} stamped, {_n_unstamped} unstamped"
+                    + (f", ref grid {self.ref_shape_for_drizzle[0]}×{self.ref_shape_for_drizzle[1]}"
+                       if self.ref_shape_for_drizzle else "")
+                ))
+                if _n_unstamped and not _n_stamped:
+                    self.update_status(self.tr(
+                        "ℹ️ These aligned frames predate drizzle stamping. Drizzle will "
+                        "upsample the aligned pixels (identity), which is NOT true "
+                        "deposit-from-original drizzle. Re-run registration with drizzle "
+                        "enabled for full drizzle quality."
+                    ))
+
+            # 6c) Persist a complete alignment_transforms.sasd from the recovered
+            # transforms. This restores the artifact that dither analysis and
+            # other tooling read, and gives drizzle a real file to load. It is
+            # clobber-safe: it merge-appends into a compatible existing .sasd and
+            # only writes fresh when none exists, so a partial set never destroys
+            # a complete file. No-op when nothing was reconstructable.
+            try:
+                self._write_sasd_from_pre_registered(status_cb=self.update_status)
+            except Exception as _e:
+                self.update_status(self.tr(f"⚠️ Could not persist .sasd for this set: {_e!r}"))
+
             # 7) Optional: split dual-band OSC into Ha / SII / OIII / Hb
-            if getattr(self, "split_dualband_cb", None) and self.split_dualband_cb.isChecked():
+            if self._dual_split_requested():
                 self.update_status(self.tr(
                     "🌈 Splitting registered dual-band OSC frames into Ha / SII / OIII / Hb…"
                 ))
@@ -27122,6 +35467,24 @@ class StackingSuiteDialog(QDialog):
 
         log(f"✅ SASD v2: loaded {len(xforms)} transform(s).")
 
+        # Merge in transforms reconstructed from aligned-frame header stamps
+        # (the "Skip Registration and Integrate" path). These are keyed by the
+        # ORIGINAL path recovered from each frame's SASDZ* stamp, matching the
+        # entry["orig"] the split/entry builder produced. SASD entries win on a
+        # key collision (a live full run is the most authoritative), but for
+        # pre-registered frames the SASD usually lacks these originals entirely,
+        # so the stamps fill the gap and let deposit-from-original drizzle work.
+        pre_reg_xf = getattr(self, "_pre_reg_xforms", None)
+        if isinstance(pre_reg_xf, dict) and pre_reg_xf:
+            _added = 0
+            for _k, _v in pre_reg_xf.items():
+                _kk = os.path.normpath(_k)
+                if _kk not in xforms:
+                    xforms[_kk] = _v
+                    _added += 1
+            if _added:
+                log(f"🧭 Merged {_added} transform(s) reconstructed from aligned headers.")
+
         # ---- sanity: entries must exist ----
         if not entries:
             log(f"⚠️ Group '{group_key}' has no drizzle entries – skipping.")
@@ -27192,7 +35555,7 @@ class StackingSuiteDialog(QDialog):
         # --- choose depositor ONCE (and log it) ---
         # Always use footprint/kernel drizzle for drizzle output.
         # Point deposit is not valid for 2x/3x drizzle.
-        # Projective deposit: full 3x3 transform, no pixel pre-warp (correct
+        #sasprojective deposit: full 3x3 transform, no pixel pre-warp (correct
         # drizzle for affine AND homography; required for CFA sparse planes).
         deposit_func = drizzle_deposit_kernel_mono_proj if is_mono else drizzle_deposit_color_kernel_proj
         kinf = ["square", "circular", "gaussian"][_kcode]
@@ -27336,6 +35699,34 @@ class StackingSuiteDialog(QDialog):
             except Exception:
                 pass
             return orig_path
+        _pre_registered = bool(getattr(self, "_drizzle_pre_registered", False))
+
+        def _pixel_path_for_entry(ent):
+            orig = os.path.normpath(ent.get("orig", ""))
+            aligned = os.path.normpath(ent.get("aligned", ""))
+            kind, X = xforms.get(orig, (None, None))
+            if kind is None:
+                # Pre-registered frames carry no solved transform: the aligned
+                # (split) file already sits in the reference grid, so deposit
+                # its pixels directly (identity). Non-pre-registered = genuine
+                # miss → no pixel source.
+                if _pre_registered:
+                    return aligned or orig or None
+                return None
+            if isinstance(kind, str) and (kind.startswith("poly") or kind in ("tps", "thin_plate_spline")):
+                return aligned or None
+            if kind in ("affine", "similarity", "homography") and X is not None:
+                return _cfa_pixel_source(orig)
+            return None
+
+        _prefetch_paths = [_pixel_path_for_entry(e) for e in entries]
+        _prefetch = _FramePrefetcher(
+            _prefetch_paths,
+            loader=lambda p: load_image(p)[0],   # pixels only; header/meta re-read where needed
+            lookahead=3,
+            workers=min(4, (os.cpu_count() or 4)),
+        )
+
         for i, ent in enumerate(entries):
             orig_file = os.path.normpath(ent.get("orig", ""))
             aligned_file = os.path.normpath(ent.get("aligned", ""))  # this is what rejections/weights reference
@@ -27349,8 +35740,22 @@ class StackingSuiteDialog(QDialog):
             weight = frame_weights.get(aligned_file, frame_weights.get(orig_file, 1.0))
 
             kind, X = xforms.get(orig_file, (None, None))
+
+            # Pre-registered safety: if we have a real transform from a header
+            # stamp but the ORIGINAL pixels are gone (user kept only aligned
+            # frames), we cannot deposit-from-original. Fall back to identity on
+            # the aligned pixels rather than dropping the frame. Only do this in
+            # pre-registered mode — in a live run a missing original is a real
+            # error worth surfacing.
+            if (_pre_registered and kind in ("affine", "similarity", "homography")
+                    and X is not None):
+                if not os.path.exists(orig_file):
+                    log(f"ℹ️ Original missing for {os.path.basename(orig_file)}; "
+                        f"depositing aligned pixels (identity) instead of true drizzle.")
+                    kind, X = None, None
+
             log(f"🧭 Drizzle uses {kind or '-'} for {os.path.basename(orig_file)} (chan={chan or 'all'})")
-            if kind is None:
+            if kind is None and not _pre_registered:
                 log(f"⚠️ No usable transform for {os.path.basename(orig_file)} – skipping")
                 continue
 
@@ -27358,7 +35763,18 @@ class StackingSuiteDialog(QDialog):
             pixels_are_registered = False
             img_data = None
 
-            if isinstance(kind, str) and (kind.startswith("poly") or kind in ("tps", "thin_plate_spline")):
+            if kind is None and _pre_registered:
+                # Pre-registered / "Skip Registration and Integrate": the aligned
+                # (or split) file is already on the reference grid. Deposit it
+                # directly with an identity canvas at the requested drizzle scale.
+                pixel_path = aligned_file or orig_file
+                if not pixel_path:
+                    log(f"⚠️ Pre-registered frame has no pixel source – skipping {os.path.basename(orig_file)}")
+                    continue
+                H_canvas = np.eye(3, dtype=np.float32)
+                pixels_are_registered = True
+
+            elif isinstance(kind, str) and (kind.startswith("poly") or kind in ("tps", "thin_plate_spline")):
                 # Already warped to reference during registration
                 pixel_path = aligned_file
                 if not pixel_path:
@@ -27367,8 +35783,9 @@ class StackingSuiteDialog(QDialog):
                 H_canvas = np.eye(3, dtype=np.float32)
                 pixels_are_registered = True
 
-            elif kind == "affine" and X is not None:
-                # Use ORIGINAL pixels + affine subpixel mapping
+            elif kind in ("affine", "similarity") and X is not None:
+                # Use ORIGINAL pixels + affine subpixel mapping. 'similarity' is
+                # a constrained 2x3 affine, so it deposits identically.
                 pixel_path = _cfa_pixel_source(orig_file)
                 H_canvas = np.eye(3, dtype=np.float32)
                 H_canvas[:2] = np.asarray(X, np.float32).reshape(2, 3)
@@ -27389,11 +35806,10 @@ class StackingSuiteDialog(QDialog):
             if img_data is None:
                 if os.path.normpath(pixel_path) != os.path.normpath(orig_file):
                     log(f"   ↳ depositing pixels from {os.path.basename(pixel_path)}")
-                img_data, _, _, _ = load_image(pixel_path)
+                img_data = _prefetch.get(pixel_path)      # was: load_image(pixel_path)[0-ish]
                 if img_data is None:
                     log(f"⚠️ Failed to read {os.path.basename(pixel_path)} – skipping")
                     continue
-
             # If this is a split dual-band entry, extract channel from the pixel source
             if chan in ("R", "G", "B"):
                 if img_data.ndim == 3 and img_data.shape[2] >= 3:
@@ -27452,7 +35868,17 @@ class StackingSuiteDialog(QDialog):
         # ---- save (single-HDU; no rejection layers here) ----
         Hd, Wd = final_drizzle.shape[:2] if final_drizzle.ndim >= 2 else (0, 0)
         display_group_driz = self._label_with_dims(group_key, Wd, Hd)
-        base_stem = f"MasterLight_{display_group_driz}_{len(file_list)}stacked_drizzle"
+        _set_pref = (f"{self._reg_current_set_slug}_"
+                     if getattr(self, "_reg_current_set", "Default") not in (None, "Default")
+                     else "")
+        # Effective count = frames with weight > 0 (soft rejection may
+        # have zeroed some). Drizzle filename and header reflect only
+        # those; the pre-rejection pool size is kept in NPOOL/NREJECT
+        # if any sub was rejected.
+        n_frames      = int(self._count_contributing_frames(file_list))
+        n_frames_pool = int(len(file_list))
+
+        base_stem = f"MasterLight_{_set_pref}{display_group_driz}_{n_frames}stacked_drizzle"
         base_stem = self._normalize_master_stem(base_stem)
         out_path_orig = self._build_out(self._master_light_dir(), base_stem, "fit")
         out_path_orig = self._dedupe_out_path(out_path_orig)
@@ -27464,9 +35890,13 @@ class StackingSuiteDialog(QDialog):
         hdr_orig["CREATOR"] = "SetiAstroSuite"
         hdr_orig["DATE-OBS"] = datetime.utcnow().isoformat()
 
-        n_frames = int(len(file_list))
-        hdr_orig["NCOMBINE"] = (n_frames, "Number of frames combined")
+        hdr_orig["NCOMBINE"] = (n_frames, "Number of frames combined (weight > 0)")
         hdr_orig["NSTACK"] = (n_frames, "Alias of NCOMBINE (SetiAstro)")
+        if n_frames_pool != n_frames:
+            hdr_orig["NPOOL"]   = (n_frames_pool,
+                                   "Pre-rejection frame pool size (SetiAstro)")
+            hdr_orig["NREJECT"] = (n_frames_pool - n_frames,
+                                   "Frames soft-rejected (weight=0) by score outlier pass")
 
         if final_drizzle.ndim == 2:
             hdr_orig["NAXIS"] = 2
@@ -27482,9 +35912,28 @@ class StackingSuiteDialog(QDialog):
 
         is_mono_driz = (final_drizzle.ndim == 2)
         final_drizzle = self._normalize_stack_01(final_drizzle)
+
+        # ── NEW: upscale fix (normalization + drizzle factor) → ensure WCS CD
+        # matrix → plate solve. Drizzle multiplies the image geometry by
+        # scale_factor on top of any upstream normalization upscale, so the
+        # ref header's PIXSCALE/CRPIX/CDi_j must be rescaled by both.
+        hdr_orig = self._apply_upscale_fix_to_header(
+            hdr_orig, file_list,
+            label=f"'{group_key}' drizzle master", status_cb=log
+        )
+        try:
+            sf = float(scale_factor)
+            if abs(sf - 1.0) > 1e-4:
+                hdr_orig = self._fix_header_for_upscale(hdr_orig, sf, sf)
+                log(f"📐 Header corrected for {sf:.3f}× drizzle scale on '{group_key}' master.")
+        except Exception as e:
+            log(f"⚠️ Drizzle header fix failed for '{group_key}': {e}")
+        hdr_orig = self._ensure_wcs_matrix(
+            hdr_orig, label=f"'{group_key}' drizzle master", status_cb=log
+        )
         hdr_orig = self._maybe_plate_solve_master(
             final_drizzle, hdr_orig, label=f"'{group_key}' drizzle master", status_cb=log
-        )        
+        )
         save_image(
             img_array=final_drizzle,
             filename=out_path_orig,
@@ -27494,6 +35943,12 @@ class StackingSuiteDialog(QDialog):
             is_mono=is_mono_driz
         )
         log(f"✅ Drizzle (original) saved: {out_path_orig}")
+        # Make the drizzle master visible to the post-alignment summary.
+        # Finalize resets this list at the top of its drizzle loop, so
+        # each run collects only its own outputs.
+        if not hasattr(self, "_drizzle_master_paths"):
+            self._drizzle_master_paths = []
+        self._drizzle_master_paths.append((group_key, out_path_orig))
 
         # ---- optional auto-crop ----
         if autocrop_enabled:
@@ -27504,22 +35959,38 @@ class StackingSuiteDialog(QDialog):
                 scale=float(scale_factor),
                 rect_override=rect_override
             )
-            hdr_crop["NCOMBINE"] = (n_frames, "Number of frames combined")
+            hdr_crop["NCOMBINE"] = (n_frames, "Number of frames combined (weight > 0)")
             hdr_crop["NSTACK"] = (n_frames, "Alias of NCOMBINE (SetiAstro)")
+            if n_frames_pool != n_frames:
+                hdr_crop["NPOOL"]   = (n_frames_pool,
+                                       "Pre-rejection frame pool size (SetiAstro)")
+                hdr_crop["NREJECT"] = (n_frames_pool - n_frames,
+                                       "Frames soft-rejected (weight=0) by score outlier pass")
 
             is_mono_crop = (cropped_drizzle.ndim == 2)
             display_group_driz_crop = self._label_with_dims(group_key, cropped_drizzle.shape[1], cropped_drizzle.shape[0])
-            base_crop = f"MasterLight_{display_group_driz_crop}_{len(file_list)}stacked_drizzle_autocrop"
+            _set_pref = (f"{self._reg_current_set_slug}_"
+                         if getattr(self, "_reg_current_set", "Default") not in (None, "Default")
+                         else "")
+            base_crop = f"MasterLight_{_set_pref}{display_group_driz_crop}_{n_frames}stacked_drizzle_autocrop"
             base_crop = self._normalize_master_stem(base_crop)
             out_path_crop = self._build_out(self._master_light_dir(), base_crop, "fit")
             out_path_crop = self._dedupe_out_path(out_path_crop)
 
             cropped_drizzle = self._normalize_stack_01(cropped_drizzle)
+            # hdr_crop was derived from hdr_orig (which already carries the
+            # upscale+drizzle correction), so only the WCS CD matrix guard
+            # is needed here before the solve.
+            hdr_crop = self._ensure_wcs_matrix(
+                hdr_crop,
+                label=f"'{group_key}' auto-cropped drizzle master",
+                status_cb=log,
+            )
             hdr_crop = self._maybe_plate_solve_master(
                 cropped_drizzle, hdr_crop,
                 label=f"'{group_key}' auto-cropped drizzle master",
                 status_cb=log
-            )            
+            )
             save_image(
                 img_array=cropped_drizzle,
                 filename=out_path_crop,
@@ -27528,9 +35999,12 @@ class StackingSuiteDialog(QDialog):
                 original_header=hdr_crop,
                 is_mono=is_mono_crop
             )
-            if not hasattr(self, "_autocrop_outputs"):
-                self._autocrop_outputs = []
-            self._autocrop_outputs.append((group_key, out_path_crop))
+            # Expose the drizzle crop to the post-alignment summary (same
+            # list the main drizzle master above uses; finalize reads both
+            # when building master_files_out).
+            if not hasattr(self, "_drizzle_crop_paths"):
+                self._drizzle_crop_paths = []
+            self._drizzle_crop_paths.append((group_key, out_path_crop))
             log(f"✂️ Drizzle (auto-cropped) saved: {out_path_crop}")
 
         return True
@@ -27678,7 +36152,10 @@ class StackingSuiteDialog(QDialog):
 
         algo = (algo_override or self.rejection_algorithm)
 
-        use_gpu = bool(self._hw_accel_enabled()) and _torch_ok() and _gpu_algo_supported(algo)
+        use_gpu = (
+            bool(self._hw_accel_enabled()) and _torch_ok()
+            and _gpu_algo_supported(algo) and _rejection_gpu_ok(status_cb=log)
+        )
         log(f"📊 Stacking group '{group_key}' with {algo}{' [GPU]' if use_gpu else ''}")
 
         # ── Low RAM Safe Mode gate ─────────────────────────────────────────────
@@ -27771,7 +36248,7 @@ class StackingSuiteDialog(QDialog):
         pref_w = self.chunk_width
         try:
             chunk_h, chunk_w = compute_safe_chunk(height, width, N, channels, DTYPE, pref_h, pref_w)
-            log(f"🔧 Using chunk size {chunk_h}×{chunk_w} for {DTYPE}")
+            log(f"🔧 Row-band mode: {chunk_h} rows × {chunk_w}px full width ({DTYPE})")
         except MemoryError as e:
             for s in sources:
                 s.close()
@@ -27922,7 +36399,7 @@ class StackingSuiteDialog(QDialog):
                 "Windsorized Sigma Clipping":          lambda: windsorized_sigma_clip_weighted_np(ts_zeroed, np.ones_like(weights_array), lower=self.sigma_low, upper=self.sigma_high, iterations=self.iterations),
                 "Kappa-Sigma Clipping":                lambda: kappa_sigma_clip_weighted_np(ts_zeroed, weights_array, kappa=self.kappa, iterations=self.iterations),
                 "Trimmed Mean":                        lambda: trimmed_mean_weighted_np(ts_zeroed, weights_array, trim_fraction=self.trim_fraction),
-                "Extreme Studentized Deviate (ESD)":   lambda: esd_clip_weighted_np(ts_zeroed, weights_array, threshold=self.esd_threshold),
+                "Extreme Studentized Deviate (ESD)":   lambda: esd_clip_weighted_np(ts_zeroed, weights_array, threshold=self.esd_threshold, esd_bonferroni=bool(getattr(self, "esd_bonferroni", False))),
                 "Biweight Estimator":                  lambda: biweight_location_weighted_np(ts_zeroed, weights_array, tuning_constant=self.biweight_constant),
                 "Modified Z-Score Clipping":           lambda: modified_zscore_clip_weighted_np(ts_zeroed, weights_array, threshold=self.modz_threshold),
             }
@@ -27968,71 +36445,129 @@ class StackingSuiteDialog(QDialog):
                 try: cleanup_memmap(None, integrated_memmap_path)
                 except Exception: pass
 
+        reduce_maps = (not collect_per_file) and (not DEBUG_INTEGRATION_ONLY)
         _ctx_instance = _safe_torch_inference_ctx() if use_gpu else contextlib.nullcontext()
-        with _ctx_instance:
-            for tile_idx, (y0, y1, x0, x1) in enumerate(tiles, start=1):
-                if self._cancelled():
-                    _abort_cleanup()
-                    log(f"⏹ Integration cancelled for group '{group_key}'.")
-                    raise StackCancelled()
-                t0 = time.perf_counter()
+        tile_idx = 0
+        try:
+            with _ctx_instance:
+                for tile_idx, (y0, y1, x0, x1) in enumerate(tiles, start=1):
+                    if self._cancelled():
+                        _abort_cleanup()
+                        log(f"⏹ Integration cancelled for group '{group_key}'.")
+                        raise StackCancelled()
+                    t0 = time.perf_counter()
 
-                fut, bidx, _ = pending.popleft()
-                th, tw = fut.result()
-                ts               = _buf_pool[bidx][:N, :th, :tw, :channels]
-                forced_mask_tile = _mask_pool[bidx][:N, :th, :tw]
+                    fut, bidx, _ = pending.popleft()
+                    th, tw = fut.result()
+                    ts               = _buf_pool[bidx][:N, :th, :tw, :channels]
+                    if NAN_PROBE:
+                        try:
+                            _tsv = np.asarray(ts)
+                            self._ip_nan  = getattr(self, "_ip_nan", 0)  + int(np.isnan(_tsv).sum())
+                            self._ip_zero = getattr(self, "_ip_zero", 0) + int((_tsv == 0.0).sum())
+                            self._ip_tiny = getattr(self, "_ip_tiny", 0) + int(((_tsv > 0.0) & (_tsv < 1e-4)).sum())
+                            self._ip_tot  = getattr(self, "_ip_tot", 0)  + int(_tsv.size)
+                        except Exception:
+                            pass
+                    forced_mask_tile = _mask_pool[bidx][:N, :th, :tw]
 
-                _submit_next()
+                    _submit_next()
 
-                if ts.size == 0 or ts.shape[1] == 0 or ts.shape[2] == 0 or ts.shape[3] == 0:
-                    tile_result, tile_rej_map = _cpu_reduce_tile(ts, forced_mask_tile, th, tw)
-                elif use_gpu:
-                    try:
-                        tile_result, tile_rej_map = _torch_reduce_tile(
-                            ts, weights_array,
-                            algo_name=algo,
-                            kappa=float(self.kappa),
-                            iterations=int(self.iterations),
-                            sigma_low=float(self.sigma_low),
-                            sigma_high=float(self.sigma_high),
-                            trim_fraction=float(self.trim_fraction),
-                            esd_threshold=float(self.esd_threshold),
-                            biweight_constant=float(self.biweight_constant),
-                            modz_threshold=float(self.modz_threshold),
-                            comet_hclip_k=float(self.settings.value("stacking/comet_hclip_k", 1.30, type=float)),
-                            comet_hclip_p=float(self.settings.value("stacking/comet_hclip_p", 25.0, type=float)),
-                            forced_reject_mask_np=forced_mask_tile,
-                        )
-                        if hasattr(tile_result, "detach"):
-                            tile_result = tile_result.detach().cpu().numpy()
-                        if hasattr(tile_rej_map, "detach"):
-                            tile_rej_map = tile_rej_map.detach().cpu().numpy()
-                    except Exception as e:
-                        log(f"⚠️ GPU rejection failed on tile {tile_idx}/{total_tiles} "
-                            f"shape={ts.shape}: {e} – falling back to CPU for this and remaining tiles.")
-                        use_gpu = False
+                    if ts.size == 0 or ts.shape[1] == 0 or ts.shape[2] == 0 or ts.shape[3] == 0:
                         tile_result, tile_rej_map = _cpu_reduce_tile(ts, forced_mask_tile, th, tw)
-                else:
-                    tile_result, tile_rej_map = _cpu_reduce_tile(ts, forced_mask_tile, th, tw)
+                    elif use_gpu:
+                        try:
+                            tile_result, tile_rej_map = _torch_reduce_tile(
+                                ts, weights_array,
+                                algo_name=algo,
+                                kappa=float(self.kappa),
+                                iterations=int(self.iterations),
+                                sigma_low=float(self.sigma_low),
+                                sigma_high=float(self.sigma_high),
+                                trim_fraction=float(self.trim_fraction),
+                                esd_threshold=float(self.esd_threshold),
+                                esd_bonferroni=bool(getattr(self, "esd_bonferroni", False)),
+                                biweight_constant=float(self.biweight_constant),
+                                modz_threshold=float(self.modz_threshold),
+                                comet_hclip_k=float(self.settings.value("stacking/comet_hclip_k", 1.30, type=float)),
+                                comet_hclip_p=float(self.settings.value("stacking/comet_hclip_p", 25.0, type=float)),
+                                forced_reject_mask_np=forced_mask_tile,
+                                reduce_rej_maps=reduce_maps,
+                            )
+                            if hasattr(tile_result, "detach"):
+                                tile_result = tile_result.detach().cpu().numpy()
+                            if hasattr(tile_rej_map, "detach"):
+                                tile_rej_map = tile_rej_map.detach().cpu().numpy()
+                        except MemoryError:
+                            raise  # host RAM is gone; CPU reduction needs even more
+                        except Exception as e:
+                            log(f"⚠️ GPU rejection failed on tile {tile_idx}/{total_tiles} "
+                                f"shape={ts.shape}: {e} – falling back to CPU for this and remaining tiles.")
+                            use_gpu = False
+                            tile_result, tile_rej_map = _cpu_reduce_tile(ts, forced_mask_tile, th, tw)
+                    else:
+                        tile_result, tile_rej_map = _cpu_reduce_tile(ts, forced_mask_tile, th, tw)
 
-                integrated_image[y0:y1, x0:x1, :] = tile_result
+                    integrated_image[y0:y1, x0:x1, :] = tile_result
 
-                trm = np.asarray(tile_rej_map, dtype=bool)
-                if trm.ndim == 4:
-                    trm = np.any(trm, axis=-1)
-                rej_any[y0:y1, x0:x1]   |= np.any(trm, axis=0)
-                rej_count[y0:y1, x0:x1] += trm.sum(axis=0).astype(np.uint16)
+                    if not DEBUG_INTEGRATION_ONLY:
+                        if isinstance(tile_rej_map, tuple):
+                            # GPU already reduced to (any-rejected, reject-count);
+                            # copy the two small (th,tw) maps straight in.
+                            tr_any, tr_cnt = tile_rej_map
+                            rej_any[y0:y1, x0:x1]   |= tr_any
+                            rej_count[y0:y1, x0:x1] += tr_cnt.astype(np.uint16)
+                        else:
+                            trm = np.asarray(tile_rej_map, dtype=bool)
+                            if trm.ndim == 4:
+                                trm = np.any(trm, axis=-1)
+                            rej_any[y0:y1, x0:x1]   |= np.any(trm, axis=0)
+                            rej_count[y0:y1, x0:x1] += trm.sum(axis=0).astype(np.uint16)
 
-                if collect_per_file:
-                    for i, fpath in enumerate(file_list):
-                        m = trm[i]
-                        if np.any(m):
-                            per_file_rejections[fpath].append((x0, y0, m.copy()))
+                            if collect_per_file:
+                                for i, fpath in enumerate(file_list):
+                                    m = trm[i]
+                                    if np.any(m):
+                                        per_file_rejections[fpath].append((x0, y0, m.copy()))
 
-                dt = time.perf_counter() - t0
-                work_px = th * tw * N * channels
-                mpx_s = (work_px / 1e6) / dt if dt > 0 else float("inf")
-                log(f"\r  🔧 Tile {tile_idx}/{total_tiles} [{group_key}] — {mpx_s:.1f} MPx/s")
+                    dt = time.perf_counter() - t0
+                    work_px = th * tw * N * channels
+                    mpx_s = (work_px / 1e6) / dt if dt > 0 else float("inf")
+                    log(f"\r  🔧 Tile {tile_idx}/{total_tiles} [{group_key}] — {mpx_s:.1f} MPx/s")
+        except MemoryError as e:
+            # Host RAM ran out mid-integration. Release what this pass holds and
+            # re-run the group with the seek-based reader, like the EMFILE
+            # fallback above. Wait for the prefetch reads first: they read from
+            # the sources closed below.
+            try: tp.shutdown(wait=True, cancel_futures=True)
+            except Exception: pass
+            for s in sources:
+                try: s.close()
+                except Exception: pass
+            sources.clear()
+            _buf_pool.clear()
+            _mask_pool.clear()
+            pending.clear()
+            ts = forced_mask_tile = tile_result = tile_rej_map = None
+            integrated_image = None
+            if integrated_memmap_path is not None:
+                try: cleanup_memmap(None, integrated_memmap_path)
+                except Exception: pass
+            gc.collect()
+            try:
+                _free_torch_memory()
+            except Exception:
+                pass
+            log(f"⚠️ Out of memory on tile {tile_idx}/{total_tiles} ({e}); "
+                f"retrying '{group_key}' with the Low RAM reader (slower).")
+            return self._normal_integration_low_ram(
+                group_key=group_key,
+                file_list=file_list,
+                frame_weights=frame_weights,
+                status_cb=status_cb,
+                algo_override=algo_override,
+                collect_per_file_rejections=collect_per_file_rejections,
+            )
 
         if use_gpu:
             try:
@@ -28043,24 +36578,49 @@ class StackingSuiteDialog(QDialog):
                 pass
 
         tp.shutdown(wait=True)
+        try:
+            del _buf_pool, _mask_pool, pending, tiles
+        except Exception:
+            pass
 
         import threading as _threading2
         _sources_to_close = list(sources)
         sources.clear()
-        def _close_memmaps():
-            for s in _sources_to_close:
-                try: s.close()
-                except Exception: pass
-        _threading2.Thread(target=_close_memmaps, daemon=True).start()
+        _threading2.Thread(target=_close_mmimages, args=(_sources_to_close,),
+                           daemon=True).start()
 
         if channels == 1:
             integrated_image = integrated_image[..., 0]
 
-        if not hasattr(self, "_rej_maps"):
-            self._rej_maps = {}
-        rej_frac = rej_count.astype(np.float32) / float(max(1, N))
-        self._rej_maps[group_key] = {"any": rej_any, "frac": rej_frac, "count": rej_count, "n": N}
+        _dbg_stem = self._normalize_master_stem(str(group_key))
+        if DEBUG_INTEGRATION_ONLY:
+            try:
+                import os as _os
+                from astropy.io import fits as _fits
+                _dbg = np.asarray(integrated_image, np.float32)
+                if _dbg.ndim == 3 and _dbg.shape[-1] in (3, 4):
+                    _dbg = np.transpose(_dbg, (2, 0, 1))
+                _dbgp = _os.path.join(self._master_light_dir(), f"_DEBUG_rawintegration_{_dbg_stem}.fit")
+                _fits.PrimaryHDU(data=_dbg).writeto(_dbgp, overwrite=True)
+                log(f"🧪 DEBUG_INTEGRATION_ONLY: raw integration (pre-normalize, no rejection) → {_dbgp}")
+            except Exception as _e:
+                log(f"🧪 DEBUG raw-integration dump failed: {_e}")
+        else:
+            if not hasattr(self, "_rej_maps"):
+                self._rej_maps = {}
+            rej_frac = rej_count.astype(np.float32) / float(max(1, N))
+            self._rej_maps[group_key] = {"any": rej_any, "frac": rej_frac, "count": rej_count, "n": N}
 
+        if NAN_PROBE:
+            try:
+                _ii = np.asarray(integrated_image)
+                log(f"🔎 ts-probe [{group_key}] ts-NaN={getattr(self,'_ip_nan',0)} "
+                    f"ts-exact0={getattr(self,'_ip_zero',0)} ts-tiny(0<v<1e-4)={getattr(self,'_ip_tiny',0)} "
+                    f"of {getattr(self,'_ip_tot',0)} samples | integrated NaN={int(np.isnan(_ii).sum())} "
+                    f"min={float(np.nanmin(_ii)) if np.isfinite(_ii).any() else float('nan'):.6g}")
+            except Exception as _e:
+                log(f"🔎 ts-probe log failed: {_e}")
+            self._ip_nan = self._ip_zero = self._ip_tiny = self._ip_tot = 0
         log(f"Integration complete for group '{group_key}'.")
 
         if integrated_memmap_path is not None:
@@ -28068,8 +36628,12 @@ class StackingSuiteDialog(QDialog):
             try: cleanup_memmap(None, integrated_memmap_path)
             except Exception: pass
 
-        import threading as _threading
-        _threading.Thread(target=lambda: _free_torch_memory(), daemon=True).start()
+        import gc as _gc
+        _gc.collect()
+        try:
+            _free_torch_memory()
+        except Exception:
+            pass
 
         return integrated_image, per_file_rejections, ref_header
 
@@ -28118,7 +36682,10 @@ class StackingSuiteDialog(QDialog):
         del ref_data
 
         algo = (algo_override or self.rejection_algorithm)
-        use_gpu = bool(self._hw_accel_enabled()) and _torch_ok() and _gpu_algo_supported(algo)
+        use_gpu = (
+            bool(self._hw_accel_enabled()) and _torch_ok()
+            and _gpu_algo_supported(algo) and _rejection_gpu_ok(status_cb=log)
+        )
         log(f"📊 [LowRAM] Stacking '{group_key}' with {algo}{' [GPU]' if use_gpu else ''}")
 
         # ── Satellite masks ────────────────────────────────────────────────────
@@ -28312,7 +36879,7 @@ class StackingSuiteDialog(QDialog):
                 "Windsorized Sigma Clipping":          lambda: windsorized_sigma_clip_weighted_np(ts_zeroed, np.ones_like(weights_array), lower=self.sigma_low, upper=self.sigma_high, iterations=self.iterations),
                 "Kappa-Sigma Clipping":                lambda: kappa_sigma_clip_weighted_np(ts_zeroed, weights_array, kappa=self.kappa, iterations=self.iterations),
                 "Trimmed Mean":                        lambda: trimmed_mean_weighted_np(ts_zeroed, weights_array, trim_fraction=self.trim_fraction),
-                "Extreme Studentized Deviate (ESD)":   lambda: esd_clip_weighted_np(ts_zeroed, weights_array, threshold=self.esd_threshold),
+                "Extreme Studentized Deviate (ESD)":   lambda: esd_clip_weighted_np(ts_zeroed, weights_array, threshold=self.esd_threshold, esd_bonferroni=bool(getattr(self, "esd_bonferroni", False))),
                 "Biweight Estimator":                  lambda: biweight_location_weighted_np(ts_zeroed, weights_array, tuning_constant=self.biweight_constant),
                 "Modified Z-Score Clipping":           lambda: modified_zscore_clip_weighted_np(ts_zeroed, weights_array, threshold=self.modz_threshold),
             }
@@ -28348,6 +36915,7 @@ class StackingSuiteDialog(QDialog):
                 try: cleanup_memmap(None, integrated_memmap_path)
                 except Exception: pass
 
+        reduce_maps = (not collect_per_file) and (not DEBUG_INTEGRATION_ONLY)
         _ctx_instance = (
             _safe_torch_inference_ctx() if use_gpu else contextlib.nullcontext()
         )
@@ -28378,6 +36946,7 @@ class StackingSuiteDialog(QDialog):
                             sigma_high=float(self.sigma_high),
                             trim_fraction=float(self.trim_fraction),
                             esd_threshold=float(self.esd_threshold),
+                            esd_bonferroni=bool(getattr(self, "esd_bonferroni", False)),
                             biweight_constant=float(self.biweight_constant),
                             modz_threshold=float(self.modz_threshold),
                             comet_hclip_k=float(self.settings.value(
@@ -28385,6 +36954,7 @@ class StackingSuiteDialog(QDialog):
                             comet_hclip_p=float(self.settings.value(
                                 "stacking/comet_hclip_p", 25.0, type=float)),
                             forced_reject_mask_np=forced_mask_tile,
+                            reduce_rej_maps=reduce_maps,
                         )
                         if hasattr(tile_result, "detach"):
                             tile_result = tile_result.detach().cpu().numpy()
@@ -28403,17 +36973,25 @@ class StackingSuiteDialog(QDialog):
 
                 integrated_image[y0:y1, x0:x1, :] = tile_result
 
-                trm = np.asarray(tile_rej_map, dtype=bool)
-                if trm.ndim == 4:
-                    trm = np.any(trm, axis=-1)
-                rej_any[y0:y1, x0:x1]   |= np.any(trm, axis=0)
-                rej_count[y0:y1, x0:x1] += trm.sum(axis=0).astype(np.uint16)
+                if not DEBUG_INTEGRATION_ONLY:
+                    if isinstance(tile_rej_map, tuple):
+                        # GPU already reduced to (any-rejected, reject-count);
+                        # copy the two small (th,tw) maps straight in.
+                        tr_any, tr_cnt = tile_rej_map
+                        rej_any[y0:y1, x0:x1]   |= tr_any
+                        rej_count[y0:y1, x0:x1] += tr_cnt.astype(np.uint16)
+                    else:
+                        trm = np.asarray(tile_rej_map, dtype=bool)
+                        if trm.ndim == 4:
+                            trm = np.any(trm, axis=-1)
+                        rej_any[y0:y1, x0:x1]   |= np.any(trm, axis=0)
+                        rej_count[y0:y1, x0:x1] += trm.sum(axis=0).astype(np.uint16)
 
-                if collect_per_file:
-                    for i, fpath in enumerate(file_list):
-                        m = trm[i]
-                        if np.any(m):
-                            per_file_rejections[fpath].append((x0, y0, m.copy()))
+                        if collect_per_file:
+                            for i, fpath in enumerate(file_list):
+                                m = trm[i]
+                                if np.any(m):
+                                    per_file_rejections[fpath].append((x0, y0, m.copy()))
 
                 dt = time.perf_counter() - t0
                 work_px = th * tw * N * channels
@@ -28440,12 +37018,26 @@ class StackingSuiteDialog(QDialog):
         if channels == 1:
             integrated_image = integrated_image[..., 0]
 
-        if not hasattr(self, "_rej_maps"):
-            self._rej_maps = {}
-        rej_frac = rej_count.astype(np.float32) / float(max(1, N))
-        self._rej_maps[group_key] = {
-            "any": rej_any, "frac": rej_frac, "count": rej_count, "n": N
-        }
+        _dbg_stem = self._normalize_master_stem(str(group_key))
+        if DEBUG_INTEGRATION_ONLY:
+            try:
+                import os as _os
+                from astropy.io import fits as _fits
+                _dbg = np.asarray(integrated_image, np.float32)
+                if _dbg.ndim == 3 and _dbg.shape[-1] in (3, 4):
+                    _dbg = np.transpose(_dbg, (2, 0, 1))
+                _dbgp = _os.path.join(self._master_light_dir(), f"_DEBUG_rawintegration_{_dbg_stem}.fit")
+                _fits.PrimaryHDU(data=_dbg).writeto(_dbgp, overwrite=True)
+                log(f"🧪 DEBUG_INTEGRATION_ONLY: raw integration (pre-normalize, no rejection) → {_dbgp}")
+            except Exception as _e:
+                log(f"🧪 DEBUG raw-integration dump failed: {_e}")
+        else:
+            if not hasattr(self, "_rej_maps"):
+                self._rej_maps = {}
+            rej_frac = rej_count.astype(np.float32) / float(max(1, N))
+            self._rej_maps[group_key] = {
+                "any": rej_any, "frac": rej_frac, "count": rej_count, "n": N
+            }
 
         log(f"✅ [LowRAM] Integration complete for group '{group_key}'.")
 
@@ -28454,8 +37046,12 @@ class StackingSuiteDialog(QDialog):
             try: cleanup_memmap(None, integrated_memmap_path)
             except Exception: pass
 
-        import threading as _t
-        _t.Thread(target=lambda: _free_torch_memory(), daemon=True).start()
+        import gc as _gc
+        _gc.collect()
+        try:
+            _free_torch_memory()
+        except Exception:
+            pass
 
         return integrated_image, per_file_rejections, ref_header
 

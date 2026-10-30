@@ -1,4 +1,4 @@
-# pro/aberration_ai.py
+#saspro/aberration_ai.py
 from __future__ import annotations
 import os
 import webbrowser
@@ -8,7 +8,7 @@ import sys
 import platform  # add
 import time
 import subprocess
-
+from setiastro.saspro.help_support import make_help_button
 IS_APPLE_ARM = (sys.platform == "darwin" and platform.machine() == "arm64")
 
 def _has_nvidia_gpu() -> bool:
@@ -769,7 +769,7 @@ def run_aberration_ai_on_array(
     if not model_path or not os.path.isfile(model_path):
         raise RuntimeError("No valid Aberration AI model is configured.")
 
-    # Provider selection
+    #sasprovider selection
     if IS_APPLE_ARM:
         resolved_providers = ["CPUExecutionProvider"]
     elif providers:
@@ -999,6 +999,7 @@ class AberrationAIDialog(QDialog):
         btn_browse = QPushButton(self.tr("Browse…")); btn_browse.clicked.connect(self._browse_active_model)
         row.addWidget(self.model_label, 1)
         row.addWidget(btn_browse)
+        row.addWidget(make_help_button("aberration_ai", self))
         v.addLayout(row)
         # Custom model row (NEW)
         row_custom = QHBoxLayout()
@@ -1019,7 +1020,7 @@ class AberrationAIDialog(QDialog):
 
         row_custom.addWidget(btn_custom_clear)
         v.addLayout(row_custom)
-        # Providers row
+        #sasproviders row
         row2 = QHBoxLayout()
         self.chk_auto = QCheckBox(self.tr("Auto GPU (if available)"))
         self.chk_auto.setChecked(True)
@@ -1050,7 +1051,7 @@ class AberrationAIDialog(QDialog):
         row4.addStretch(1)
         v.addLayout(row4)
 
-        # Progress + actions
+        #sasprogress + actions
         self.progress = QProgressBar(); self.progress.setRange(0, 100); v.addWidget(self.progress)
         row5 = QHBoxLayout()
         self.btn_run = QPushButton(self.tr("Run")); self.btn_run.clicked.connect(self._run)
@@ -1550,6 +1551,8 @@ class AberrationAIDialog(QDialog):
         # 2) Metadata for this step (stored on the document)
         meta = {
             "is_mono": (out.ndim == 2),
+            "command_id": "aberrationai",
+            "preset": self.get_preset(),
             "processing_parameters": {
                 **(getattr(doc, "metadata", {}) or {}).get("processing_parameters", {}),
                 "AberrationAI": {
@@ -1562,7 +1565,7 @@ class AberrationAIDialog(QDialog):
             },
             "masked": bool(self._active_mask_id(doc)),
             "mask_id": self._active_mask_id(doc),
-            "mask_blend": "m*out+(1-m)*src",            
+            "mask_blend": "m*out+(1-m)*src",
         }
 
         # 3) Apply through history-aware API (either path is fine)

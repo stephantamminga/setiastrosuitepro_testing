@@ -51,7 +51,7 @@ from setiastro.saspro.memory_utils import smart_zeros
 from setiastro.saspro.legacy.image_manager import load_image, save_image
 from setiastro.saspro.blink_comparator_pro import CustomDoubleSpinBox, CustomSpinBox
 from setiastro.saspro.abe import _generate_sample_points as abe_generate_sample_points
-
+from setiastro.saspro.help_support import make_help_button
 try:
     from setiastro.saspro.imageops.stretch import stretch_mono_image, stretch_color_image
 except Exception:
@@ -176,7 +176,7 @@ def coerce_to_header(hdr_in):
 
     rows = []
     if isinstance(hdr_in, dict):
-        # ProjectWriter._serialize_header_any wraps headers for JSON. Unwrap
+        #sasprojectWriter._serialize_header_any wraps headers for JSON. Unwrap
         # before treating the dict's own keys as FITS cards -- otherwise the
         # wrapper's "format" key becomes the only card and the real WCS is
         # dropped on the floor.
@@ -1155,27 +1155,51 @@ def _as_hwc(img):
     return a[:, :, None] if a.ndim == 2 else a
 
 def _panel_mad(img, *, mono=None) -> float:
-    """Median absolute deviation of a panel's pixels (robust spread).
+    """Raw median absolute deviation of a panel, computed identically to the
+    Histogram statistics dialog so the two surfaces report the same number.
+
+    Mirrors histogram.py's real-statistics MAD exactly: per channel, raw
+    ``median(|x - median(x)|)`` with no 1.4826 scaling and no black-point
+    normalization. (The old black-point subtraction was a no-op -- MAD is
+    translation-invariant, so subtracting a pedestal never changed the value.)
+    Large channels are subsampled with the same seeded RNG and 5M cap the
+    Histogram uses, so the numbers agree bit-for-bit on clean data. Non-finite
+    pixels are dropped per channel; that only diverges from the Histogram where
+    the Histogram itself would return NaN, and it keeps the linear/stretched
+    discriminator from silently collapsing to NaN on panels with masked borders.
 
     Linear astronomical data is sky-dominated and pathologically tight, so its
-    MAD is tiny (order 1e-3). A display stretch lifts and spreads the midtones,
-    raising the MAD by one to two orders of magnitude. This is the cleanest
-    single-number discriminator between linear and stretched panels.
+    MAD is tiny (order 1e-3); a display stretch lifts and spreads the midtones,
+    raising the MAD by one to two orders of magnitude. That gap is what the
+    caller uses to tell linear panels from stretched ones.
 
-    Uses a black-point-normalized copy so a pure pedestal offset between panels
-    doesn't affect the spread measurement.
+    For a colour panel each channel is measured exactly as the Histogram
+    measures it and the per-channel MADs are averaged into the single scalar the
+    caller needs (swap ``np.mean`` for ``np.max`` below to track the widest
+    channel instead).
     """
-    m = mono if mono is not None else (img if img.ndim == 2 else np.mean(img, axis=2))
-    m = np.asarray(m, dtype=np.float32)
-    finite = m[np.isfinite(m)]
-    if finite.size == 0:
-        return 0.0
-    # Black-point normalize (subtract the floor) so MAD reflects spread, not offset.
-    lo = float(np.percentile(finite, 0.5))
-    v = finite - lo
-    med = float(np.median(v))
-    mad = float(np.median(np.abs(v - med)))
-    return mad
+    def _hist_mad_1d(chan) -> float:
+        # One channel, identical to histogram.py's real-statistics MAD path.
+        flat = np.asarray(chan, dtype=np.float32).ravel()
+        flat = flat[np.isfinite(flat)]
+        if flat.size == 0:
+            return 0.0
+        if flat.size > 20_000_000:
+            idx = np.random.default_rng(0).choice(
+                flat.size, size=5_000_000, replace=False)
+            flat = flat[idx]
+        cmed = float(np.median(flat))
+        return float(np.median(np.abs(flat - cmed)))
+
+    if mono is not None:
+        return _hist_mad_1d(mono)
+
+    a = np.asarray(img)
+    if a.ndim == 2:
+        return _hist_mad_1d(a)
+
+    mads = [_hist_mad_1d(a[..., c]) for c in range(a.shape[2])]
+    return float(np.mean(mads)) if mads else 0.0
 
 def estimate_background_level(img, *, tiles=16, keep_frac=0.15, valid=None,
                               min_tile_valid=0.60, clip_sigma=2.5, clip_iters=3):
@@ -1530,6 +1554,8 @@ class MosaicMasterDialog(QDialog):
         wrench_btn.clicked.connect(self.openSettings)
         btn_layout.addWidget(wrench_btn)
 
+        btn_layout.addWidget(make_help_button("mosaic_master", self))
+
         layout.addLayout(btn_layout)
 
         # ------------------------------------------------------------------
@@ -1705,7 +1731,7 @@ class MosaicMasterDialog(QDialog):
         n_sip = sum(1 for it in solved if self._wcs_has_sip(it["wcs"]))
         frac = n_sip / len(solved)
 
-        box.blockSignals(True)   # programmatic change must not trip _touched
+        box.blockSignals(True)   #sasprogrammatic change must not trip _touched
         if frac >= 0.8:
             box.setChecked(True)
             box.setText("Disable star alignment  —  SIP distortion detected "
@@ -2482,7 +2508,7 @@ class MosaicMasterDialog(QDialog):
         QApplication.processEvents()
 
         # ------------------------------------------------------------
-        # Progress dialog. Re-ranged per phase; _tick() also pumps the
+        #sasprogress dialog. Re-ranged per phase; _tick() also pumps the
         # event loop so Cancel stays responsive during long panels.
         # ------------------------------------------------------------
         progress = QProgressDialog("Preparing...", "Cancel", 0, 1, self)
@@ -3513,7 +3539,7 @@ class MosaicMasterDialog(QDialog):
                 QApplication.processEvents()
                 # Create an instance of PolyGradientRemoval with degree 1.
                 poly_remover = PolyGradientRemoval(new_img, poly_degree=2, downsample_scale=5, num_sample_points=100)
-                # Process the image to remove the gradient
+                #sasprocess the image to remove the gradient
                 new_img = poly_remover.process()
                 print("[DEBUG] Finished polynomial gradient removal on subframe.")
 
@@ -3747,7 +3773,7 @@ class MosaicMasterDialog(QDialog):
                 return False
 
         # ---------------------------------------------------------
-        # Process each subsequent image once
+        #sasprocess each subsequent image once
         # ---------------------------------------------------------
         failed_items = []
         # We'll do a normal for-loop with enumerate so we can pass index to progress

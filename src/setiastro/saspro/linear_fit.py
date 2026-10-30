@@ -1,4 +1,4 @@
-# pro/linear_fit.py
+#saspro/linear_fit.py
 from __future__ import annotations
 
 import numpy as np
@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QGroupBox, QMessageBox, QGridLayout, QWidget, QProgressBar
 )
 from PyQt6.QtGui import QIcon
+
 
 # --------------------------------------------------------------------------------------
 # Preset editor (used by Shortcuts “Edit Preset…”). Import into shortcuts.py like:
@@ -297,7 +298,7 @@ class LinearFitDialog(QDialog):
         h2.addWidget(self.combo_rescale, 1)
         v.addWidget(gb2)
 
-        # Progress
+        #sasprogress
         self.status = QLabel("")
         self.bar = QProgressBar(self); self.bar.setRange(0, 100)
         v.addWidget(self.status)
@@ -307,6 +308,7 @@ class LinearFitDialog(QDialog):
         # Deferred import: shortcuts.py imports this module at load time
         # (_LinearFitPresetDialog), so a top-level import here would cycle.
         from setiastro.saspro.shortcuts import PresetDragHandle
+        from setiastro.saspro.help_support import make_help_button
         try:
             from setiastro.saspro.resources import linearfit_path
             _lf_icon = QIcon(linearfit_path)
@@ -328,6 +330,8 @@ class LinearFitDialog(QDialog):
         )
         drag_row.addWidget(self.preset_drag_handle)
         drag_row.addStretch(1)
+        self.btn_help = make_help_button("linear_fit", self)
+        drag_row.addWidget(self.btn_help)
         v.addLayout(drag_row)
 
         # Buttons
@@ -459,7 +463,14 @@ class LinearFitDialog(QDialog):
 
         # 1) Apply result via DocManager (ROI/full handled there)
         try:
-            self.dm.apply_edit_to_active(out_img, step_name=step_name)
+            _preset = self._linear_fit_params()
+            self.dm.apply_edit_to_active(
+                out_img,
+                step_name=step_name,
+                metadata={"step_name": step_name,
+                          "command_id": "linear_fit",
+                          "preset": _preset},
+            )
         except Exception as e:
             QMessageBox.warning(self, "Linear Fit", f"Applied, but could not update document:\n{e}")
 
@@ -537,7 +548,13 @@ def apply_linear_fit_via_preset(parent, doc_manager, active_doc, preset: dict | 
         names = ["R","G","B"]
         target = {0:"highest median", 1:"lowest median", 2:"Red", 3:"Green", 4:"Blue"}.get(rgb_idx, "highest median")
         step = f"Linear Fit (RGB → {names[ref_idx]} / {target})"
-        doc_manager.apply_edit_to_active(out, step_name=step)
+        doc_manager.apply_edit_to_active(
+            out, step_name=step,
+            metadata={"step_name": step, "command_id": "linear_fit",
+                      "preset": {"mode": "rgb",
+                                 "rgb_mode_idx": rgb_idx,
+                                 "rescale_mode_idx": rescale_idx}},
+        )
         return
 
     # MONO → prompt for reference
@@ -572,7 +589,11 @@ def apply_linear_fit_via_preset(parent, doc_manager, active_doc, preset: dict | 
 
     out, _, _ = linear_fit_mono_to_ref(img, ref, rescale_idx)
     step = f"Linear Fit (mono → {others[cb.currentIndex()].display_name()})"
-    doc_manager.apply_edit_to_active(out, step_name=step)
+    doc_manager.apply_edit_to_active(
+        out, step_name=step,
+        metadata={"step_name": step, "command_id": "linear_fit",
+                  "preset": {"mode": "mono", "rescale_mode_idx": rescale_idx}},
+    )
 
 def apply_linear_fit_to_doc(parent, target_doc, preset: dict | None) -> None:
     """

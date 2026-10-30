@@ -131,6 +131,153 @@ def _debug_log_undo(context: str, **info):
 
 from setiastro.saspro.file_utils import _normalize_ext
 
+# Processing-state words recognised in a FILENAME and appended to the smart
+# display name, e.g. 'ngc660galaxy_G' -> 'ngc660galaxy_G_starless'.
+#
+# ORDER MATTERS - most specific first. Once an alias matches, its span is
+# blanked out of the working copy so a shorter alias cannot re-match the same
+# text. Without that, 'crop_mask' would yield BOTH 'cropmask' and 'crop', and
+# 'star_mask' would yield both 'starmask' and 'mask'.
+#
+# Matching is separator-aware rather than \b-based, because '_' is a word
+# character to the regex engine: r'\bcrop\b' does NOT match 'ngc660_crop_G'.
+# Requiring a separator (or a string edge) on both sides is also what keeps
+# 'satmask' and 'masterflat' from registering as 'mask'.
+#
+# Extend by adding a (canonical, (aliases...)) row in the right priority slot.
+_DISPLAY_DESCRIPTORS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("cropmask", ("cropmask", "crop_mask", "crop-mask")),
+    ("starmask", ("starmask", "star_mask", "star-mask",
+                  "starsmask", "stars_mask", "stars-mask")),
+    ("starless", ("starless", "star_less", "star-less",
+                  "nostars", "no_stars", "no-stars")),
+    ("stars",    ("starsonly", "stars_only", "stars-only", "onlystars")),
+    ("drizzle",  ("drizzle", "drizzled", "drz")),
+    ("crop",     ("crop", "cropped")),
+    ("mask",     ("mask",)),
+)
+
+# Keeps a heavily-processed filename from producing an absurd view title.
+_MAX_DISPLAY_DESCRIPTORS = 3
+
+
+def _descriptors_from_title(title: str) -> list[str]:
+    """
+    Pull processing-state words out of a filename, in the order they appear
+    there.
+
+    Filename order is preserved deliberately: 'ngc660_crop_starless' reads as
+    a processing sequence, and keeping that order means two files differing
+    only in it still get distinct view names.
+    """
+    if not title:
+        return []
+    # Drop the extension so a literal '.drz' tail can't become a descriptor
+    # and '....crop.fit' doesn't lose one to the boundary check.
+    work = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", str(title))
+    buf = list(work.lower())
+    found: list[tuple[int, str]] = []
+    for canon, aliases in _DISPLAY_DESCRIPTORS:
+        for alias in aliases:
+            pat = r"(?:^|[^a-z0-9])(" + re.escape(alias) + r")(?:[^a-z0-9]|$)"
+            m = re.search(pat, "".join(buf))
+            if not m:
+                continue
+            s, e = m.span(1)
+            # Blank the alias only, never the separators around it, so a
+            # neighbouring descriptor keeps its own boundaries.
+            for i in range(s, e):
+                buf[i] = "\x00"
+            found.append((s, canon))
+            break  # at most one hit per canonical descriptor
+    found.sort(key=lambda t: t[0])
+    return [c for _, c in found[:_MAX_DISPLAY_DESCRIPTORS]]
+
+
+def _append_descriptors(name: str, descriptors) -> str:
+    """
+    Append descriptors to a derived name, skipping any whose word is already
+    a token of it (so an OBJECT of 'ngc660_starless' doesn't become
+    'ngc660_starless_G_starless').
+    """
+    have = {t for t in re.split(r"[^a-z0-9]+", name.lower()) if t}
+    out = name
+    for d in descriptors:
+        if d in have:
+            continue
+        out = f"{out}_{d}"
+        have.add(d)
+    return out
+
+
+def _derive_display_name_from_header(header, fallback: str | None = None,
+                                     *, path: str | None = None) -> str | None:
+    """
+    Build a short descriptive display name from a FITS-like header,
+    e.g. 'ngc660galaxy_G' from OBJECT=ngc660galaxy + FILTER=G.
+
+    Priority:
+      subject = OBJECT / TARGET / OBJNAME
+      filter  = FILTER / FILTNAM / FILTNAME
+
+    When `path` is supplied, processing-state words found in the FILENAME
+    ('starless', 'crop', 'crop_mask', 'drizzle', ...) are appended as further
+    suffixes: 'ngc660galaxy_G_starless'. Without it a master and every
+    derivative cut from it collapse to the same view title, because they all
+    carry identical OBJECT and FILTER cards.
+
+    Returns 'SUBJECT_FILTER[_DESCRIPTOR...]', or 'SUBJECT' if no filter, or
+    `fallback` if no usable subject. Accepts astropy fits.Header, plain dict,
+    or XISF-style [{"value": ..., "comment": ...}] entries.
+    """
+    if header is None:
+        return fallback
+
+    def _get(key):
+        try:
+            v = header.get(key) if hasattr(header, "get") else None
+            if v is None:
+                return None
+            if isinstance(v, list) and v:
+                v = v[0]
+            if isinstance(v, dict) and "value" in v:
+                v = v["value"]
+            s = str(v).strip()
+            return s or None
+        except Exception:
+            return None
+
+    subject = next((_get(k) for k in ("OBJECT", "TARGET", "OBJNAME") if _get(k)), None)
+    if not subject:
+        return fallback
+
+    filt = next((_get(k) for k in ("FILTER", "FILTNAM", "FILTNAME") if _get(k)), None)
+
+    def _san(s: str) -> str:
+        s = re.sub(r"\s+", "_", s.strip())
+        s = re.sub(r"[^\w\-.]", "", s)
+        return s
+
+    subject = _san(subject)
+    if not subject:
+        return fallback
+
+    name = subject
+    if filt:
+        filt = _san(filt)
+        if filt:
+            name = f"{subject}_{filt}"
+
+    # Filename-derived processing descriptors, e.g. '_starless', '_crop'.
+    if path:
+        try:
+            name = _append_descriptors(
+                name, _descriptors_from_title(os.path.basename(str(path)))
+            )
+        except Exception:
+            pass  # naming is cosmetic - never let it break a file load
+    return name
+
 def _normalize_image_01(arr: np.ndarray) -> np.ndarray:
     """
     Normalize an image to [0,1] in-place-ish:
@@ -163,6 +310,205 @@ def _normalize_image_01(arr: np.ndarray) -> np.ndarray:
 
     return a
 
+# ---------------------------------------------------------------------
+# Metadata stratification: sticky (WCS / plate-solve) and identity keys.
+# ---------------------------------------------------------------------
+# The undo/redo stack stores a full metadata snapshot per state, but not
+# every metadata key is state-shaped. Some keys — WCS / plate-solve results
+# — are "sticky": they belong to the document as a whole, not to any one
+# pixel snapshot. Others — target name, acquisition time, telescope, filter
+# — are "identity": they never vary with processing.
+#
+# When the user runs undo/redo we still restore the frozen state metadata
+# from the tuple (so per-state values like step_name, _replay etc. come
+# back), but we then overlay the current strata so sticky+identity keys
+# survive the restore. This is what lets you plate-solve at an early undo
+# state and have the WCS carry forward through redo, matching how
+# PixInsight handles WCS across processing history.
+#
+# NOTE: geometry-changing operations (crop, rotate, resample) will need
+# to transform the sticky WCS to remain valid. That is a separate
+# migration step — see ImageDocument.apply_geometry_transform() for the
+# entry point. Until each such tool is updated, we deliberately keep
+# individual FITS WCS keys (CRPIX*, CD*_*, CRVAL*, …) OUT of the sticky
+# set so that undo past a crop still restores the correct per-state
+# snapshot for those cards.
+_STICKY_KEYS: frozenset[str] = frozenset({
+    "wcs",                    # astropy.wcs.WCS object, if cached
+    "wcs_header",             # fits.Header carrying the solved WCS
+    "is_solved",              # bool: plate-solve success flag
+    "plate_solve_source",     # e.g. "astap", "astrometry.net"
+    "plate_solve_time",       # timestamp / ISO string
+    "roi_wcs_header",         # ROI-cropped WCS header (preview docs)
+    "__header_snapshot__",    # JSON-safe serialised header snapshot
+})
+
+# Identity keys are matched case-insensitively against the FITS convention.
+_IDENTITY_KEYS_UPPER: frozenset[str] = frozenset({
+    "OBJECT", "TARGET", "OBJNAME",
+    "DATE-OBS", "DATE_OBS", "DATE", "MJD-OBS", "MJD_OBS", "JD",
+    "TELESCOP", "TELESCOPE", "INSTRUME", "INSTRUMENT", "DETECTOR",
+    "FILTER", "FILTNAM", "FILTNAME",
+    "EXPTIME", "EXPOSURE",
+    "XPIXSZ", "YPIXSZ", "PIXSIZE1", "PIXSIZE2",
+    "FOCALLEN",
+    "GAIN", "EGAIN", "ELECTRONS", "RDNOISE", "READNOIS",
+    "OFFSET", "CCDTEMP", "CCD-TEMP", "SETTEMP", "SET-TEMP",
+    "RA", "DEC", "OBJCTRA", "OBJCTDEC",
+    "SITELAT", "SITELONG", "SITEELEV",
+    "OBSGEO-L", "OBSGEO-B", "OBSGEO-H",
+    "OBSERVER", "CREATOR", "SWCREATE", "ORIGIN",
+    "AIRMASS", "ALTITUDE", "AZIMUTH",
+    "IMAGETYP", "FRAME", "BAYERPAT", "XBAYROFF", "YBAYROFF",
+    "MOUNT",
+})
+
+# Case-sensitive SASpro identity keys (non-FITS).
+_IDENTITY_KEYS_EXACT: frozenset[str] = frozenset({
+    "display_name",           # user-visible title
+    "file_meta",              # source-file metadata block
+})
+
+
+def _is_sticky_key(key) -> bool:
+    """True if the metadata key represents document-level sticky state."""
+    return isinstance(key, str) and key in _STICKY_KEYS
+
+
+def _is_identity_key(key) -> bool:
+    """True if the metadata key represents invariant document identity."""
+    if not isinstance(key, str):
+        return False
+    if key in _IDENTITY_KEYS_EXACT:
+        return True
+    return key.upper() in _IDENTITY_KEYS_UPPER
+
+
+# ---- Replay-capture audit (opt-in) ----------------------------------
+# Finds tools that don't yet self-identify for the replay/bundle system.
+#
+# Flip _REPLAY_AUDIT_MODE to turn it on WITHOUT an env var:
+#     ""    -> off
+#     "1"   -> log only problem captures (missing / empty preset)
+#     "all" -> also log OK captures
+# An env var, if set, overrides the constant (handy in an IDE run config).
+# Optional: set a log file path in _REPLAY_AUDIT_FILE (or the env var).
+# ---- Replay-capture audit (opt-in) ----------------------------------
+# Flip this to True, run SASpro, click Apply once in each tool, read console.
+REPLAY_AUDIT = True   # <-- set False when done
+
+_REPLAY_AUDIT_SEEN: set = set()
+
+def _replay_audit(step_name, marker) -> None:
+    if not REPLAY_AUDIT:
+        return
+    try:
+        label = str(step_name or "").strip() or "<no step_name>"
+        if marker is None:
+            verdict, cid, detail = "NO-MARKER", "-", "no command_id and no preset recovered"
+        else:
+            cid = marker.get("command_id") or "-"
+            if marker.get("preset"):
+                verdict, detail = "OK", "captured with preset"
+            elif marker.get("cid_explicit"):
+                verdict, detail = "EMPTY-PRESET", "explicit command_id, empty preset (fine if parameterless)"
+            else:
+                verdict, detail = "NAME-ONLY", "resolved by name only, NO preset captured"
+
+        key = (label.lower(), verdict)
+        if key in _REPLAY_AUDIT_SEEN:
+            return
+        _REPLAY_AUDIT_SEEN.add(key)
+
+        #print(f"[REPLAY-AUDIT] {verdict:12} cid={str(cid):22} step={label!r}  ({detail})", flush=True)
+    except Exception:
+        pass
+
+_REPLAY_ROUTING_KEYS = ("command_id", "cid", "preset", "preset_dict")
+
+def _strip_replay_keys(md):
+    """Return a shallow copy of md without replay-routing keys.
+
+    These are captured into the undo tuple's _replay marker at apply time and
+    must NOT persist in live metadata — otherwise the NEXT tool (geometry,
+    convo, …), which builds its edit metadata by copying doc.metadata,
+    inherits a stale command_id/preset and gets mislabelled as that tool.
+    """
+    if not md or not any(k in md for k in _REPLAY_ROUTING_KEYS):
+        return md
+    clean = dict(md)
+    for k in _REPLAY_ROUTING_KEYS:
+        clean.pop(k, None)
+    return clean
+
+def _make_replay_marker(metadata: dict | None, step_name: str) -> dict | None:
+    """
+    Build a compact 'replay marker' for a just-applied edit so History Explorer
+    can rebuild an exact command payload later (and so Function Bundles can be
+    created from a document's history).
+
+    Returns {"step_name", "command_id", "preset", "cid_explicit"} or None.
+
+    Mirrors _RoiViewDocument._preview_commands capture:
+      1. Prefer an explicit command_id + preset carried in the edit metadata.
+      2. Otherwise recover the preset from the app's _last_headless_command,
+         matching on normalized command_id (set by _handle_command_drop at the
+         moment the op runs).
+
+    The *preset* is the valuable, otherwise-unrecoverable payload we rescue.
+    The command_id is best-effort; History Explorer canonicalizes it against
+    its display-name table when this marker was only name-derived
+    (cid_explicit=False).
+    """
+    try:
+        from setiastro.saspro.command_ids import normalize_command_id
+    except Exception:
+        def normalize_command_id(s):
+            return (s or "").strip().lower().replace(" ", "_")
+
+    md = dict(metadata or {})
+
+    explicit_cid = md.get("command_id") or md.get("cid")
+    raw_cid = explicit_cid or md.get("step_name") or step_name or ""
+    raw_cid = str(raw_cid).strip()
+    if not raw_cid:
+        return None
+
+    cid = normalize_command_id(raw_cid)
+
+    preset = md.get("preset") or md.get("preset_dict") or {}
+    try:
+        preset = dict(preset)
+    except Exception:
+        preset = {}
+
+    if not preset:
+        try:
+            from PyQt6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is not None:
+                for widget in app.topLevelWidgets():
+                    last = getattr(widget, "_last_headless_command", None)
+                    if not isinstance(last, dict):
+                        continue
+                    last_cid = normalize_command_id(str(last.get("command_id") or ""))
+                    if last_cid and last_cid == cid:
+                        preset = dict(last.get("preset") or {})
+                        break
+        except Exception:
+            pass
+    # Only record a marker when we captured real signal: an explicit command
+    # id, or a recovered preset. Otherwise leave the snapshot unmarked so the
+    # legacy heuristics can still run.
+    if not explicit_cid and not preset:
+        return None
+    return {
+        "step_name": str(step_name or raw_cid),
+        "command_id": cid,
+        "preset": preset,
+        "cid_explicit": bool(explicit_cid),
+    }
+
 _ALLOWED_DEPTHS = {
     "png":  {"8-bit"},
     "jpg":  {"8-bit"},
@@ -172,6 +518,8 @@ _ALLOWED_DEPTHS = {
     "xisf": {"16-bit", "32-bit unsigned", "32-bit floating point"},
     "psb":  {"16-bit", "32-bit floating point"},
     "webp": ["8-bit"],
+    # SYQ Core 1: u8 / u16 / f32 (SASpro is f32-internal; no u32 or f64 export).
+    "syq":  {"8-bit", "16-bit", "32-bit floating point"},
 }
 
 class TableDocument(QObject):
@@ -224,7 +572,28 @@ class ImageDocument(QObject):
         #   "ts": float
         # }
         self._op_log: list[dict] = []
-        
+        # Playhead index into _op_log. Points at the position where the NEXT
+        # recorded op will land. undo/redo move it back/forward; a new edit
+        # from a mid-log position truncates the "future" branch (matching the
+        # linear-undo model already used for _redo).
+        self._op_log_playhead: int = 0
+
+        # ---- Stratified metadata stores -------------------------------
+        # These hold WCS / plate-solve data (_sticky_meta) and acquisition
+        # invariants (_identity_meta) independently of the per-state undo
+        # snapshots, so plate-solve results survive undo/redo across
+        # WCS-invariant operations (color cal, sharpen, denoise, star
+        # removal, stretch, …). See _sync_strata_from_metadata /
+        # _overlay_strata_onto_metadata below.
+        self._sticky_meta: dict = {}
+        self._identity_meta: dict = {}
+        #saspromote anything the caller already put in metadata (e.g. from a
+        # freshly-loaded file: OBJECT, DATE-OBS, wcs_header, …).
+        try:
+            self._sync_strata_from_metadata()
+        except Exception:
+            pass
+
         # Track unsaved changes explicitly
         self.dirty: bool = False
         
@@ -244,8 +613,16 @@ class ImageDocument(QObject):
         """
         Append a param-record for this edit. This is *lightweight* metadata
         used for replaying ROI recipes etc; it does NOT affect undo/redo.
+
+        Honours _op_log_playhead: if the playhead is behind the log tail
+        (user is mid-undo), the "future" branch is truncated first — the
+        same linear-undo model that apply_edit uses for _redo.
         """
         import time as _time
+        # Truncate the future branch if we were mid-log after undo.
+        ph = max(0, min(self._op_log_playhead, len(self._op_log)))
+        if ph < len(self._op_log):
+            del self._op_log[ph:]
         op_id = uuid.uuid4().hex
         entry = {
             "id": op_id,
@@ -256,15 +633,149 @@ class ImageDocument(QObject):
             "ts": float(_time.time()),
         }
         self._op_log.append(entry)
+        self._op_log_playhead = len(self._op_log)
         return op_id
 
     def get_operation_log(self) -> list[dict]:
-        """Return a copy of the operation log (for UI / replay)."""
+        """
+        Return a copy of the operation log, respecting the undo/redo
+        playhead — entries beyond the playhead are the "future" branch
+        that would be discarded on the next edit and are hidden from the
+        default view. Use get_full_operation_log() to see everything.
+        """
+        ph = max(0, min(self._op_log_playhead, len(self._op_log)))
+        return list(self._op_log[:ph])
+
+    def get_full_operation_log(self) -> list[dict]:
+        """Return the full log including entries past the playhead."""
         return list(self._op_log)
 
     def clear_operation_log(self):
         """Clear the operation log (does not touch pixel history)."""
         self._op_log.clear()
+        self._op_log_playhead = 0
+
+    # --- metadata strata helpers (WCS / plate-solve survival) ----------
+    def _sync_strata_from_metadata(self, source: dict | None = None):
+        """
+        Scan `source` (default: self.metadata) and promote any sticky /
+        identity keys into the corresponding stratum store. Safe to call
+        multiple times; safe on partial dicts (e.g. the incoming metadata=
+        arg of apply_edit).
+
+        Tools that mutate self.metadata directly (bypassing apply_edit)
+        can call sync_strata_from_metadata() to make sure their sticky /
+        identity keys are captured before the next undo/redo.
+        """
+        src = source if source is not None else getattr(self, "metadata", None)
+        if not isinstance(src, dict):
+            return
+        for k, v in src.items():
+            if _is_sticky_key(k):
+                self._sticky_meta[k] = v
+            elif _is_identity_key(k):
+                self._identity_meta[k] = v
+
+    def sync_strata_from_metadata(self):
+        """Public alias for _sync_strata_from_metadata."""
+        self._sync_strata_from_metadata()
+
+    def _overlay_strata_onto_metadata(self):
+        """
+        Overlay identity then sticky onto self.metadata. Called after
+        undo/redo restores a frozen snapshot — so document-level keys
+        survive the restore. Sticky wins over identity where they overlap
+        (they should be disjoint sets, but sticky is 'more current'
+        semantically).
+        """
+        if not isinstance(getattr(self, "metadata", None), dict):
+            return
+        if self._identity_meta:
+            for k, v in self._identity_meta.items():
+                self.metadata[k] = v
+        if self._sticky_meta:
+            for k, v in self._sticky_meta.items():
+                self.metadata[k] = v
+
+    def set_wcs(self, hdr_like, *, source: str | None = None, wcs_obj=None):
+        """
+        Attach a plate-solve result to this document as sticky metadata.
+
+        `hdr_like` should be a fits.Header (or a plain dict of WCS keys),
+        `wcs_obj` optionally an astropy.wcs.WCS. The result is stored in
+        _sticky_meta so it will survive undo/redo across WCS-invariant
+        operations. Also mirrored to self.metadata so current code paths
+        that read doc.metadata["wcs_header"] etc. see it immediately.
+        """
+        if hdr_like is None and wcs_obj is None:
+            return
+        if hdr_like is not None:
+            self._sticky_meta["wcs_header"] = hdr_like
+        if wcs_obj is not None:
+            self._sticky_meta["wcs"] = wcs_obj
+        self._sticky_meta["is_solved"] = True
+        if source:
+            self._sticky_meta["plate_solve_source"] = source
+        # Mirror to live self.metadata for immediate consumers.
+        md = getattr(self, "metadata", None)
+        if isinstance(md, dict):
+            if hdr_like is not None:
+                md["wcs_header"] = hdr_like
+            if wcs_obj is not None:
+                md["wcs"] = wcs_obj
+            md["is_solved"] = True
+            if source:
+                md["plate_solve_source"] = source
+        try:
+            self.changed.emit()
+        except Exception:
+            pass
+
+    def clear_wcs(self):
+        """Drop sticky WCS (for operations that fundamentally invalidate it)."""
+        _keys = ("wcs", "wcs_header", "is_solved",
+                 "plate_solve_source", "plate_solve_time",
+                 "__header_snapshot__")
+        for k in _keys:
+            self._sticky_meta.pop(k, None)
+            md = getattr(self, "metadata", None)
+            if isinstance(md, dict):
+                md.pop(k, None)
+
+    def apply_geometry_transform(self, wcs_transform):
+        """
+        Entry point for crop / rotate / resample tools to keep the sticky
+        WCS valid across a geometry change.
+
+        `wcs_transform` is a callable taking the current sticky WCS
+        payload (dict or fits.Header) and returning the new one, e.g.::
+
+            def crop_transform(hdr):
+                new = dict(hdr) if not hasattr(hdr, 'copy') else hdr.copy()
+                new['CRPIX1'] = float(new.get('CRPIX1', 0)) - x_offset
+                new['CRPIX2'] = float(new.get('CRPIX2', 0)) - y_offset
+                return new
+
+        NOTE: this is a stub for the WCS_TRANSFORM migration described in
+        the stratification design. Once a tool implements it, the
+        (before, after) pair should also be recorded on the tool's undo
+        record so undo/redo can invert the transform. Until then, undo
+        past a geometry change may leave the sticky WCS reflecting the
+        post-transform pixel grid — the same class of bug as today.
+        """
+        if not callable(wcs_transform):
+            return
+        for key in ("wcs_header", "wcs", "roi_wcs_header"):
+            if key in self._sticky_meta:
+                try:
+                    new_val = wcs_transform(self._sticky_meta[key])
+                    if new_val is not None:
+                        self._sticky_meta[key] = new_val
+                        md = getattr(self, "metadata", None)
+                        if isinstance(md, dict):
+                            md[key] = new_val
+                except Exception as e:
+                    print(f"[ImageDocument] geometry transform failed for {key}: {e}")
 
 
     def can_undo(self) -> bool:
@@ -517,16 +1028,42 @@ class ImageDocument(QObject):
                 new_full = base.copy()
                 new_full[y:y + h, x:x + w] = img
 
+                # NEW: capture any sticky/identity keys the caller may have
+                # written directly to parent.metadata since the last edit
+                # (e.g. a plate solve) BEFORE we snapshot for undo, so they
+                # don't get lost when future undos restore this snapshot.
+                try:
+                    if hasattr(parent, "_sync_strata_from_metadata"):
+                        parent._sync_strata_from_metadata()
+                except Exception:
+                    pass
+
                 # push onto the PARENT’s history
                 if metadata:
-                    parent.metadata = _merge_meta(parent.metadata, metadata, step_name)
+                    parent.metadata = _merge_meta(parent.metadata, _strip_replay_keys(metadata), step_name)
                 else:
                     parent.metadata.setdefault("step_name", step_name)
+
+                # NEW: promote sticky/identity keys just merged in from the
+                # incoming metadata (e.g. wcs_header from plate solve, or
+                # DATE-OBS refreshed from a fresh header).
+                try:
+                    if hasattr(parent, "_sync_strata_from_metadata"):
+                        parent._sync_strata_from_metadata()
+                except Exception:
+                    pass
 
                 sm = get_swap_manager()
                 sid = sm.save_state(parent.image)
                 if sid:
-                    parent._undo.append((sid, parent.metadata.copy(), step_name))
+                    _meta_snap = parent.metadata.copy()
+                    _rp = _make_replay_marker(metadata, step_name)
+                    _replay_audit(step_name, _rp)
+                    if _rp is not None:
+                        _meta_snap["_replay"] = _rp
+                    else:
+                        _meta_snap.pop("_replay", None)
+                    parent._undo.append((sid, _meta_snap, step_name))
                     sm.pin_state(sid)
                     parent._pin_last_undos(keep=5)
 
@@ -556,6 +1093,16 @@ class ImageDocument(QObject):
             self._cow_source = None
 
         if self.image is not None:
+            # NEW: capture any sticky/identity keys the caller wrote
+            # directly to self.metadata since the last edit (e.g. a plate
+            # solve that bypasses apply_edit) BEFORE we snapshot for undo.
+            # Without this, the snapshot below is fine but future undos
+            # that restore it would not preserve the newly-set sticky keys.
+            try:
+                self._sync_strata_from_metadata()
+            except Exception:
+                pass
+
             # snapshot current image + metadata for undo
             try:
                 curr = np.asarray(self.image, dtype=np.float32)
@@ -575,7 +1122,14 @@ class ImageDocument(QObject):
                     swap_id=sid
                 )
                 if sid:
-                    self._undo.append((sid, self.metadata.copy(), step_name))
+                    _meta_snap = self.metadata.copy()
+                    _rp = _make_replay_marker(metadata, step_name)
+                    _replay_audit(step_name, _rp)
+                    if _rp is not None:
+                        _meta_snap["_replay"] = _rp
+                    else:
+                        _meta_snap.pop("_replay", None)
+                    self._undo.append((sid, _meta_snap, step_name))
                     sm.pin_state(sid)
                     self._pin_last_undos(keep=5)
             except Exception as e:
@@ -590,9 +1144,18 @@ class ImageDocument(QObject):
 
         # --- header-safe metadata merge ---
         if metadata:
-            self.metadata = _merge_meta(self.metadata, metadata, step_name)
+            self.metadata = _merge_meta(self.metadata, _strip_replay_keys(metadata), step_name)
         else:
             self.metadata.setdefault("step_name", step_name)
+
+        # NEW: promote sticky/identity keys just merged in from the incoming
+        # metadata. This is how, e.g., plate-solve results delivered via
+        # apply_edit(metadata={"wcs_header": hdr, ...}) end up in
+        # _sticky_meta and survive later undo/redo.
+        try:
+            self._sync_strata_from_metadata()
+        except Exception:
+            pass
 
         # normalize new image
         img = np.asarray(new_image, dtype=np.float32)
@@ -643,6 +1206,16 @@ class ImageDocument(QObject):
         )
 
         sm = get_swap_manager()
+
+        # NEW: capture any sticky/identity keys currently in self.metadata
+        # (including anything a tool set directly since the last apply_edit
+        # — e.g. plate solve) so they get promoted to _sticky_meta /
+        # _identity_meta BEFORE we blow away self.metadata with a frozen
+        # snapshot below.
+        try:
+            self._sync_strata_from_metadata()
+        except Exception:
+            pass
 
         # Pop with an extra guard in case something cleared _undo between
         # the check above and this call (re-entrancy / threading).
@@ -720,6 +1293,16 @@ class ImageDocument(QObject):
 
         self.image = prev_arr
         self.metadata = dict(prev_meta or {})
+        # NEW: overlay sticky (WCS / plate-solve) and identity keys so they
+        # survive the snapshot restore. This is what makes plate-solve
+        # results carry through undo/redo across WCS-invariant operations.
+        try:
+            self._overlay_strata_onto_metadata()
+        except Exception:
+            pass
+        # NEW: move op-log playhead back one step (bounded at 0).
+        if self._op_log_playhead > 0:
+            self._op_log_playhead -= 1
         self.dirty = True
         try:
             self.changed.emit()
@@ -752,6 +1335,14 @@ class ImageDocument(QObject):
         )
 
         sm = get_swap_manager()
+
+        # NEW: capture any sticky/identity keys currently in self.metadata
+        # (e.g. a plate solve done at this intermediate state) before we
+        # overwrite self.metadata with the redo snapshot below.
+        try:
+            self._sync_strata_from_metadata()
+        except Exception:
+            pass
 
         nxt_sid, nxt_meta, name = self._redo.pop()
 
@@ -816,6 +1407,15 @@ class ImageDocument(QObject):
 
         self.image = nxt_arr
         self.metadata = dict(nxt_meta or {})
+        # NEW: overlay sticky/identity so plate-solve results and identity
+        # keys survive the snapshot restore on redo.
+        try:
+            self._overlay_strata_onto_metadata()
+        except Exception:
+            pass
+        # NEW: advance op-log playhead (bounded at len(_op_log)).
+        if self._op_log_playhead < len(self._op_log):
+            self._op_log_playhead += 1
         self.dirty = True
         try:
             self.changed.emit()
@@ -1336,6 +1936,14 @@ class _RoiViewDocument(ImageDocument):
         self._pundo: list[tuple[_np.ndarray, dict, str]] = []  # (img, meta, name)
         self._predo: list[tuple[_np.ndarray, dict, str]] = []  # (img, meta, name)
 
+        # NEW: promote sticky keys (roi_wcs_header, original_header, ...)
+        # that we assigned directly to self.metadata above, so they survive
+        # this doc's local preview undo/redo.
+        try:
+            self._sync_strata_from_metadata()
+        except Exception:
+            pass
+
     @property
     def image(self):
         p = self._parent_doc
@@ -1379,9 +1987,16 @@ class _RoiViewDocument(ImageDocument):
             raise ValueError(f"Commit shape {img.shape[:2]} does not match ROI {(h, w)}")
 
         # push undo on parent and paste
-        parent._undo.append((base.copy(), parent.metadata.copy(), step_name))
+        _meta_snap = parent.metadata.copy()
+        _rp = _make_replay_marker(metadata, step_name)
+        _replay_audit(step_name, _rp)
+        if _rp is not None:
+            _meta_snap["_replay"] = _rp
+        else:
+            _meta_snap.pop("_replay", None)
+        parent._undo.append((base.copy(), _meta_snap, step_name))
         parent._redo.clear()
-        if metadata: parent.metadata.update(metadata)
+        if metadata: parent.metadata.update(_strip_replay_keys(metadata))
         parent.metadata.setdefault("step_name", step_name)
 
         new_full = base.copy()
@@ -1403,7 +2018,7 @@ class _RoiViewDocument(ImageDocument):
 
     # --- helper to snapshot what's currently visible in the Preview
     def _current_preview_copy(self) -> _np.ndarray:
-        img = self.image  # property: returns override or parent slice
+        img = self.image  #sasproperty: returns override or parent slice
         if img is None:
             return _np.zeros((1, 1), dtype=_np.float32)
         arr = _np.asarray(img, dtype=_np.float32)
@@ -1486,8 +2101,15 @@ class _RoiViewDocument(ImageDocument):
         )
 
         if metadata:
-            self.metadata.update(metadata)
+            self.metadata.update(_strip_replay_keys(metadata))
         self.metadata.setdefault("step_name", step_name)
+
+        # NEW: promote sticky/identity keys just merged in, so they
+        # survive this ROI doc's local preview undo/redo.
+        try:
+            self._sync_strata_from_metadata()
+        except Exception:
+            pass
 
         # 1) notify ROI listeners (e.g. the main window via _on_roi_changed)
         try:
@@ -1564,6 +2186,13 @@ class _RoiViewDocument(ImageDocument):
                 pundo_len=len(self._pundo),
                 predo_len=len(self._predo),
             )
+            # NEW: capture any sticky/identity keys currently in metadata
+            # before we blow it away with the frozen snapshot.
+            try:
+                self._sync_strata_from_metadata()
+            except Exception:
+                pass
+
             # move current → redo; pop undo → current
             curr = self._current_preview_copy()
             self._predo.append((curr, dict(self.metadata), self._pundo[-1][2]))
@@ -1571,6 +2200,12 @@ class _RoiViewDocument(ImageDocument):
             prev_img, prev_meta, name = self._pundo.pop()
             self._preview_override = prev_img
             self.metadata = dict(prev_meta)
+            # NEW: overlay sticky/identity so ROI-level WCS + identity
+            # keys survive local preview undo.
+            try:
+                self._overlay_strata_onto_metadata()
+            except Exception:
+                pass
             _debug_log_undo(
                 "_RoiViewDocument.undo.local.apply",
                 roi=self._roi,
@@ -1626,6 +2261,13 @@ class _RoiViewDocument(ImageDocument):
     def redo(self) -> str | None:
         # --- Case 1: ROI-local preview history ---
         if self._predo:
+            # NEW: capture any sticky/identity keys currently in metadata
+            # before we replace it with the redo snapshot below.
+            try:
+                self._sync_strata_from_metadata()
+            except Exception:
+                pass
+
             # move current → undo; pop redo → current
             curr = self._current_preview_copy()
             self._pundo.append((curr, dict(self.metadata), self._predo[-1][2]))
@@ -1633,6 +2275,12 @@ class _RoiViewDocument(ImageDocument):
             nxt_img, nxt_meta, name = self._predo.pop()
             self._preview_override = nxt_img
             self.metadata = dict(nxt_meta)
+            # NEW: overlay sticky/identity so ROI-level WCS + identity
+            # keys survive local preview redo.
+            try:
+                self._overlay_strata_onto_metadata()
+            except Exception:
+                pass
 
             try:
                 self.changed.emit()
@@ -2153,16 +2801,28 @@ class DocManager(QObject):
         """Return a live, ROI-aware proxy for this view."""
         return LiveViewDocument(self, view, base_doc)
 
-    def open_path(self, path: str):
+    def open_path(self, path: str, open_auxiliary_images: bool | None = None):
         ext = os.path.splitext(path)[1].lower().lstrip('.')
         norm_ext = _normalize_ext(ext)
 
         lower_path = path.lower()
         is_fits = lower_path.endswith((".fit", ".fits", ".fts", ".fit.gz", ".fits.gz", ".fz"))
         is_xisf = (norm_ext == "xisf")
+        is_syq = (norm_ext == "syq")
 
         primary_doc = None
         created_any = False
+
+        if open_auxiliary_images is None:
+            try:
+                from PyQt6.QtCore import QSettings
+                open_auxiliary_images = bool(
+                    QSettings().value("files/open_auxiliary_images", True, type=bool)
+                )
+            except Exception:
+                open_auxiliary_images = True
+        else:
+            open_auxiliary_images = bool(open_auxiliary_images)
 
         # ---------- local helper: build vector-style table from 1-D FITS image HDU ----------
         def _make_vector_table_doc_from_hdu(hdu, base_path: str, base_name: str, key_str: str):
@@ -2436,9 +3096,35 @@ class DocManager(QObject):
                     "is_mono": is_mono,
                     "original_format": norm_ext,
                 }
-
-                # NEW: attach WCS even for old loader
                 meta = attach_wcs_to_metadata(meta, header)
+
+            # NEW: derive a short display name like OBJECT_FILTER from the
+            # header. Works for FITS, XISF (synthesized FITS header), and
+            # TIFF/PNG/JPEG/WebP that carry an embedded SASpro header
+            # sidecar — all of those populate original_header on load.
+            #
+            # Gated by Settings → "Smart view naming" (files/smart_view_naming,
+            # default True). When off, the raw filename is left as the view
+            # title — matches pre-smart-naming behaviour. Only affects NEW
+            # loads: existing views keep whatever display_name they have.
+            if not meta.get("display_name"):
+                try:
+                    from PyQt6.QtCore import QSettings
+                    smart_naming = QSettings().value(
+                        "files/smart_view_naming", True, type=bool
+                    )
+                except Exception:
+                    smart_naming = True
+                if smart_naming:
+                    hdr_for_name = (meta.get("fits_header")
+                                    or meta.get("original_header")
+                                    or header)
+                    derived = _derive_display_name_from_header(
+                        hdr_for_name,
+                        path=(meta.get("file_path") or path),
+                    )
+                    if derived:
+                        meta["display_name"] = derived
 
             _snapshot_header_for_metadata(meta)
 
@@ -2448,7 +3134,9 @@ class DocManager(QObject):
             created_any = True
 
         # ---------- 2) FITS: enumerate HDUs (tables + vector HDUs + extra images + ICC) ----------
-        if is_fits:
+        # Extra image HDUs (weights, rejection maps, …) each become another
+        # full float32 document + view. Skip them unless explicitly requested.
+        if is_fits and open_auxiliary_images:
             try:
                 with fits.open(path, memmap=False) as hdul:
                     base = os.path.basename(path)
@@ -2626,57 +3314,134 @@ class DocManager(QObject):
                         print(f"[DocManager] XISF primary (index 0) open failed: {e0}")
 
                 # Add images 1..N-1 as siblings (even if primary came from legacy)
-                for i in range(1, len(metas)):
-                    try:
-                        m = metas[i]
-                        arr = xisf.read_image(i, data_format="channels_last")
-                        arr_f32 = _to_float32_preserve(arr)
-                        arr_f32 = _normalize_image_01(arr_f32)
-
-                        bd = _bit_depth_from_dtype(m.get("dtype", arr.dtype))
-                        is_mono_i = (arr_f32.ndim == 2) or (arr_f32.ndim == 3 and arr_f32.shape[2] == 1)
-
-                        # Friendly label: prefer id, else EXTNAME/EXTVER in FITSKeywords, else index
-                        label = m.get("id") or None
-                        if not label:
-                            try:
-                                fk = m.get("FITSKeywords", {})
-                                en = (fk.get("EXTNAME") or [{}])[0].get("value", "")
-                                ev = (fk.get("EXTVER")  or [{}])[0].get("value", "")
-                                if en:
-                                    label = f"{en}[{ev}]" if ev else en
-                            except Exception:
-                                pass
-                        if not label:
-                            label = f"Image[{i}]"
-
-                        md = {
-                            "file_path": f"{path}::XISF[{i}]",
-                            "original_header": m,  # snapshot; sanitized below
-                            "bit_depth": bd,
-                            "is_mono": is_mono_i,
-                            "original_format": "xisf",
-                            "image_meta": {"derived_from": path, "layer_index": i, "readonly": True},
-                            "display_name": f"{base} {label}",
-                        }
-                        hdri = _xisf_meta_to_fits_header(m)
-                        if hdri is not None:
-                            md = attach_wcs_to_metadata(md, hdri)
-
-                        _snapshot_header_for_metadata(md)
-                        sib = ImageDocument(arr_f32, md)
-                        self._register_doc(sib)
+                if open_auxiliary_images:
+                    for i in range(1, len(metas)):
                         try:
-                            sib.changed.emit()
-                        except Exception as e:
-                            import logging
-                            logging.debug(f"Exception suppressed: {type(e).__name__}: {e}")
-                        created_any = True
+                            m = metas[i]
+                            arr = xisf.read_image(i, data_format="channels_last")
+                            arr_f32 = _to_float32_preserve(arr)
+                            arr_f32 = _normalize_image_01(arr_f32)
 
-                    except Exception as _e:
-                        print(f"[DocManager] XISF image {i} skipped: {_e}")
+                            bd = _bit_depth_from_dtype(m.get("dtype", arr.dtype))
+                            is_mono_i = (arr_f32.ndim == 2) or (arr_f32.ndim == 3 and arr_f32.shape[2] == 1)
+
+                            # Friendly label: prefer id, else EXTNAME/EXTVER in FITSKeywords, else index
+                            label = m.get("id") or None
+                            if not label:
+                                try:
+                                    fk = m.get("FITSKeywords", {})
+                                    en = (fk.get("EXTNAME") or [{}])[0].get("value", "")
+                                    ev = (fk.get("EXTVER")  or [{}])[0].get("value", "")
+                                    if en:
+                                        label = f"{en}[{ev}]" if ev else en
+                                except Exception:
+                                    pass
+                            if not label:
+                                label = f"Image[{i}]"
+
+                            md = {
+                                "file_path": f"{path}::XISF[{i}]",
+                                "original_header": m,  # snapshot; sanitized below
+                                "bit_depth": bd,
+                                "is_mono": is_mono_i,
+                                "original_format": "xisf",
+                                "image_meta": {"derived_from": path, "layer_index": i, "readonly": True},
+                                "display_name": f"{base} {label}",
+                            }
+                            hdri = _xisf_meta_to_fits_header(m)
+                            if hdri is not None:
+                                md = attach_wcs_to_metadata(md, hdri)
+
+                            _snapshot_header_for_metadata(md)
+                            sib = ImageDocument(arr_f32, md)
+                            self._register_doc(sib)
+                            try:
+                                sib.changed.emit()
+                            except Exception as e:
+                                import logging
+                                logging.debug(f"Exception suppressed: {type(e).__name__}: {e}")
+                            created_any = True
+
+                        except Exception as _e:
+                            print(f"[DocManager] XISF image {i} skipped: {_e}")
             except Exception as _e:
                 print(f"[DocManager] XISF open/enumeration failed: {_e}")
+
+        # ---------- 3b) SYQ: primary already loaded; enumerate extra image layers ----------
+        # Each additional IMAGE_DESCRIPTOR (processing checkpoints, linear images,
+        # masks, …) becomes a read-only sibling view — the SYQ analog of extra
+        # FITS image HDUs / XISF images. The primary was opened by legacy_load_image
+        # above (with its WCS already attached); here we also fold the raw SYQ
+        # metadata onto it and bring in the other layers.
+        if is_syq:
+            try:
+                from setiastro.saspro.imageops.syq_io import (
+                    list_syq_images, read_syq as _syq_read_layer,
+                )
+                base = os.path.basename(path)
+                layers = list_syq_images(path)
+
+                if primary_doc is not None:
+                    prim = next((L for L in layers if L["is_primary"]), None)
+                    if prim is not None:
+                        try:
+                            im = primary_doc.metadata.setdefault("image_meta", {})
+                            if isinstance(im, dict):
+                                im.setdefault("syq_metadata", prim["metadata"])
+                                im.setdefault("syq_role", prim["role"])
+                        except Exception:
+                            pass
+
+                used_names = set()
+                if open_auxiliary_images:
+                    for L in layers:
+                        if L["is_primary"]:
+                            continue
+                        try:
+                            arr, hdr, bd, mono = _syq_read_layer(path, image_id=L["id"])
+                            arr = _normalize_image_01(arr)
+                            # Studio files often carry many layers sharing a role
+                            # (e.g. PROCESSING_CHECKPOINT), which would produce
+                            # identically-titled views. Number the repeats
+                            # ("NAME", "NAME 2", …); the object id in file_path
+                            # stays the stable, unique key regardless.
+                            label = L["role"] or f"SYQ[{L['id']}]"
+                            disp = f"{base} {label}"
+                            if disp in used_names:
+                                k = 2
+                                while f"{base} {label} {k}" in used_names:
+                                    k += 1
+                                disp = f"{base} {label} {k}"
+                            used_names.add(disp)
+                            md = {
+                                "file_path": f"{path}::SYQ[{L['id']}]",
+                                "original_header": hdr,
+                                "bit_depth": bd,
+                                "is_mono": mono,
+                                "original_format": "syq",
+                                "image_meta": {
+                                    "derived_from": path,
+                                    "layer_id": L["id"],
+                                    "syq_role": L["role"],
+                                    "syq_metadata": L["metadata"],
+                                    "readonly": True,
+                                },
+                                "display_name": disp,
+                            }
+                            md = attach_wcs_to_metadata(md, hdr)
+                            _snapshot_header_for_metadata(md)
+                            sib = ImageDocument(arr, md)
+                            self._register_doc(sib)
+                            try:
+                                sib.changed.emit()
+                            except Exception as e:
+                                import logging
+                                logging.debug(f"Exception suppressed: {type(e).__name__}: {e}")
+                            created_any = True
+                        except Exception as _e:
+                            print(f"[DocManager] SYQ layer {L.get('id')} skipped: {_e}")
+            except Exception as _e:
+                print(f"[DocManager] SYQ open/enumeration failed: {_e}")
 
         # ---------- 4) Return sensible doc or raise ----------
         if primary_doc is not None:
@@ -3083,6 +3848,15 @@ class DocManager(QObject):
             meta["original_header"] = effective_header
 
         doc.metadata = meta
+        # Post-save the in-memory metadata was replaced wholesale. Re-sync
+        # sticky/identity strata so they reflect what's actually there now
+        # (e.g. the refreshed original_header). Best-effort — older doc
+        # types (ProjectDocument etc.) may not implement this.
+        try:
+            if hasattr(doc, "_sync_strata_from_metadata"):
+                doc._sync_strata_from_metadata()
+        except Exception:
+            pass
 
         # reset dirty flag
         if hasattr(doc, "dirty"):

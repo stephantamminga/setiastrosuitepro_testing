@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Optional, List, Tuple, Dict, Any, Callable
-
+from setiastro.saspro.help_support import make_help_button
 import numpy as np
 
 try:
@@ -1437,7 +1437,7 @@ def _equalize_radial(tiles: List[Tile], cfg: SurfaceMosaicConfig,
             np.add.at(wac, bi, ct)
         prof = np.where(wac > 0, acc / np.maximum(wac, 1e-9), 0.0)
         # per-tile GAIN-ONLY robust fit: weighted median of per-bin ratios
-        # profile/tile. A median of ratios shrugs off glint-corrupted bins where
+        #sasprofile/tile. A median of ratios shrugs off glint-corrupted bins where
         # a least-squares would chase them; no bias term, so the sky (which never
         # enters the bins anyway) cannot be lifted.
         for pos, (bi, md, ct) in tile_bins.items():
@@ -2320,6 +2320,7 @@ if _HAVE_QT:
             self.btn_advanced.clicked.connect(self._open_advanced)
             run_row.addWidget(self.btn_advanced)
             run_row.addStretch(1)
+            run_row.addWidget(make_help_button("surface_mosaic", self))
             self.btn_run = QPushButton("Build Mosaic")
             self.btn_run.clicked.connect(self._on_run)
             run_row.addWidget(self.btn_run)

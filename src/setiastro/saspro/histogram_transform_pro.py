@@ -631,6 +631,7 @@ class HistogramTransformDialogPro(QDialog):
         # Placed AFTER the stretch so it pins to the lower-left corner.
         # Deferred import to avoid any shortcuts.py <-> this-module import cycle.
         from setiastro.saspro.shortcuts import PresetDragHandle
+        from setiastro.saspro.help_support import make_help_button
         try:
             from setiastro.saspro.resources import histogram_transform_path
             _lv_icon = QIcon(histogram_transform_path)
@@ -654,6 +655,8 @@ class HistogramTransformDialogPro(QDialog):
         )
         drag_row.addWidget(self.preset_drag_handle)
         drag_row.addStretch(1)
+        self.btn_help = make_help_button("levels", self)
+        drag_row.addWidget(self.btn_help)
         left.addLayout(drag_row)
 
         root.addWidget(left_host, 0)
@@ -1012,7 +1015,16 @@ class HistogramTransformDialogPro(QDialog):
 
         if self.cb_live.isChecked():
             out = apply_histogram_transform_channel(self._preview_base, b, m_rel, w, chan)
-            # ...mask blend unchanged...
+            # Mask-aware preview: _active_mask_array() is sized to the FULL doc,
+            # but the preview base is downsampled, so resize the mask down to the
+            # preview dimensions before blending. Without this the preview shows
+            # an unmasked transform while Apply (fullres) blends — the mismatch
+            # the user sees.
+            mask_full = self._active_mask_array()
+            if mask_full is not None:
+                ph, pw = self._preview_base.shape[:2]
+                mask_prev = self._resize_mask_to(mask_full, ph, pw)
+                out = self._blend_with_mask(self._preview_base, out, mask_prev)
         else:
             out = self._preview_base
 
@@ -1208,16 +1220,30 @@ class HistogramTransformDialogPro(QDialog):
             return
 
         try:
+            _preset = self._levels_params()
+            _meta = {"step_name": "Levels", "command_id": "levels", "preset": dict(_preset)}
             if hasattr(self.document, "apply_edit"):
                 self.document.apply_edit(
                     result.astype(np.float32, copy=False),
-                    metadata={"step_name": "Levels"},
-                    step_name="Levels"
+                    metadata=_meta,
+                    step_name="Levels",
                 )
             elif hasattr(self.document, "set_image"):
-                self.document.set_image(result, step_name="Levels")
+                self.document.set_image(result, metadata=_meta, step_name="Levels")
             else:
                 self.document.image = result
+
+            # Keep "Replay last / on base" consistent with the drop path.
+            try:
+                mw = self.parent()
+                _seen = 0
+                while mw is not None and not hasattr(mw, "_handle_command_drop") and _seen < 8:
+                    mw = mw.parent() if callable(getattr(mw, "parent", None)) else None
+                    _seen += 1
+                if mw is not None:
+                    mw._last_headless_command = {"command_id": "levels", "preset": dict(_preset)}
+            except Exception:
+                pass
         except Exception as e:
             self.btn_apply.setEnabled(True)
             self.btn_new.setEnabled(True)
@@ -1226,11 +1252,17 @@ class HistogramTransformDialogPro(QDialog):
             QMessageBox.critical(self, "Levels", f"Failed to apply:\n{e}")
             return
 
-        # Reload base image + cached hist0, KEEP UI OPEN and KEEP slider values
+        # Reload base image + cached hist0, KEEP UI OPEN.
         self._reload_base_from_document()
 
-        # immediate refresh
-        self._recompute()
+        # Reset black/mid/white back to identity after a successful apply, so the
+        # next adjustment starts from a clean curve on the already-transformed
+        # image. (Previously the handles were left where the user had them —
+        # PI's behavior — but users preferred a reset here.) _reset() restores
+        # both spinboxes, both sliders, and the curve widget together, and it
+        # calls _schedule()/_recompute() so the preview refreshes on the new
+        # base — so we don't need a separate _recompute() call below.
+        self._reset()
 
         self.btn_apply.setEnabled(True)
         self.btn_new.setEnabled(True)

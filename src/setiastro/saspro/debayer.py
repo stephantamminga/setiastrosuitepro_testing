@@ -1,4 +1,4 @@
-# pro/debayer.py
+#saspro/debayer.py
 from __future__ import annotations
 import numpy as np
 from typing import Optional, Tuple
@@ -23,7 +23,7 @@ from setiastro.saspro.bayer_utils import (
     normalize_bayer_token as _normalize_bayer_token,
     roworder_is_bottom_up as _roworder_is_bottom_up,
 )
-
+from setiastro.saspro.help_support import make_help_button
 
 _RAW_EXTS = (".raf", ".raw", ".rw2", ".arw", ".nef", ".cr2", ".cr3", ".dng", ".orf", ".pef")
 
@@ -49,10 +49,21 @@ def _find_raw_sibling(path: Optional[str]) -> Optional[str]:
 
 # -------- helpers ------------------------------------------------------------
 _BAYER_METHODS = [
-    ("VNG (Variable Number of Gradients)", "vng"),
-    ("Edge-aware (Numba)",            "edge"),
-    ("Bilinear (Numba)",              "bilinear"),
-    ("Strict CFA (no interpolation)", "strict_cfa"),
+    # RCD is first because it's the best general choice for OSC astro work
+    # — ratio-corrected demosaic preserves saturation on faint narrowband
+    # color and uses second-order gradients that don't speckle under noise
+    # the way VNG does on dim data. AHD is a close second and tends to win
+    # on fine-detail subjects (planetary, lunar, dense star fields,
+    # daylight) by reconstructing both H and V candidates and picking per
+    # pixel which one is more homogeneous in CIELab. VNG stays available
+    # for daylight subjects where its gradient response is still useful;
+    # edge-aware and bilinear are fallbacks; strict_cfa is for drizzle prep.
+    ("RCD (Ratio-Corrected)",                      "rcd"),
+    ("Edge-aware (Selective Gradient)",            "edge"),    
+    ("AHD (Adaptive Homogeneity-Directed)",        "ahd"),
+    ("VNG (Variable Number of Gradients)",         "vng"),
+    ("Bilinear (Traditional Debayer)",             "bilinear"),
+    ("Strict CFA (no interpolation)",              "strict_cfa"),
 ]
 _XTRANS_METHODS = [
     ("AHD (rawpy)", "AHD"),
@@ -472,9 +483,10 @@ class DebayerDialog(QDialog):
         self.combo_method.setCurrentIndex(0)
         hm.addWidget(self.combo_method)
         hm.addStretch(1)
+        hm.addWidget(make_help_button("debayer", self))
         v.addWidget(self.method_group)
 
-        # progress + buttons
+        #sasprogress + buttons
         self.status = QLabel("")
         self.bar = QProgressBar(self); self.bar.setRange(0, 100)
         v.addWidget(self.status)
@@ -597,7 +609,7 @@ def debayer_array(
     if flipped:
         m = np.ascontiguousarray(np.flipud(m))
 
-    meth = method if method in ("edge", "bilinear", "strict_cfa", "vng") else "vng"
+    meth = method if method in ("edge", "bilinear", "strict_cfa", "vng", "rcd", "ahd") else "rcd"
     rgb = debayer_fits_fast(m, pat, cfa_drizzle=cfa_drizzle, method=meth)
 
     if flipped:
@@ -608,7 +620,9 @@ def apply_debayer_preset_to_doc(dm, doc, preset: dict) -> Tuple[str, np.ndarray]
     """
     preset = {
         "pattern": "auto|RGGB|BGGR|GRBG|GBRG",
-        "method":  "auto|vng|edge|bilinear|strict_cfa|AHD|DHT"
+        "method":  "auto|rcd|ahd|vng|edge|bilinear|strict_cfa|AHD|DHT"
+                   (lowercase 'ahd' is the Numba Bayer AHD; uppercase 'AHD'
+                   routes to rawpy for X-Trans only.)
     }
     Returns (used_pattern, rgb_array).
     """
@@ -656,7 +670,7 @@ def apply_debayer_preset_to_doc(dm, doc, preset: dict) -> Tuple[str, np.ndarray]
     if pat not in _VALID:
         raise ValueError(f"Unsupported Bayer pattern: {pat}")
 
-    method_tok = (want_method.lower() if want_method.lower() in ("edge", "bilinear", "vng", "strict_cfa") else "vng")
+    method_tok = (want_method.lower() if want_method.lower() in ("edge", "bilinear", "vng", "strict_cfa", "rcd", "ahd") else "rcd")
 
     if debayer_fits_fast is None:
         raise RuntimeError("Numba debayer kernels not available.")
@@ -676,7 +690,10 @@ def run_debayer_via_preset(main, preset: dict | None = None, *, doc=None):
 
     preset keys:
       - pattern: "auto" | "RGGB" | "BGGR" | "GRBG" | "GBRG"
-      - method:  "auto" | "vng" | "edge" | "bilinear" | "strict_cfa" | "AHD" | "DHT"
+      - method:  "auto" | "rcd" | "ahd" | "vng" | "edge" | "bilinear"
+                 | "strict_cfa" | "AHD" | "DHT"
+                 (lowercase 'ahd' is the Numba Bayer AHD; uppercase 'AHD'
+                 routes to rawpy for X-Trans only.)
     """
     p = dict(preset or {})
 

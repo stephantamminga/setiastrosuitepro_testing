@@ -208,6 +208,35 @@ def _init_splash():
     QCoreApplication.setApplicationName("Seti Astro Suite Pro")
     class _SASProApplication(QApplication):
         def event(self, e):
+            # macOS: Finder "Open With" / dock-dropped files arrive as
+            # QFileOpenEvent. These can fire BEFORE the main window exists
+            # (right-click a .fits before SASpro is open -> the OS launches
+            # us and immediately sends the FileOpen event, often before our
+            # splash's event loop has ticked the main window into existence).
+            # We buffer paths on the QApplication instance; after the main
+            # window is built, main() installs _file_open_cb and drains the
+            # buffer. Any subsequent FileOpen events route through the cb
+            # directly.
+            if e.type() == QEvent.Type.FileOpen:
+                try:
+                    path = e.file()
+                    if path:
+                        pending = getattr(self, "_pending_open_paths", None)
+                        if pending is None:
+                            pending = []
+                            self._pending_open_paths = pending
+                        pending.append(path)
+
+                        cb = getattr(self, "_file_open_cb", None)
+                        if callable(cb):
+                            try:
+                                cb(path)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                return True
+
             if (
                 e.type() == QEvent.Type.ApplicationActivate
                 and platform.system() == "Darwin"
@@ -622,9 +651,39 @@ def _init_splash():
                 logo_y = 40
                 painter.drawPixmap(logo_x, logo_y, self.logo_pixmap)
 
-            painter.setFont(self.title_font)
-            painter.setPen(QColor(255, 255, 255))
-            painter.drawText(QRect(0, 230, w, 40), Qt.AlignmentFlag.AlignCenter, "Seti Astro Suite Pro")
+            # ─── SASPRO ASCII title ────────────────────────────────────────
+            # Four rows, each a different color — top-down gradient
+            # dim → magenta → bright magenta → white. All rows are exactly
+            # 66 characters wide so columns line up in a monospace font.
+            ascii_lines = [
+                ("┌┐ ┌┐ ┌┬┐ ∙      ┌┐ ┌┐ ┌┬┐ ┌┐ ┌┐      ┌┐ ┐┐ ∙ ┌┬┐ ┌┐      ┌┐ ┌┐ ┌┐", QColor( 85,  85, 100)),
+                ("││ ├   │  │      ├│ ││  │  ││ ││      ││ ││ │  │  ├       ││ ││ ││", QColor(170,  85, 170)),
+                ("└┐ ││  │  │      ││ └┐  │  │┘ ││      └┐ ││ │  │  ││      │┘ │┘ ││", QColor(230, 110, 240)),
+                ("└┘ └┘  ┘  ┘      ┘┘ └┘  ┘  ┘┘ └┘      └┘ └┘ ┘  ┘  └┘      ┘  ┘┘ └┘", QColor(255, 255, 255)),
+            ]
+
+            ascii_font = QFont("Consolas", 10)
+            ascii_font.setStyleHint(QFont.StyleHint.Monospace)
+            # Fallback chain so macOS / Linux builds still land on a mono
+            # font that has the Unicode box-drawing glyphs.
+            ascii_font.setFamilies(["Consolas", "Cascadia Mono", "Menlo",
+                                    "DejaVu Sans Mono", "Courier New"])
+            painter.setFont(ascii_font)
+
+            fm = painter.fontMetrics()
+            line_h = fm.height()
+            block_top = 215  # was y=230 for the one-liner; nudged up because art is 4 rows
+            for i, (line, color) in enumerate(ascii_lines):
+                painter.setPen(color)
+                text_w = fm.horizontalAdvance(line)
+                x = (w - text_w) // 2
+                y = block_top + i * line_h + fm.ascent()
+                painter.drawText(x, y, line)
+
+            # Compute subtitle y dynamically so it clears the taller title
+            # block regardless of font metrics on this platform.
+            subtitle_top = block_top + line_h * len(ascii_lines) + 8
+            # ───────────────────────────────────────────────────────────────
 
             painter.setFont(self.subtitle_font)
             painter.setPen(QColor(180, 180, 200))
@@ -634,12 +693,12 @@ def _init_splash():
                     subtitle_text += QCoreApplication.translate("Splash", "  •  Running locally from source code")
                 else:
                     subtitle_text += QCoreApplication.translate("Splash", "  •  Build {0}").format(self._build)
-            painter.drawText(QRect(0, 270, w, 25), Qt.AlignmentFlag.AlignCenter, subtitle_text)
+            painter.drawText(QRect(0, subtitle_top, w, 25), Qt.AlignmentFlag.AlignCenter, subtitle_text)
 
             if self._supporter_line:
                 painter.setFont(self.supporter_font)
                 painter.setPen(QColor(212, 175, 55))   # gold, matches the About heart
-                painter.drawText(QRect(0, 296, w, 18),
+                painter.drawText(QRect(0, subtitle_top + 26, w, 18),
                                  Qt.AlignmentFlag.AlignCenter, self._supporter_line)
 
             bar_margin = 50
@@ -926,47 +985,61 @@ def _bootstrap_imports():
                 self.__path__ = []    # makes Python treat it as a package
                 self.__spec__ = None
                 self.__version__ = "0.0.0+unavailable"
-                # Minimal cuda/version stubs so guards like
-                # `torch.cuda.is_available()` return False instead of crashing
-                self.cuda = _sys.modules.get(
-                    "torch.cuda",
-                    _TorchUnavailableStub.__new__(_TorchUnavailableStub)
-                )
-                self.version = _sys.modules.get(
-                    "torch.version",
-                    _TorchUnavailableStub.__new__(_TorchUnavailableStub)
-                )
- 
-            _STUB_GETATTR_GUARD = set()  # add this as a class-level variable above __getattr__
+                # NOTE: torch.cuda / torch.version are deliberately NOT set
+                # here any more. They used to be built with __new__ (skipping
+                # __init__), which left them without a __name__ -- so the very
+                # first __getattr__ on one would blow up inside the f-string
+                # below. They now resolve lazily through __getattr__ to the
+                # fully-constructed stubs that the _torch_submods loop installs
+                # into sys.modules immediately after this class is defined.
 
             def __getattr__(self, name: str):
-                child_key = f"{self.__name__}.{name}"
-                # Guard against recursion during frozen module introspection
-                if child_key in _TorchUnavailableStub._STUB_GETATTR_GUARD:
+                # CRITICAL: never fabricate a child stub for a dunder.
+                #
+                # inspect.getmodule() walks every entry in sys.modules probing
+                # __file__ (and friends). If __file__ hands back a module
+                # object, inspect.getfile() falls through to its
+                # `raise TypeError('{!r} is a built-in module'.format(object))`
+                # branch -- and that repr goes through importlib's
+                # _module_repr, which formats self.__file__ with !r, whose
+                # __file__ is another stub, whose __file__ is another stub...
+                # 950 frames later: RecursionError, during the astropy.nddata
+                # import triggered by the reproject guard below.
+                #
+                # Real built-in modules raise AttributeError for __file__.
+                # So do we. That terminates the walk cleanly.
+                if name.startswith("__") and name.endswith("__"):
                     raise AttributeError(name)
-                _TorchUnavailableStub._STUB_GETATTR_GUARD.add(child_key)
-                try:
-                    if child_key not in _sys.modules:
-                        child = _TorchUnavailableStub(child_key)
-                        _sys.modules[child_key] = child
-                    return _sys.modules[child_key]
-                finally:
-                    _TorchUnavailableStub._STUB_GETATTR_GUARD.discard(child_key)
- 
+
+                child_key = f"{self.__name__}.{name}"
+                child = _sys.modules.get(child_key)
+                if child is None:
+                    child = _TorchUnavailableStub(child_key)
+                    _sys.modules[child_key] = child
+                return child
+
+            # Belt and braces: give repr() a terminating implementation of its
+            # own, so no future introspection path can re-enter the cycle above
+            # even if it reaches us by some other route.
+            def __repr__(self) -> str:
+                return f"<module {self.__name__!r} (SASpro torch-unavailable stub)>"
+
             def __call__(self, *a, **kw):
                 raise RuntimeError(_TORCH_NOT_INSTALLED_MSG)
- 
+
             def __bool__(self):
                 return False
- 
-            # Keep isinstance(x, torch.nn.Module) from crashing — just False
+
+            # Keep isinstance(x, torch.nn.Module) from crashing -- just False.
+            # Works because the second isinstance argument is a stub INSTANCE,
+            # so Python looks __instancecheck__ up on _TorchUnavailableStub.
             def __instancecheck__(self, instance):
                 return False
- 
+
             # Make `torch.cuda.is_available()` return False instead of crashing
             def is_available(self):
                 return False
- 
+
         # Only inject if torch is genuinely absent
         if "torch" not in _sys.modules:
             _stub_root = _TorchUnavailableStub("torch")
@@ -997,7 +1070,53 @@ def _bootstrap_imports():
                 "GPU tools will be unavailable until Hardware Acceleration is installed "
                 "via Settings -> Preferences."
             )
- 
+
+    # ── reproject.spherical_intersect SAC guard ──────────────────────────────
+    # reproject's __init__.py eagerly imports its C-extension submodule
+    # `spherical_intersect` (which backs reproject_exact) at package load.
+    # SASpro only ever calls reproject_interp — pure Python — but the eager
+    # import means ANY failure loading the compiled _overlap.pyd takes the
+    # whole reproject package down with it, and star_alignment/mosaic_master
+    # can't even import.
+    #
+    # Windows 11 24H2's Smart App Control has started quarantining the
+    # _overlap.pyd shipped in the reproject wheel on some installs (first
+    # reported Oct 2026, after KB5127647 / KB5127648). The quarantine fires
+    # at DLL-load time with:
+    #   ImportError: DLL load failed while importing _overlap:
+    #                An Application Control policy has blocked this file.
+    # We can't sign every third-party wheel, so the practical defence is:
+    # try the real import once, and if it fails for ANY reason (SAC block,
+    # missing DLL, broken wheel), replace reproject.spherical_intersect in
+    # sys.modules with a stub whose reproject_exact raises a clear
+    # RuntimeError at call time. Downstream `from reproject import
+    # reproject_interp` then succeeds, star_alignment loads, Stacking
+    # Suite launches, and nothing in SASpro that we actually use is lost.
+    # Must run BEFORE the main_window import below, which pulls
+    # star_alignment -> reproject. Same ordering requirement as the torch
+    # stub above.
+    try:
+        import reproject.spherical_intersect  # noqa: F401
+    except (ImportError, OSError) as _reproject_err:
+        import types as _types2
+        _stub = _types2.ModuleType("reproject.spherical_intersect")
+        _reproject_err_captured = _reproject_err
+        def _reproject_exact_unavailable(*_a, **_kw):
+            raise RuntimeError(
+                "reproject_exact is unavailable on this system "
+                f"({_reproject_err_captured}). SASpro only uses "
+                "reproject_interp, so stacking and WCS alignment still "
+                "work; if you need reproject_exact specifically, see "
+                "https://aka.ms/smartappcontrol about Smart App Control."
+            )
+        _stub.reproject_exact = _reproject_exact_unavailable
+        sys.modules["reproject.spherical_intersect"] = _stub
+        print(
+            f"[SASpro] reproject.spherical_intersect unavailable "
+            f"({_reproject_err}); stub injected. "
+            "reproject_interp (what SASpro actually uses) still works."
+        )
+
     _update_splash_gravitas(7)
     _update_splash_technical("Preparing AI runtime cache...")
     try:
@@ -1284,7 +1403,7 @@ def _init_opengl_before_qapp():
     QSurfaceFormat.setDefaultFormat(fmt)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, _skip_handoff: bool = False) -> int:
     """
     Main entry point for Seti Astro Suite Pro.
     
@@ -1293,6 +1412,63 @@ def main(argv: list[str] | None = None) -> int:
     - Direct import and call
     - When running as a module: python -m setiastro.saspro
     """
+    # Catch multiprocessing spawn children FIRST — before the splash, OpenGL
+    # init, or any heavy work. In a frozen build every process-pool worker
+    # re-execs this EXE and runs main(); freeze_support() takes the child over
+    # here and never returns, so it can no longer flash the splash on its way
+    # to being a worker. (The later multiprocessing block is now a no-op.)
+    import multiprocessing as _mp
+    _mp.freeze_support()
+    try:
+        _mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    # ── Single-instance handoff ──────────────────────────────────────────────
+    # If another SASpro is already running (in the same bucket — frozen builds
+    # share one bucket, source checkouts share another; see single_instance.py
+    # for the policy) and the user did NOT pass --new-instance / set
+    # SASPRO_NEW_INSTANCE=1, hand our argv off to it and exit — BEFORE the
+    # splash paints, before OpenGL init, before heavy imports — so the user
+    # sees nothing but the existing window popping to the front with their
+    # file open in it.
+    #
+    # _skip_handoff=True means __main__.entry() already ran this probe against
+    # the RAW argv (including any --new-instance flag) and either handed off or
+    # decided we're the primary. Running it again here would re-probe with the
+    # already-stripped argv — losing the --new-instance signal — and silently
+    # hand the "new instance" launch back to the running primary. The direct
+    # cli._launch_gui() path leaves this False so single-instance still works
+    # for `python -m setiastro.saspro.cli file.fits`.
+    if not _skip_handoff:
+        try:
+            from setiastro.saspro.single_instance import maybe_handoff_and_exit
+            _effective_argv = argv if argv is not None else sys.argv[1:]
+            _cleaned = maybe_handoff_and_exit(_effective_argv)
+            if _cleaned is None:
+                # Primary accepted our handoff. We're done; secondary exits silently.
+                return 0
+            # Strip --new-instance / --single-instance from argv for the rest of main().
+            argv = _cleaned
+        except Exception:
+            # Single-instance failure must never block launch. Fall through and
+            # start a normal full instance.
+            import traceback as _tb
+            print("[single-instance] probe failed, launching normally:")
+            _tb.print_exc()
+    else:
+        # Caller already handled handoff with the raw argv; just normalize
+        # our view of argv so downstream code (_collect_open_paths etc.)
+        # sees the cleaned list.
+        try:
+            from setiastro.saspro.single_instance import parse_instance_flags
+            argv = parse_instance_flags(argv).remaining
+        except Exception:
+            # If flag parsing somehow blows up, use argv as-is. Downstream
+            # tolerates stray flags via _collect_open_paths' startswith("-")
+            # filter, so there's no crash risk here.
+            pass
+
     _init_opengl_before_qapp()
     global _splash, _app, _splash_initialized
     from PyQt6.QtCore import QTimer
@@ -1440,6 +1616,73 @@ def main(argv: list[str] | None = None) -> int:
                 win.setWindowIcon(_app_icon_obj)
         except Exception:
             pass
+
+        # ── Install single-instance primary listener ─────────────────────────
+        # From now on, any secondary SASpro launch in our bucket will hand its
+        # argv to us instead of starting fresh. The handler runs on the Qt
+        # main thread, raises our window, and routes paths through the doc
+        # manager's open_path() — the same sink used by the CLI path and by
+        # macOS QFileOpenEvents, so there's one code path for "a file arrived
+        # from the outside world".
+        try:
+            from setiastro.saspro.single_instance import (
+                install_primary_listener, raise_window_to_front,
+            )
+
+            def _on_handoff(payload: dict):
+                try:
+                    handoff_argv = payload.get("argv") or []
+                    paths = _collect_open_paths(handoff_argv)
+                    logging.info(
+                        "[single-instance] handoff received: %d path(s) from pid=%s",
+                        len(paths), payload.get("pid"),
+                    )
+
+                    raise_window_to_front(win)
+
+                    if paths:
+                        dm = getattr(win, "docman", None) or getattr(win, "doc_manager", None)
+                        if dm is None:
+                            logging.warning("[single-instance] no doc manager, can't open paths")
+                            return
+                        for p in paths:
+                            try:
+                                dm.open_path(p)
+                            except Exception:
+                                logging.exception("[single-instance] open_path failed: %s", p)
+                except Exception:
+                    logging.exception("[single-instance] handoff handler crashed")
+
+            # Hang the server off the main window so GC doesn't eat it.
+            win._single_instance_server = install_primary_listener(
+                _app, _on_handoff, status_cb=lambda m: logging.info(m)
+            )
+        except Exception:
+            logging.exception("[single-instance] failed to install primary listener (continuing)")
+
+        # ── macOS QFileOpenEvent plumbing ───────────────────────────────────
+        # On macOS, Finder's "Open With -> SetiAstroSuitePro" and dock-dropped
+        # files fire QFileOpenEvent on the QApplication. _SASProApplication
+        # buffers any that arrive before the main window exists. Now that it
+        # does, install the live callback and drain whatever's queued.
+        if sys.platform == "darwin":
+            def _open_one_from_event(path: str):
+                try:
+                    raise_window_to_front(win)
+                    dm = getattr(win, "docman", None) or getattr(win, "doc_manager", None)
+                    if dm is not None:
+                        dm.open_path(path)
+                except Exception:
+                    logging.exception("[file-open-event] failed: %s", path)
+
+            try:
+                _app._file_open_cb = _open_one_from_event
+                for _p in list(getattr(_app, "_pending_open_paths", []) or []):
+                    QTimer.singleShot(0, lambda p=_p: _open_one_from_event(p))
+                _app._pending_open_paths = []
+            except Exception:
+                logging.exception("[file-open-event] failed to drain pending paths")
+
         def _kick_updates_after_splash():
             try:
                 win.raise_()
@@ -1471,6 +1714,45 @@ def main(argv: list[str] | None = None) -> int:
 
         win.show()
         QTimer.singleShot(0, lambda: win.setWindowIcon(_app.windowIcon()))
+
+        # ── Non-fatal environment sanity check (source runs only) ──────
+        # Frozen/installer builds are isolated + correct, so skip them. For
+        # users running from GitHub, a NumPy/SciPy mismatch or two mixed Python
+        # environments makes the multi-process workers die (BrokenProcessPool
+        # -> 'no frames to stack'). The fallbacks keep SASpro working
+        # single-process; this just tells the user how to fix it. Warn and keep
+        # running — never touch their environment.
+        def _saspro_env_warn():
+            try:
+                import sys as _sys2
+                if getattr(_sys2, "frozen", False):
+                    return
+                from setiastro.saspro.worker_env import diagnose_local_env
+                _ok, _msg = diagnose_local_env()
+                if _ok:
+                    return
+                from PyQt6.QtWidgets import QMessageBox as _QMB, QApplication as _QApp
+                _box = _QMB(win)
+                _box.setIcon(_QMB.Icon.Warning)
+                _box.setWindowTitle("Python environment problem")
+                _box.setText(
+                    "SASpro detected an inconsistent scientific-library setup.\n\n"
+                    "It will still run, but multi-core stacking is disabled until "
+                    "this is fixed (stacking will be slower).")
+                _box.setInformativeText(_msg)
+                _copy = _box.addButton("Copy fix command", _QMB.ButtonRole.ActionRole)
+                _box.addButton(_QMB.StandardButton.Ok)
+                _box.setDefaultButton(_QMB.StandardButton.Ok)
+                _box.exec()
+                if _box.clickedButton() is _copy:
+                    try:
+                        _QApp.clipboard().setText(
+                            f'"{_sys2.executable}" -m pip install -r requirements.txt')
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        QTimer.singleShot(1500, _saspro_env_warn)
         
         if open_paths:
             def _open_cli_paths():
@@ -1538,19 +1820,17 @@ def main(argv: list[str] | None = None) -> int:
         import textwrap
         try:
             print("\033[38;2;255;140;0m" + textwrap.dedent(r"""
-               _____      __  _ ___         __            _____       _ __       ____           
-              / ___/___  / /_(_)   |  _____/ /__________ / ___/__  __(_) /____  / __ \_________ 
-              \__ \/ _ \/ __/ / /| | / ___/ __/ ___/ __ \\__ \/ / / / / __/ _ \/ /_/ / ___/ __ \
-             ___/ /  __/ /_/ / ___ |(__  ) /_/ /  / /_/ /__/ / /_/ / / /_/  __/ ____/ /  / /_/ /
-            /____/\___/\__/_/_/  |_/____/\__/_/   \____/____/\__,_/_/\__/\___/_/   /_/   \____/                                                                                                 
+[0;90m┌┐[0;37m [0;90m┌┐[0;37m [0;90m┌┬┐[0;37m [0;90m∙[0;37m      [0;90m┌┐[0;37m [0;90m┌┐[0;37m [0;90m┌┬┐[0;37m [0;90m┌┐[0;37m [0;90m┌┐[0;37m      [0;90m┌┐[0;37m [0;90m┐┐[0;37m [0;90m∙[0;37m [0;90m┌┬┐[0;37m [0;90m┌┐[0;37m      [0;90m┌┐[0;37m [0;90m┌┐[0;37m [0;90m┌┐[0m
+[0;35m││[0;37m [0;35m├[0;37m  [0;35m │[0;37m  [0;35m│[0;37m      [0;35m├│[0;37m [0;35m││[0;37m [0;35m │[0;37m  [0;35m││[0;37m [0;35m││[0;37m      [0;35m││[0;37m [0;35m││[0;37m [0;35m│[0;37m [0;35m │[0;37m  [0;35m├[0;37m       [0;35m││[0;37m [0;35m││[0;37m [0;35m││[0m
+[0;95m└┐[0;37m [0;95m││[0;37m [0;97m [0;95m│[0;37m  [0;95m│[0;37m      [0;95m││[0;37m [0;95m└┐[0;37m [0;97m [0;95m│[0;37m  [0;95m│┘[0;37m [0;95m││[0;37m      [0;95m└┐[0;37m [0;95m││[0;37m [0;95m│[0;37m [0;97m [0;95m│[0;37m  [0;95m││[0;37m      [0;95m│┘[0;37m [0;95m│┘[0;37m [0;95m││[0m
+[0;97m└┘[0;37m [0;97m└┘[0;37m [0;97m ┘[0;37m  [0;97m┘[0;37m      [0;97m┘┘[0;37m [0;97m└┘[0;37m [0;97m ┘[0;37m  [0;97m┘┘[0;37m [0;97m└┘[0;37m      [0;97m└┘[0;37m [0;97m└┘[0;37m [0;97m┘[0;37m [0;97m ┘[0;37m  [0;97m└┘[0;37m      [0;97m┘[0;37m  [0;97m┘┘[0;37m [0;97m└┘[0m                                                                         
             """) + "\033[0m")
         except Exception:
             print(textwrap.dedent(r"""
-               _____      __  _ ___         __            _____       _ __       ____           
-              / ___/___  / /_(_)   |  _____/ /__________ / ___/__  __(_) /____  / __ \_________ 
-              \__ \/ _ \/ __/ / /| | / ___/ __/ ___/ __ \\__ \/ / / / / __/ _ \/ /_/ / ___/ __ \
-             ___/ /  __/ /_/ / ___ |(__  ) /_/ /  / /_/ /__/ / /_/ / / /_/  __/ ____/ /  / /_/ /
-            /____/\___/\__/_/_/  |_/____/\__/_/   \____/____/\__,_/_/\__/\___/_/   /_/   \____/         
+[0;90m┌┐[0;37m [0;90m┌┐[0;37m [0;90m┌┬┐[0;37m [0;90m∙[0;37m      [0;90m┌┐[0;37m [0;90m┌┐[0;37m [0;90m┌┬┐[0;37m [0;90m┌┐[0;37m [0;90m┌┐[0;37m      [0;90m┌┐[0;37m [0;90m┐┐[0;37m [0;90m∙[0;37m [0;90m┌┬┐[0;37m [0;90m┌┐[0;37m      [0;90m┌┐[0;37m [0;90m┌┐[0;37m [0;90m┌┐[0m
+[0;35m││[0;37m [0;35m├[0;37m  [0;35m │[0;37m  [0;35m│[0;37m      [0;35m├│[0;37m [0;35m││[0;37m [0;35m │[0;37m  [0;35m││[0;37m [0;35m││[0;37m      [0;35m││[0;37m [0;35m││[0;37m [0;35m│[0;37m [0;35m │[0;37m  [0;35m├[0;37m       [0;35m││[0;37m [0;35m││[0;37m [0;35m││[0m
+[0;95m└┐[0;37m [0;95m││[0;37m [0;97m [0;95m│[0;37m  [0;95m│[0;37m      [0;95m││[0;37m [0;95m└┐[0;37m [0;97m [0;95m│[0;37m  [0;95m│┘[0;37m [0;95m││[0;37m      [0;95m└┐[0;37m [0;95m││[0;37m [0;95m│[0;37m [0;97m [0;95m│[0;37m  [0;95m││[0;37m      [0;95m│┘[0;37m [0;95m│┘[0;37m [0;95m││[0m
+[0;97m└┘[0;37m [0;97m└┘[0;37m [0;97m ┘[0;37m  [0;97m┘[0;37m      [0;97m┘┘[0;37m [0;97m└┘[0;37m [0;97m ┘[0;37m  [0;97m┘┘[0;37m [0;97m└┘[0;37m      [0;97m└┘[0;37m [0;97m└┘[0;37m [0;97m┘[0;37m [0;97m ┘[0;37m  [0;97m└┘[0;37m      [0;97m┘[0;37m  [0;97m┘┘[0;37m [0;97m└┘[0m 
             """))
         print(f"Seti Astro Suite Pro v{VERSION} ({build_label}) up and running!")
         sys.exit(_app.exec())

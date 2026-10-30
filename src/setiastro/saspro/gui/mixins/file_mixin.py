@@ -1,4 +1,4 @@
-# pro/gui/mixins/file_mixin.py
+# saspro/gui/mixins/file_mixin.py
 """
 File operations mixin for AstroSuiteProMainWindow.
 """
@@ -124,56 +124,6 @@ class FitsBundleExportDialog(QDialog):
                     out.append(dict(ent))
         return out
 
-_PROC_SCAN_RE = re.compile(r"^(?P<prefix>.+)_proc(?P<n>\d+)(?P<tag>_[^.]*)?$", re.IGNORECASE)
-
-def _split_stars_suffix(name_no_ext: str) -> Tuple[str, bool]:
-    if name_no_ext.lower().endswith("_stars"):
-        return name_no_ext[:-6], True
-    return name_no_ext, False
-
-def _strip_proc_tail(base_no_ext: str) -> str:
-    """
-    If base already ends in _procN or _procN_tag, strip that whole tail so we build from the true prefix.
-    """
-    m = _PROC_SCAN_RE.match(base_no_ext)
-    if not m:
-        return base_no_ext
-    return m.group("prefix")
-
-def _safe_ext_from_path(path: str) -> str:
-    ext = os.path.splitext(path)[1] or ""
-    return ext.lower()
-
-def _next_proc_index_for(prefix: str, workdir: str, stars: bool, tag: str, ext: str) -> int:
-    """
-    Find next N by scanning the directory for files that match:
-      prefix_procN{tag}{_stars}{ext}
-    """
-    # normalize
-    tag_part = tag or ""          # e.g. "_dbe" or ""
-    stars_part = "_stars" if stars else ""
-
-    patt = re.compile(
-        r"^" + re.escape(prefix)
-        + r"_proc(\d+)"
-        + re.escape(tag_part)
-        + re.escape(stars_part)
-        + re.escape(ext)
-        + r"$",
-        re.IGNORECASE
-    )
-
-    max_n = 0
-    try:
-        for fn in os.listdir(workdir):
-            m = patt.match(fn)
-            if m:
-                max_n = max(max_n, int(m.group(1)))
-    except Exception:
-        pass
-
-    return max_n + 1
-
 class _FitsBundleDialog(QDialog):
     def __init__(self, parent, entries: list[dict], active_index: int = -1):
         super().__init__(parent)
@@ -264,13 +214,6 @@ class _FitsBundleDialog(QDialog):
                 out.append(ent)
         return out
 
-@dataclass
-class _CheckpointSpec:
-    mode_all_open: bool = False            # default active only
-    format_override: Optional[str] = None  # e.g. ".fits" or ".xisf" or None meaning same-as-source
-    tag: str = ""                          # e.g. "_dbe" or "" (must start with "_" if non-empty)
-    include_paired_stars: bool = True      # if base exists and paired stars exists, save both
-
 
 class FileMixin:
     """
@@ -279,6 +222,45 @@ class FileMixin:
     Provides methods for opening, saving, importing, and exporting files.
     """
     
+    @staticmethod
+    def _filter_for_ext(filters: str, ext: str) -> Optional[str]:
+        """
+        The entry in a ";;"-joined filter string that accepts *ext*.
+
+        Used so Save As can pre-select the filter matching the file the
+        document came from. Without it Qt falls back to the FIRST filter and
+        appends ITS first pattern, which is how a ".fit" comes back ".fits".
+        """
+        e = (ext or "").lower().lstrip(".")
+        if not e:
+            return None
+        for entry in (filters or "").split(";;"):
+            # A label can carry parentheses of its own -- "SYQ (SyQon)
+            # (*.syq)" -- so take the group holding the patterns, not simply
+            # the first one.
+            for grp in re.findall(r"\(([^)]*)\)", entry):
+                if "*" not in grp:
+                    continue
+                pats = [q.strip().lower().lstrip("*.") for q in grp.split()]
+                if e in pats:
+                    return entry
+        return None
+
+    @staticmethod
+    def _doc_original_ext(doc) -> str:
+        """The extension the document was opened from, '' if unknown."""
+        meta = (getattr(doc, "metadata", {}) or {})
+        fp = str(meta.get("file_path", "") or "")
+        if "::" in fp:                     # "/x/y.fits::HDU 2"
+            fp = fp.split("::", 1)[0]
+        ext = os.path.splitext(fp)[1].lower()
+        if ext:
+            return ext
+        fmt = str(meta.get("original_format", "") or "").lower().lstrip(".")
+        if fmt and fmt not in ("internal", ""):
+            return "." + fmt
+        return ""
+
     def _load_recent_lists(self):
         """Load recent files and projects from settings."""
         if not hasattr(self, "settings"):
@@ -634,12 +616,13 @@ class FileMixin:
         # One-stop "All Supported" plus focused groups the user can switch to
         filters = (
             "All Supported (*.png *.jpg *.jpeg *.webp *.tif *.tiff "
-            "*.fits *.fit *.fts *.fits.gz *.fit.gz *.fz *.xisf *.pdf "
-            "*.cr2 *.cr3 *.nef *.arw *.dng *.raf *.orf *.rw2 *.pef *.psb);;"
+            "*.fits *.fit *.fts *.fits.gz *.fit.gz *.fz *.xisf *.syq *.pdf "
+            "*.cr2 *.cr3 *.nef *.arw *.dng *.raf *.orf *.rw2 *.pef *.psb *.psd);;"
             "PDF (*.pdf);;"
-            "Astro (FITS/XISF) (*.xisf *.fits *.fit *.fts *.fits.gz *.fit.gz *.fz);;"
+            "Astro (FITS/XISF/SYQ) (*.xisf *.syq *.fits *.fit *.fts *.fits.gz *.fit.gz *.fz);;"
+            "SYQ (SyQon) (*.syq);;"
             "RAW Images (*.cr2 *.cr3 *.nef *.arw *.dng *.raf *.orf *.rw2 *.pef);;"
-            "Photoshop Documents (*.psb);;"
+            "Photoshop Documents (*.psb *.psd);;"
             "Common Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff);;"
             "All Files (*)"
         )
@@ -673,7 +656,18 @@ class FileMixin:
                     if p.lower().endswith(".pdf"):
                         self._open_pdf(p)
                         continue
-                    _ = self.docman.open_path(p)
+                    _syq_busy = (
+                        self._show_bundle_busy("Unpacking and Opening Bundled File...")
+                        if p.lower().endswith(".syq") else None
+                    )
+                    try:
+                        _ = self.docman.open_path(p)
+                    finally:
+                        if _syq_busy is not None:
+                            try:
+                                _syq_busy.close()
+                            except Exception:
+                                pass
                     self._log(f"Opened: {p}")
                     self._add_recent_image(p)
 
@@ -696,6 +690,34 @@ class FileMixin:
                 self._mdi_end_open_batch()
             except Exception:
                 pass
+
+    def _show_bundle_busy(self, text: str = "Unpacking and Opening Bundled File..."):
+        """
+        Indeterminate busy popup shown while a bundled container (.syq) is
+        unpacked and its image layers are opened — same idiom as the project
+        load/save dialog. Returns the QProgressDialog (call .close() when done),
+        or None if it couldn't be created. A processEvents() forces it to paint
+        before the (synchronous) open blocks the event loop.
+        """
+        try:
+            dlg = QProgressDialog(self.tr(text), "", 0, 0, self)
+            dlg.setWindowTitle(self.tr("Opening"))
+            try:
+                dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+            except AttributeError:
+                dlg.setWindowModality(Qt.ApplicationModal)  # PyQt5 fallback
+            try:
+                dlg.setCancelButton(None)
+            except TypeError:
+                dlg.setCancelButtonText("")
+            dlg.setMinimumDuration(0)
+            dlg.setAutoClose(False)
+            dlg.setAutoReset(False)
+            dlg.show()
+            QApplication.processEvents()
+            return dlg
+        except Exception:
+            return None
 
     def _open_pdf(self, path: str):
         try:
@@ -772,8 +794,9 @@ class FileMixin:
             return
 
         filters = (
-            "FITS (*.fits *.fit);;"
+            "FITS (*.fits *.fit *.fts);;"
             "XISF (*.xisf);;"
+            "SYQ (SyQon) (*.syq);;"
             "TIFF (*.tif *.tiff);;"
             "PNG (*.png);;"
             "JPEG (*.jpg *.jpeg);;"
@@ -810,20 +833,38 @@ class FileMixin:
 
         # --- Suggest a sane filename ---------------------------------------
         suggested = _best_doc_name(doc)
-        suggested = os.path.splitext(suggested)[0]               # remove any ext
-        suggested_safe = _sanitize_filename(suggested)
+        suggested_safe = _sanitize_filename(os.path.splitext(suggested)[0])
+
+        # Offer the extension the document came in with, and pre-select the
+        # filter that owns it. Stripping the extension and letting the dialog
+        # default meant a file opened as ".fit" was offered back as ".fits" --
+        # a different filename, so Save As quietly produced a second copy
+        # beside the original rather than overwriting it.
+        _orig_ext = self._doc_original_ext(doc)
+        _sel_filter = self._filter_for_ext(filters, _orig_ext)
+        if _sel_filter:
+            suggested_safe = suggested_safe + _orig_ext
         suggested_path = os.path.join(candidate_dir, suggested_safe)
 
         # --- Open dialog ----------------------------------------
-        path, selected_filter = QFileDialog.getSaveFileName(self, self.tr("Save As"), suggested_path, filters)
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, self.tr("Save As"), suggested_path, filters, _sel_filter or ""
+        )
         if not path:
             return
 
         before = path
+        _typed_ext = os.path.splitext(before)[1].lower()
         path, ext_norm = _normalize_save_path_chosen_filter(path, selected_filter)
+        # Normalisation may swap a perfectly valid extension for the filter's
+        # first pattern. If what the user had is also accepted by the filter
+        # they chose, keep theirs.
+        if _typed_ext and os.path.splitext(path)[1].lower() != _typed_ext:
+            if self._filter_for_ext(selected_filter or "", _typed_ext):
+                path = os.path.splitext(path)[0] + _typed_ext
 
         # If sanitization changed the filename, the native dialog's own overwrite
-        # prompt fired on the name the user TYPED — which may differ from what we're
+        #sasprompt fired on the name the user TYPED — which may differ from what we're
         # about to write. Warn here so we don't silently clobber a different file.
         if os.path.basename(before) != os.path.basename(path):
             note = ""
@@ -1112,140 +1153,19 @@ class FileMixin:
                 pass
         return docs
 
-    def checkpoint_save(self):
-        """
-        Public entrypoint bound to QAction. Default behavior = active-only, same format, no tag.
-        If you later add a small dialog, it can call _checkpoint_save_with_spec(spec).
-        """
-        spec = _CheckpointSpec(
-            mode_all_open=False,
-            format_override=None,
-            tag="",
-            include_paired_stars=True
-        )
-        self._checkpoint_save_with_spec(spec)
+    def _checkpoint_now(self):
+        """One-click Checkpoint Save: a numbered copy (…_proc1, …_proc2) written
+        beside the source file, same format, including the paired _stars view.
+        The full options (destination, format, tag, folder export, bundles) live
+        in the Save Checkpoint / Export dialog on the toolbar dropdown."""
+        from setiastro.saspro.export_fits import run_checkpoint_now
+        run_checkpoint_now(self)
 
-    def _checkpoint_save_with_spec(self, spec: _CheckpointSpec):
-        dm = getattr(self, "doc_manager", None) or getattr(self, "docman", None)
-        if dm is None:
-            QMessageBox.warning(self, self.tr("Checkpoint Save"), self.tr("Document manager not available."))
-            return
-
-        # Collect docs to save
-        docs = []
-        if spec.mode_all_open:
-            docs = self._collect_open_documents()
-        else:
-            d = self._active_doc()
-            if d:
-                docs = [d]
-
-        if not docs:
-            return
-
-        # Build a quick lookup for paired stars docs by "base title"
-        # We'll use best_doc_name(doc) for stable naming.
-        from setiastro.saspro.main_helpers import best_doc_name as _best_doc_name
-
-        name_to_doc = {}
-        for d in docs if spec.mode_all_open else self._collect_open_documents():
-            try:
-                nm = os.path.splitext(_best_doc_name(d))[0]
-                name_to_doc[nm] = d
-            except Exception:
-                pass
-
-        saved_any = False
-        for doc in docs:
-            try:
-                ok = self._checkpoint_save_one(doc, spec, name_to_doc=name_to_doc)
-                saved_any = saved_any or ok
-            except Exception as e:
-                QMessageBox.warning(self, self.tr("Checkpoint Save"), str(e))
-
-        if saved_any:
-            self._log("Checkpoint Save complete.")
-
-    def _checkpoint_save_one(self, doc, spec: _CheckpointSpec, name_to_doc: Optional[dict] = None) -> bool:
-        from setiastro.saspro.main_helpers import best_doc_name as _best_doc_name
-
-        # Determine source file path (real filesystem path, not "::HDU" etc)
-        meta = getattr(doc, "metadata", {}) or {}
-        orig_path = meta.get("file_path", "") or ""
-        if "::" in orig_path:
-            orig_path_fs = orig_path.split("::", 1)[0]
-        else:
-            orig_path_fs = orig_path
-
-        if not orig_path_fs:
-            # Official tool could prompt for folder; for now we follow your style and warn.
-            self._log(f"Checkpoint skipped (unsaved doc): {_best_doc_name(doc)}")
-            return False
-
-        workdir = os.path.dirname(orig_path_fs)
-        if not workdir or not os.path.isdir(workdir):
-            self._log(f"Checkpoint skipped (bad folder): {orig_path_fs}")
-            return False
-
-        base = os.path.splitext(os.path.basename(orig_path_fs))[0]  # file base, not window title
-        ext_src = _safe_ext_from_path(orig_path_fs)                 # includes dot, e.g. ".fits"
-        ext = (spec.format_override or ext_src or ".fits").lower()
-
-        # normalize tag
-        tag = (spec.tag or "").strip()
-        if tag and not tag.startswith("_"):
-            tag = "_" + tag
-
-        # stars suffix (based on current doc name, not path base) — but your pipeline expects _stars in title commonly
-        # We'll infer from best_doc_name(doc) to match your window naming.
-        doc_title_no_ext = os.path.splitext(_best_doc_name(doc))[0]
-        doc_base_no_stars, is_stars = _split_stars_suffix(doc_title_no_ext)
-
-        # Use the *filesystem base* as prefix source, but strip any proc tail
-        # This keeps checkpoint files grouped with the original file on disk.
-        prefix = _strip_proc_tail(base)
-
-        n_next = _next_proc_index_for(prefix, workdir, is_stars, tag, ext)
-        out_base = f"{prefix}_proc{n_next}{tag}" + ("_stars" if is_stars else "")
-        out_path = os.path.join(workdir, out_base + ext)
-
-        # Save using DocManager so headers/bit depth handling remains consistent
-        # Use doc's current bit depth unless you want "same as save_active dialog" later.
-        chosen_bd = meta.get("bit_depth", None)
-
-        self.docman.save_document(
-            doc, out_path,
-            bit_depth_override=chosen_bd,
-            jpeg_quality=(meta.get("jpeg_quality", None) if ext in (".jpg", ".jpeg") else None),
-            export_opts=None,
-        )
-        self._log(f"Checkpoint saved: {out_path}")
-
-        # Optional: also save paired stars doc if requested
-        if spec.include_paired_stars and (not is_stars) and name_to_doc:
-            paired_name = doc_title_no_ext + "_stars"
-            paired_doc = name_to_doc.get(paired_name)
-            if paired_doc is not None:
-                # Save paired as well with same N
-                out_base2 = f"{prefix}_proc{n_next}{tag}_stars"
-                out_path2 = os.path.join(workdir, out_base2 + ext)
-                meta2 = getattr(paired_doc, "metadata", {}) or {}
-                bd2 = meta2.get("bit_depth", None)
-                self.docman.save_document(
-                    paired_doc, out_path2,
-                    bit_depth_override=bd2,
-                    jpeg_quality=(meta2.get("jpeg_quality", None) if ext in (".jpg", ".jpeg") else None),
-                    export_opts=None,
-                )
-                self._log(f"Checkpoint saved (paired stars): {out_path2}")
-
-        return True
-    
     def save_active_as_format(self, fmt: str):
         """
         Save active document directly in a specific format,
         pre-populating the file dialog with the right extension.
-        fmt: 'fits', 'xisf', 'tiff', 'png', 'jpeg', 'webp', 'psb'
+        fmt: 'fits', 'xisf', 'syq', 'tiff', 'png', 'jpeg', 'webp', 'psb'
         """
         from setiastro.saspro.main_helpers import (
             best_doc_name as _best_doc_name,
@@ -1258,8 +1178,9 @@ class FileMixin:
             return
 
         fmt_map = {
-            "fits":  ("FITS (*.fits *.fit)",              ".fits"),
+            "fits":  ("FITS (*.fits *.fit *.fts)",         ".fits"),
             "xisf":  ("XISF (*.xisf)",                   ".xisf"),
+            "syq":   ("SYQ (SyQon) (*.syq)",             ".syq"),
             "tiff":  ("TIFF (*.tif *.tiff)",              ".tiff"),
             "png":   ("PNG (*.png)",                      ".png"),
             "jpeg":  ("JPEG (*.jpg *.jpeg)",              ".jpg"),
@@ -1272,10 +1193,18 @@ class FileMixin:
 
         selected_filter, ext = fmt_map[fmt]
 
+        # If the document already came from a file this very format accepts,
+        # keep that spelling rather than the map's default -- ".fit" stays
+        # ".fit" instead of becoming a second file called ".fits".
+        _orig_ext = self._doc_original_ext(doc)
+        if _orig_ext and self._filter_for_ext(selected_filter, _orig_ext):
+            ext = _orig_ext
+
         # Build all filters with the chosen one first
         all_filters = [
-            "FITS (*.fits *.fit)",
+            "FITS (*.fits *.fit *.fts)",
             "XISF (*.xisf)",
+            "SYQ (SyQon) (*.syq)",
             "TIFF (*.tif *.tiff)",
             "PNG (*.png)",
             "JPEG (*.jpg *.jpeg)",
@@ -1320,7 +1249,11 @@ class FileMixin:
             return
 
         before = path
+        _typed_ext = os.path.splitext(before)[1].lower()
         path, ext_norm = _normalize_save_path_chosen_filter(path, chosen_filter)
+        if _typed_ext and os.path.splitext(path)[1].lower() != _typed_ext:
+            if self._filter_for_ext(chosen_filter or "", _typed_ext):
+                path = os.path.splitext(path)[0] + _typed_ext
 
         if os.path.basename(before) != os.path.basename(path):
             note = ""
@@ -1363,4 +1296,19 @@ class FileMixin:
             self._add_recent_image(path)
             self.settings.setValue("paths/last_save_dir", os.path.dirname(path))
         except Exception as e:
-            QMessageBox.critical(self, self.tr("Save failed"), str(e))    
+            QMessageBox.critical(self, self.tr("Save failed"), str(e))
+
+    def _open_export_fits(self, preset=None):
+        from setiastro.saspro.export_fits import open_export_fits_with_preset
+        open_export_fits_with_preset(self, preset)
+
+    def _apply_export_fits_to_doc(self, doc, preset=None):
+        from setiastro.saspro.export_fits import export_document_as_fits
+        dm = getattr(self, "docman", None) or getattr(self, "doc_manager", None)
+        if dm is None:
+            raise RuntimeError("Document manager not available.")
+        result = export_document_as_fits(dm, doc, preset or {})
+        if result.ok:
+            self._log(f"Exported FITS: {result.path}")
+            return
+        self._log(f"Export FITS skipped: {result.reason}")

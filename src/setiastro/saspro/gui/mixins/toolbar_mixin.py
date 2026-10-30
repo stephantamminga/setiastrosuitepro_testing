@@ -1,4 +1,4 @@
-# pro/gui/mixins/toolbar_mixin.py
+#saspro/gui/mixins/toolbar_mixin.py
 """
 Toolbar and action management mixin for AstroSuiteProMainWindow.
 """
@@ -37,7 +37,7 @@ from setiastro.saspro.resources import (
     nbtorgb_path, freqsep_path, multiscale_decomp_path, contsub_path, halo_path, cosmic_path, nbi_path, slap_path,satchroma_path, fx_path,
     satellite_path, imagecombine_path, wims_path, wimi_path, linearfit_path, snr_path,
     debayer_path, aberration_path, functionbundles_path, viewbundles_path, planetarystacker_path,syqon_path,rcastro_path,sssc_path,
-    selectivecolor_path, selectivelum_path, rgbalign_path, planetprojection_path, clonestampicon_path, finderchart_path,magnitude_path,
+    selectivecolor_path, selectivelum_path, rgbalign_path, planetprojection_path, clonestampicon_path, finderchart_path,magnitude_path, cosmeticcorrection_path,
 )
 
 # Import shortcuts module
@@ -91,6 +91,7 @@ class ToolbarMixin:
             save_menu = QMenu(btn_save)
             save_menu.addAction(self.act_save_fits)
             save_menu.addAction(self.act_save_xisf)
+            #save_menu.addAction(self.act_save_syq)
             save_menu.addAction(self.act_save_tiff)
             save_menu.addAction(self.act_save_png)
             save_menu.addAction(self.act_save_jpeg)
@@ -98,7 +99,14 @@ class ToolbarMixin:
             save_menu.addAction(self.act_save_psb)
             btn_save.setMenu(save_menu)
             btn_save.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)        
-        tb.addAction(self.act_checkpoint_save) 
+        # Unified Save: main click = instant Checkpoint, dropdown = full dialog
+        tb.addAction(self.act_checkpoint_now)
+        btn_ckpt = tb.widgetForAction(self.act_checkpoint_now)
+        if isinstance(btn_ckpt, QToolButton):
+            ckpt_menu = QMenu(btn_ckpt)
+            ckpt_menu.addAction(self.act_export_fits)
+            btn_ckpt.setMenu(ckpt_menu)
+            btn_ckpt.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         tb.addSeparator()
         tb.addAction(self.act_undo)
         tb.addAction(self.act_redo)
@@ -214,6 +222,7 @@ class ToolbarMixin:
         tb_fn.addAction(self.act_satchroma)
         tb_fn.addAction(self.act_abe)
         tb_fn.addAction(self.act_graxpert)
+        tb_fn.addAction(self.act_cosmetic_correction)
         tb_fn.addAction(self.act_remove_stars)
         tb_fn.addAction(self.act_add_stars)
         tb_fn.addAction(self.act_background_neutral)
@@ -431,6 +440,14 @@ class ToolbarMixin:
         for tb in self.findChildren(DraggableToolBar):
             tb.setIconSize(qs)
 
+        # Keep the dock rails in lockstep with the toolbar icon size.
+        applier = getattr(self, "_apply_rail_icon_size", None)
+        if callable(applier):
+            try:
+                applier()
+            except Exception:
+                pass
+
     def _toolbar_containing_action(self, action: QAction):
         from setiastro.saspro.shortcuts import DraggableToolBar
         for tb in self.findChildren(DraggableToolBar):
@@ -647,6 +664,7 @@ class ToolbarMixin:
                 save_menu = QMenu(btn_save)
                 save_menu.addAction(self.act_save_fits)
                 save_menu.addAction(self.act_save_xisf)
+                #save_menu.addAction(self.act_save_syq)
                 save_menu.addAction(self.act_save_tiff)
                 save_menu.addAction(self.act_save_png)
                 save_menu.addAction(self.act_save_jpeg)
@@ -654,6 +672,18 @@ class ToolbarMixin:
                 save_menu.addAction(self.act_save_psb)
                 btn_save.setMenu(save_menu)
                 btn_save.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+
+        # ---- Checkpoint / Save dropdown ----
+        # tb.clear() during restore destroys this button + its menu, so the
+        # dropdown must be reattached here (not only in _init_toolbar).
+        tb_ckpt = self._toolbar_containing_action(self.act_checkpoint_now)
+        if tb_ckpt:
+            btn_ckpt = tb_ckpt.widgetForAction(self.act_checkpoint_now)
+            if isinstance(btn_ckpt, QToolButton):
+                ckpt_menu = QMenu(btn_ckpt)
+                ckpt_menu.addAction(self.act_export_fits)
+                btn_ckpt.setMenu(ckpt_menu)
+                btn_ckpt.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
                 
     def _bind_view_toolbar_menus(self, tb: DraggableToolBar):
         # --- Display-Stretch menu ---
@@ -739,10 +769,17 @@ class ToolbarMixin:
         self.act_project_save.setStatusTip(self.tr("Save all views, histories, and shortcuts to a .sas file"))
         self.act_project_load.setStatusTip(self.tr("Load a .sas project (views, histories, shortcuts)"))
 
-        self.act_checkpoint_save = QAction(QIcon.fromTheme("document-save"), self.tr("Checkpoint Save"), self)
-        self.act_checkpoint_save.setIconVisibleInMenu(True)
-        self.act_checkpoint_save.setStatusTip(self.tr("Save a numbered checkpoint copy (e.g., _proc1, _proc2, ...)"))
-        self.act_checkpoint_save.triggered.connect(self.checkpoint_save)
+        self.act_checkpoint_now = QAction(QIcon.fromTheme("document-save"), self.tr("Checkpoint Save"), self)
+        self.act_checkpoint_now.setIconVisibleInMenu(True)
+        self.act_checkpoint_now.setStatusTip(self.tr("Save a numbered checkpoint copy beside the source (e.g., _proc1, _proc2, ...)"))
+        self.act_checkpoint_now.triggered.connect(self._checkpoint_now)
+
+        self.act_export_fits = QAction(QIcon(disk_path), self.tr("Save Checkpoint / Export…"), self)
+        self.act_export_fits.setIconVisibleInMenu(True)
+        self.act_export_fits.setStatusTip(
+            self.tr("Save the current view: numbered checkpoint beside the source, or export into a folder (bundleable)")
+        )
+        self.act_export_fits.triggered.connect(self._open_export_fits)
 
         self.act_project_new.triggered.connect(self._new_project)
         self.act_project_save.triggered.connect(self._save_project)
@@ -762,6 +799,7 @@ class ToolbarMixin:
         # Save As format submenu actions
         self.act_save_fits  = QAction(self.tr("FITS (.fits)"),  self)
         self.act_save_xisf  = QAction(self.tr("XISF (.xisf)"),  self)
+        #self.act_save_syq   = QAction(self.tr("SYQ (.syq)"),    self)
         self.act_save_tiff  = QAction(self.tr("TIFF (.tiff)"),  self)
         self.act_save_png   = QAction(self.tr("PNG (.png)"),    self)
         self.act_save_jpeg  = QAction(self.tr("JPEG (.jpg)"),   self)
@@ -770,6 +808,7 @@ class ToolbarMixin:
 
         self.act_save_fits.triggered.connect(lambda: self.save_active_as_format("fits"))
         self.act_save_xisf.triggered.connect(lambda: self.save_active_as_format("xisf"))
+        #self.act_save_syq.triggered.connect(lambda:  self.save_active_as_format("syq"))
         self.act_save_tiff.triggered.connect(lambda: self.save_active_as_format("tiff"))
         self.act_save_png.triggered.connect(lambda:  self.save_active_as_format("png"))
         self.act_save_jpeg.triggered.connect(lambda: self.save_active_as_format("jpeg"))
@@ -787,6 +826,10 @@ class ToolbarMixin:
         # Make it appear under the app menu on macOS automatically:
         self.act_exit.setMenuRole(QAction.MenuRole.QuitRole)
         self.act_exit.triggered.connect(self._on_exit)
+
+        self.act_icon_table = QAction(self.tr("Function Icon Table"), self)
+        self.act_icon_table.setStatusTip(self.tr("Open the categorised process icon panel"))
+        self.act_icon_table.triggered.connect(self._open_icon_table)
 
         self.act_open_panel_host = QAction(self.tr("Open Secondary Panel Window"), self)
         self.act_open_panel_host.setStatusTip(self.tr("Open the secondary dock host window"))
@@ -1145,9 +1188,9 @@ class ToolbarMixin:
         self.act_rgb_extract.setStatusTip(self.tr("Extract R/G/B as three mono documents"))
         self.act_rgb_extract.triggered.connect(self._rgb_extract_active)
 
-        self.act_rgb_combine = QAction(QIcon(rgbcombo_path), self.tr("RGB Combination..."), self)
+        self.act_rgb_combine = QAction(QIcon(rgbcombo_path), self.tr("LRGB Combination..."), self)
         self.act_rgb_combine.setIconVisibleInMenu(True)
-        self.act_rgb_combine.setStatusTip(self.tr("Combine three mono images into RGB"))
+        self.act_rgb_combine.setStatusTip(self.tr("Combine four mono images into LRGB"))
         self.act_rgb_combine.triggered.connect(self._open_rgb_combination)
 
         self.act_blemish = QAction(QIcon(blastericon_path), self.tr("Blemish Blaster..."), self)
@@ -1159,6 +1202,11 @@ class ToolbarMixin:
         self.act_clone_stamp.setIconVisibleInMenu(True)
         self.act_clone_stamp.setStatusTip(self.tr("Interactive clone stamp on the active view"))
         self.act_clone_stamp.triggered.connect(self._open_clone_stamp)
+
+        self.act_cosmetic_correction = QAction(QIcon(cosmeticcorrection_path), self.tr("Cosmetic Correction..."), self)
+        self.act_cosmetic_correction.setStatusTip(self.tr("Detect and repair hot / cold pixels (standalone tool)"))
+        self.act_cosmetic_correction.setIconVisibleInMenu(True)
+        self.act_cosmetic_correction.triggered.connect(self._open_cosmetic_correction)
 
         self.act_wavescale_hdr = QAction(QIcon(hdr_path), self.tr("WaveScale HDR..."), self)
         self.act_wavescale_hdr.setStatusTip(self.tr("Wave-scale HDR with luminance-masked starlet"))
@@ -1608,6 +1656,19 @@ class ToolbarMixin:
         self.act_welcome.setStatusTip(self.tr("Show the SASpro welcome screen again"))
         self.act_welcome.triggered.connect(self._show_welcome)
 
+        self.act_file_associations = QAction(
+            self.tr("File Associations..."), self
+        )
+        self.act_file_associations.setStatusTip(self.tr(
+            "Make SASpro the default handler for astronomy and image files"
+        ))
+        self.act_file_associations.setToolTip(self.tr(
+            "Register .fits, .xisf, and optionally .tif/.psd/RAW to open in SASpro"
+        ))
+        self.act_file_associations.triggered.connect(
+            self._show_file_associations_dialog
+        )
+
         # give each action a stable id and register
         def reg(cid, act):
             act.setProperty("command_id", cid)
@@ -1622,7 +1683,8 @@ class ToolbarMixin:
         # register whatever you want draggable/launchable
         reg("open",           self.act_open)
         reg("save_as",        self.act_save)
-        reg("checkpoint_save", self.act_checkpoint_save)
+        reg("checkpoint_save", self.act_checkpoint_now)
+        reg("export_fits",    self.act_export_fits)
         reg("undo",           self.act_undo)
         reg("redo",           self.act_redo)
         reg("autostretch",    self.act_autostretch)
@@ -1696,6 +1758,7 @@ class ToolbarMixin:
         reg("fx", self.act_fx)
         reg("dither_analysis", self.act_dither_analysis)
         reg("plate_solve", self.act_plate_solve)
+        reg("cosmetic_correction", self.act_cosmetic_correction)
         reg("unwarp", self.act_unwarp)
         reg("magnitude_tool", self.act_magnitude)
         reg("snr_tool", self.act_snr)
@@ -1729,6 +1792,8 @@ class ToolbarMixin:
         reg("rcastro", self.act_rcastro)
         reg("view_bundles", self.act_view_bundles)
         reg("function_bundles", self.act_function_bundles)
+        reg("workflows", self.act_workflows)
+        reg("file_associations", self.act_file_associations)
 
     def _reset_all_toolbars_to_factory(self):
         """
@@ -2228,3 +2293,28 @@ class ToolbarMixin:
             QToolButton { color: #dcdcdc; }
             QToolButton:checked { color: #DAA520; font-weight: 600; }
         """)
+
+    def _show_file_associations_dialog(self):
+        """Open the File Associations dialog (About → File Associations…).
+
+        Registers SASpro as the default handler for astronomy/image file
+        types on Windows (HKCU, no admin) and Linux (~/.local/share/applications
+        + xdg-mime). On macOS, shows manual steps since the real association
+        story is the .app bundle's Info.plist.
+        """
+        try:
+            from setiastro.saspro.file_associations import FileAssociationsDialog
+            dlg = FileAssociationsDialog(self)
+            dlg.exec()
+        except Exception:
+            import logging
+            logging.exception("Failed to open File Associations dialog")
+            try:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self, self.tr("File Associations"),
+                    self.tr("Could not open the File Associations dialog. "
+                            "See the log for details."),
+                )
+            except Exception:
+                pass

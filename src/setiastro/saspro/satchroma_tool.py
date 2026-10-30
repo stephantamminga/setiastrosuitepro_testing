@@ -88,7 +88,7 @@ def _pchip_lut(points: List[Tuple[float, float]], n: int = N_CURVE) -> np.ndarra
 
 
 # ─────────────────────────────────────────────────────────────
-# Processing
+#sasprocessing
 # ─────────────────────────────────────────────────────────────
 
 def _apply_saturation_hsv(img: np.ndarray, lut: np.ndarray) -> np.ndarray:
@@ -820,6 +820,7 @@ class SatChromaTool(QDialog):
         # apply_satchroma_headless already use.
         # Deferred import avoids any shortcuts.py <-> satchroma_tool cycle.
         from setiastro.saspro.shortcuts import PresetDragHandle
+        from setiastro.saspro.help_support import make_help_button
         try:
             from setiastro.saspro.resources import satchroma_path
             _sc_icon = QIcon(satchroma_path)
@@ -841,6 +842,8 @@ class SatChromaTool(QDialog):
         )
         drag_row.addWidget(self.preset_drag_handle)
         drag_row.addStretch(1)
+        self.btn_help = make_help_button("satchroma", self)
+        drag_row.addWidget(self.btn_help)
         left_lay.addLayout(drag_row)
 
         splitter.addWidget(left)
@@ -1033,6 +1036,8 @@ class SatChromaTool(QDialog):
 
             meta = {
                 "step_name": f"SatChroma — {mode_name}",
+                "command_id": "satchroma",
+                "preset":    self.get_preset(),
                 "mode":      self.combo_mode.currentText(),
                 "strength":  self.spin_strength.value(),
                 "points":    self.canvas.get_points(),

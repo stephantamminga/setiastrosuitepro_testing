@@ -989,6 +989,7 @@ class SyQonStarlessDialog(QDialog):
         # --- preset drag handle (grip) ---
         try:
             from setiastro.saspro.shortcuts import PresetDragHandle
+            from setiastro.saspro.help_support import make_help_button
             try:
                 _grip_icon = QIcon(syqon_path)
             except Exception:
@@ -1006,6 +1007,8 @@ class SyQonStarlessDialog(QDialog):
             )
             drag_row.addWidget(self.preset_drag_handle)
             drag_row.addStretch(1)
+            self.btn_help = make_help_button("remove_stars", self)
+            drag_row.addWidget(self.btn_help)
             lay.addLayout(drag_row)
         except Exception:
             pass
@@ -1338,6 +1341,9 @@ class SyQonStarlessDialog(QDialog):
                 }
             }
         }
+
+        meta["command_id"] = "remove_stars"
+        meta["preset"] = self.get_preset()
 
         self.doc.apply_edit(final_to_apply, metadata=meta, step_name="Stars Removed")
         if hasattr(self.main, "_log"):
@@ -2511,6 +2517,15 @@ def _on_starnet_finished(main, doc, return_code, dialog, input_path, output_path
         except Exception:
             pass
 
+        _last = getattr(main, "_last_headless_command", None)
+        if isinstance(_last, dict) and _last.get("command_id") == "remove_stars" \
+                and isinstance(_last.get("preset"), dict):
+            meta["command_id"] = "remove_stars"
+            meta["preset"] = dict(_last["preset"])
+        else:
+            meta["command_id"] = "remove_stars"
+            meta["preset"] = {"tool": "starnet", "linear": bool(did_stretch)}
+
         doc.apply_edit(
             final_to_apply,
             metadata=meta,
@@ -2749,6 +2764,15 @@ def _darkstar_run_from_dialog(main, doc, cfg):
             except Exception:
                 pass
 
+            _last = getattr(main, "_last_headless_command", None)
+            if isinstance(_last, dict) and _last.get("command_id") == "remove_stars" \
+                    and isinstance(_last.get("preset"), dict):
+                meta["command_id"] = "remove_stars"
+                meta["preset"] = dict(_last["preset"])
+            else:
+                meta["command_id"] = "remove_stars"
+                meta["preset"] = {"tool": "darkstar"}
+
             doc.apply_edit(final_to_apply, metadata=meta, step_name="Stars Removed")
             if hasattr(main, "_log"):
                 main._log("Stars Removed (DarkStar)")
@@ -2970,7 +2994,7 @@ def _extract_stars_only(original_rgb: np.ndarray,
 
 
 # ------------------------------------------------------------
-# Proc runner & dialog (merged stdout/stderr)
+#sasproc runner & dialog (merged stdout/stderr)
 # ------------------------------------------------------------
 class _ProcThread(QThread):
     output_signal = pyqtSignal(str)
@@ -3237,6 +3261,7 @@ class DarkStarConfigDialog(QDialog):
         # --- preset drag handle (grip) ---
         try:
             from setiastro.saspro.shortcuts import PresetDragHandle
+            from setiastro.saspro.help_support import make_help_button
             try:
                 _grip_icon = QIcon(starnet_path)
             except Exception:
@@ -3254,6 +3279,8 @@ class DarkStarConfigDialog(QDialog):
             )
             drag_row.addWidget(self.preset_drag_handle)
             drag_row.addStretch(1)
+            self.btn_help = make_help_button("remove_stars", self)
+            drag_row.addWidget(self.btn_help)
             layout.addLayout(drag_row)
         except Exception:
             pass

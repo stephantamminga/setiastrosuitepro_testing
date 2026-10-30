@@ -1,4 +1,4 @@
-# pro/wavescalede.py
+#saspro/wavescalede.py
 from __future__ import annotations
 import math
 import numpy as np
@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
 )
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
 from setiastro.saspro.widgets.graphics_views import ZoomableGraphicsView
-
+from setiastro.saspro.help_support import make_help_button
 # Import shared wavelet utilities
 from setiastro.saspro.widgets.wavelet_utils import (
     conv_sep_reflect as _conv_sep_reflect,
@@ -266,7 +266,7 @@ class WaveScaleDarkEnhancerDialogPro(QDialog):
         row.addWidget(self.btn_preview); row.addWidget(self.btn_toggle)
         form.addRow(row)
 
-        # progress
+        #sasprogress
         self.prog_grp = QGroupBox(self.tr("Progress"))
         vprog = QVBoxLayout(self.prog_grp)
         self.lbl_step = QLabel(self.tr("Idle"))
@@ -318,7 +318,10 @@ class WaveScaleDarkEnhancerDialogPro(QDialog):
                 parent=self,
             )
             drag_row.addWidget(self.preset_drag_handle)
-            drag_row.addStretch(1)   # pushes grip to the left edge
+            drag_row.addStretch(1)
+            self.btn_help = make_help_button("wavescale_dark_enhance", self)
+            drag_row.addWidget(self.btn_help)
+            
             main.addLayout(drag_row)
         except Exception:
             pass
@@ -575,13 +578,14 @@ class WaveScaleDarkEnhancerDialogPro(QDialog):
                 mono = mono[:, :, None]
             out = mono
         out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+        _meta = {"step_name": "WaveScale Dark Enhancer",
+                 "command_id": "wavescale_dark_enhance",
+                 "preset": dict(self.get_preset())}
         try:
-            if hasattr(self._doc, "set_image"):
-                self._doc.set_image(out, step_name="WaveScale Dark Enhancer")
-            elif hasattr(self._doc, "apply_numpy"):
-                self._doc.apply_numpy(out, step_name="WaveScale Dark Enhancer")
-            else:
-                self._doc.image = out
+            self._doc.set_image(out, metadata=_meta, step_name="WaveScale Dark Enhancer")
+        except Exception as e:
+            QMessageBox.critical(self, self.tr("WaveScale Dark Enhancer"), self.tr("Failed to write to document:\n{0}").format(e))
+            return
         except Exception as e:
             QMessageBox.critical(self, self.tr("WaveScale Dark Enhancer"), self.tr("Failed to write to document:\n{0}").format(e))
             return

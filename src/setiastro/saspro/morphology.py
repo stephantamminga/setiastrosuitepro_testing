@@ -1,4 +1,4 @@
-# pro/morphology.py
+#saspro/morphology.py
 from __future__ import annotations
 import numpy as np
 import cv2
@@ -18,7 +18,7 @@ from setiastro.saspro.widgets.image_utils import (
     blend_with_mask as _blend_with_mask
 )
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
-
+from setiastro.saspro.help_support import make_help_button
 
 # ---------------- Core (unchanged) ----------------
 def apply_morphology(image: np.ndarray, *, operation: str = "erosion",
@@ -76,8 +76,9 @@ def apply_morphology_to_doc(doc, preset: dict | None):
             base = np.clip(base, 0.0, 1.0)
         out = _blend_with_mask(base, out, m).astype(np.float32, copy=False)
 
-    if hasattr(doc, "set_image"): doc.set_image(out, step_name="Morphology")
-    elif hasattr(doc, "apply_numpy"): doc.apply_numpy(out, step_name="Morphology")
+    _meta = {"step_name": "Morphology", "command_id": "morphology",
+             "preset": {"operation": str(op), "kernel": int(ker), "iterations": int(it)}}
+    if hasattr(doc, "set_image"): doc.set_image(out, metadata=_meta, step_name="Morphology")
     else: doc.image = out
 
 # Note: _get_active_mask_resized and _blend_with_mask imported from setiastro.saspro.widgets.image_utils
@@ -192,6 +193,8 @@ class MorphologyDialogPro(QDialog):
             )
             drag_row.addWidget(self.preset_drag_handle)
             drag_row.addStretch(1)   # push grip hard to the LEFT edge
+            self.btn_help = make_help_button("morphology", self)
+            drag_row.addWidget(self.btn_help)            
             v.addLayout(drag_row)
         except Exception:
             pass
@@ -293,10 +296,10 @@ class MorphologyDialogPro(QDialog):
                 out = _blend_with_mask(base, out, m).astype(np.float32, copy=False)
 
             # Commit to document
+            _meta = {"step_name": "Morphology", "command_id": "morphology",
+                     "preset": {"operation": op, "kernel": int(k), "iterations": int(it)}}
             if hasattr(self.doc, "set_image"):
-                self.doc.set_image(out, step_name="Morphology")
-            elif hasattr(self.doc, "apply_numpy"):
-                self.doc.apply_numpy(out, step_name="Morphology")
+                self.doc.set_image(out, metadata=_meta, step_name="Morphology")
             else:
                 self.doc.image = out
 

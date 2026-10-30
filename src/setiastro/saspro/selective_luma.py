@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtWidgets import QSizePolicy
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
+from setiastro.saspro.help_support import make_help_button
 
 # ---------------------------------------------------------------------
 # Small helpers  (identical to SelectiveColor)
@@ -77,7 +78,7 @@ def _lum_band_mask(L: np.ndarray, lo: float, hi: float,
     s = float(max(smooth, 0.0))
 
     if soft:
-        # Proportional selection: a smooth bump with soft shoulders straddling
+        #sasproportional selection: a smooth bump with soft shoulders straddling
         # the band edges, so mask strength tracks how close a pixel's luminance
         # is to the selected range instead of a hard in/out boxcar. Narrow bands
         # become a smooth bell; wide bands keep a soft-shouldered plateau. This
@@ -794,6 +795,8 @@ class SelectiveLuminanceCorrection(QDialog):
         for b in (self.btn_zoom_out, self.btn_zoom_in, self.btn_zoom_1, self.btn_fit):
             zoom_row.addWidget(b)
         zoom_row.addStretch(1)
+        self.btn_doc_help = make_help_button("selective_luma", self)
+        zoom_row.addWidget(self.btn_doc_help)
         right.addLayout(zoom_row)
 
         self.lbl_help = QLabel(

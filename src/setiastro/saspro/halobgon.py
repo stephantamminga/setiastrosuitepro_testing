@@ -1,4 +1,4 @@
-# pro/halobgon.py
+#saspro/halobgon.py
 from __future__ import annotations
 import numpy as np
 import cv2
@@ -21,7 +21,7 @@ except Exception:
     _lut_color_inplace = None
 
 from setiastro.saspro.widgets.themed_buttons import themed_toolbtn
-
+from setiastro.saspro.help_support import make_help_button
 
 # =============================================================================
 # Helpers
@@ -195,12 +195,14 @@ def apply_halo_b_gon_to_doc(parent, doc, preset: dict | None):
 
     out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
 
-    if hasattr(doc, "set_image"):
-        doc.set_image(out, step_name="Halo-B-Gon")
-    elif hasattr(doc, "apply_numpy"):
-        doc.apply_numpy(out, step_name="Halo-B-Gon")
-    else:
-        doc.image = out
+    out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+
+    _meta = {
+        "step_name": "Halo-B-Gon",
+        "command_id": "halo_b_gon",
+        "preset": {"reduction": int(lvl), "linear": bool(lin)},
+    }
+    doc.set_image(out, metadata=_meta, step_name="Halo-B-Gon")
 
 # =============================================================================
 # UI: dialog with preview, zoom/pan, fit, overwrite/new view
@@ -352,6 +354,8 @@ class HaloBGonDialogPro(QDialog):
             )
             drag_row.addWidget(self.preset_drag_handle)
             drag_row.addStretch(1)   # push grip hard to the LEFT edge
+            self.btn_doc_help = make_help_button("halo_b_gon", self)
+            drag_row.addWidget(self.btn_doc_help)            
             v.addLayout(drag_row)
         except Exception:
             pass
@@ -416,8 +420,6 @@ class HaloBGonDialogPro(QDialog):
     def _apply_overwrite(self, out: np.ndarray):
         if hasattr(self.doc, "set_image"):
             self.doc.set_image(out, step_name="Halo-B-Gon")
-        elif hasattr(self.doc, "apply_numpy"):
-            self.doc.apply_numpy(out, step_name="Halo-B-Gon")
         else:
             self.doc.image = out
 
